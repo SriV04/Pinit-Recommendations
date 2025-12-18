@@ -121,6 +121,7 @@ def _value_tags() -> Iterable[TagDefinition]:
     return (
         _make_def("great_value", "VALUE", "Serious bang for buck."),
         _make_def("pricey", "VALUE", "Splurge-worthy but spendy."),
+        _make_def("hidden_gem", "VALUE", "Under-the-radar hits that outperform their hype."),
     )
 
 

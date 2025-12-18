@@ -483,3 +483,15 @@ Add embeddings and residuals once you have enough behavior data and stable inges
 4) Recommender job:
 - generate candidates + rank + write `user_recommendations`
 - cron schedule + on-demand trigger
+
+5) Short term updates:
+- recent sessions
+- recent saves - light weight model updates 
+
+
+## Database schema:
+locations - processed 
+location_tags 
+user_tag_affinities 
+recommendation runs - both reusable 
+recommendation candidates - both reusable 

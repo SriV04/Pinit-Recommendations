@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 
 from config import PipelinePaths, ReviewTagConfig
+from hidden_gems import add_hidden_gem_scores
 from tag_taxonomy import tag_dataframe
 
 
@@ -42,6 +43,9 @@ REVIEW_TAG_KEYWORDS: Dict[str, Dict[str, Sequence[str]]] = {
     "halal_friendly": {"keywords": ["halal", "halal friendly"]},
     "gluten_free_options": {"keywords": ["gluten free", "gluten-free", "celiac"]},
 }
+
+HIDDEN_GEM_TAG_THRESHOLD = 0.6
+HIDDEN_GEM_MIN_REVIEWS = 35
 
 
 def _min_max_scale(values: pd.Series) -> pd.Series:
@@ -166,10 +170,9 @@ def load_locations(paths: PipelinePaths) -> pd.DataFrame:
     )
     df["expected_popularity"] = by_group
     df["residual_popularity"] = df["log_reviews"] - df["expected_popularity"]
-    df["hidden_gem_score"] = _min_max_scale(df["residual_popularity"].clip(upper=0).abs())
     df["quality_score"] = _min_max_scale(df["rating"].fillna(df["rating"].mean()))
 
-    return df
+    return add_hidden_gem_scores(df)
 
 
 def load_reviews(paths: PipelinePaths, place_to_location: Dict[str, int]) -> pd.DataFrame:
@@ -268,6 +271,29 @@ def _deterministic_tags(df: pd.DataFrame) -> List[Dict]:
                 "opening_hours",
                 {},
             )
+        if (
+            row.hidden_gem_score >= HIDDEN_GEM_TAG_THRESHOLD
+            and row.user_ratings_total >= HIDDEN_GEM_MIN_REVIEWS
+        ):
+            base_score = 70 + 25 * float(row.hidden_gem_score)
+            rating_val = row.rating
+            rating_num = float(rating_val) if rating_val is not None else float("nan")
+            hype_val = getattr(row, "hype_residual", 0.0)
+            hype_num = float(hype_val) if hype_val is not None else 0.0
+            metadata = {
+                "rating": rating_num if not math.isnan(rating_num) else None,
+                "hype_residual": hype_num,
+                "reviews": int(row.user_ratings_total),
+                "source": getattr(row, "hidden_gem_source", "unknown"),
+            }
+            _add_tag_record(
+                records,
+                row.location_id,
+                "hidden_gem",
+                min(100, base_score),
+                "hidden_gem_model",
+                metadata,
+            )
     return records
 
 
@@ -331,5 +357,3 @@ def build_location_tags(
     location_tags = location_tags.merge(tags_df[["tag_id", "text"]], left_on="tag_text", right_on="text", how="inner")
     location_tags = location_tags.drop(columns=["text"])
     return location_tags
-
-

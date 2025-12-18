@@ -5,11 +5,11 @@ import json
 from pathlib import Path
 from typing import Dict
 
-from .config import PipelineConfig, PipelinePaths, ReviewTagConfig
-from .recommendation import build_recommendations
-from .tag_taxonomy import tag_dataframe
-from .tagging import build_location_tags, load_locations, load_reviews
-from .user_profiles import (
+from config import PipelineConfig, PipelinePaths, ReviewTagConfig
+from recommendation import build_recommendations
+from tag_taxonomy import tag_dataframe
+from tagging import build_location_tags, load_locations, load_reviews
+from user_profiles import (
     build_user_tag_affinities,
     ensure_user_actions,
 )
