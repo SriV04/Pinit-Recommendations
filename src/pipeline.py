@@ -6,10 +6,10 @@ from pathlib import Path
 from typing import Dict
 
 from config import PipelineConfig, PipelinePaths, ReviewTagConfig
-from recommendation import build_recommendations
-from tag_taxonomy import tag_dataframe
-from tagging import build_location_tags, load_locations, load_reviews
-from user_profiles import (
+from recommendation.recommendation import build_recommendations
+from recommendation.tag_taxonomy import get_tags_dataframe
+from recommendation.tagging import build_location_tags, load_locations, load_reviews
+from recommendation.user_profiles import (
     build_user_tag_affinities,
     ensure_user_actions,
 )
@@ -23,7 +23,7 @@ def run_pipeline(config: PipelineConfig) -> Dict[str, Path]:
     locations = load_locations(paths)
     place_lookup = locations.set_index("google_place_id")["location_id"].to_dict()
     reviews = load_reviews(paths, place_lookup)
-    tags = tag_dataframe()
+    tags = get_tags_dataframe()
     location_tags = build_location_tags(locations, reviews, config.review_tagging)
 
     user_actions, synthetic = ensure_user_actions(

@@ -8,8 +8,8 @@ import numpy as np
 import pandas as pd
 
 from config import PipelinePaths, ReviewTagConfig
-from hidden_gems import add_hidden_gem_scores
-from tag_taxonomy import tag_dataframe
+from analysis.hidden_gems import add_hidden_gem_scores
+from recommendation.tag_taxonomy import get_tags_dataframe
 
 
 CATEGORY_TYPES = {
@@ -348,7 +348,7 @@ def build_location_tags(
     deterministic = _deterministic_tags(locations)
     review_based = _review_tag_records(reviews, config)
     records = deterministic + review_based
-    tags_df = tag_dataframe()
+    tags_df = get_tags_dataframe()
     location_tags = pd.DataFrame(records)
     if location_tags.empty:
         return pd.DataFrame(
