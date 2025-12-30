@@ -1,6 +1,16 @@
 # Proximal Recommendations API
 
-REST API for location-based personalized restaurant recommendations.
+REST API for location-based personalized restaurant recommendations with Supabase integration.
+
+## Features
+
+- 🎯 **Personalized Recommendations**: Based on user tag preferences
+- 📍 **Location-Aware**: Filters by radius with proximity scoring
+- 🗄️ **Supabase Integration**: Automatically loads user preferences from database
+- 🚀 **Fast**: In-memory caching for sub-second response times
+- 📊 **Configurable Scoring**: Adjust taste, proximity, and quality weights
+- 🔄 **Batch Processing**: Handle multiple users in single request
+- 📚 **Auto Documentation**: Interactive Swagger UI
 
 ## Setup
 
@@ -44,7 +54,8 @@ Content-Type: application/json
   "max_results": 20,
   "taste_weight": 0.2,
   "proximity_weight": 0.6,
-  "quality_weight": 0.2
+  "quality_weight": 0.2,
+  "include_taste_breakdown": true
 }
 ```
 
@@ -58,6 +69,41 @@ Content-Type: application/json
   "total_results": 20,
   "recommendations": [
     {
+      "location_id": 123,
+      "name": "Restaurant Name",
+      "vicinity": "Address",
+      "cuisine_primary": "italian",
+      "rating": 4.5,
+      "user_ratings_total": 500,
+      "price_level": 2,
+      "distance_km": 0.5,
+      "taste_score": 0.85,
+      "proximity_score": 0.95,
+      "quality_score": 0.88,
+      "final_score": 0.89,
+      "rank": 1,
+      "taste_breakdown": [
+        {
+          "tag": "italian",
+          "user_score": 90.0,
+          "location_score": 95.0,
+          "contribution": 85.5
+        },
+        {
+          "tag": "date_night",
+          "user_score": 85.0,
+          "location_score": 88.0,
+          "contribution": 74.8
+        }
+      ]
+    }
+  ],
+  "timestamp": "2025-12-25T10:30:00"
+}
+```
+
+**Parameters:**
+- `include_taste_breakdown` (optional, default: false): When true, includes detailed breakdown of which tags matched between user preferences and location attributes
       "location_id": 123,
       "name": "Restaurant Name",
       "vicinity": "Address",
@@ -128,7 +174,8 @@ curl -X POST http://localhost:8000/recommendations/proximal \
     "latitude": 51.5130,
     "longitude": -0.1240,
     "radius_km": 2.0,
-    "max_results": 10
+    "max_results": 10,
+    "include_taste_breakdown": true
   }'
 
 # List users
@@ -143,7 +190,7 @@ curl http://localhost:8000/users/demo_date_night/profile
 ```python
 import requests
 
-# Get recommendations
+# Get recommendations with taste breakdown
 response = requests.post(
     "http://localhost:8000/recommendations/proximal",
     json={
@@ -151,7 +198,8 @@ response = requests.post(
         "latitude": 51.5130,
         "longitude": -0.1240,
         "radius_km": 2.0,
-        "max_results": 20
+        "max_results": 20,
+        "include_taste_breakdown": True
     }
 )
 
@@ -162,6 +210,12 @@ for rec in data['recommendations'][:5]:
     print(f"{rec['rank']}. {rec['name']}")
     print(f"   Distance: {rec['distance_km']:.2f} km")
     print(f"   Score: {rec['final_score']:.2f}")
+    
+    # Show taste breakdown if available
+    if rec.get('taste_breakdown'):
+        print(f"   Taste matches:")
+        for match in rec['taste_breakdown'][:3]:
+            print(f"     • {match['tag']}: {match['contribution']:.1f}%")
 ```
 
 ## Configuration

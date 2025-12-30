@@ -184,7 +184,15 @@ class SupabaseService:
     
     def create_user_tag_affinity(self, user_id: str, tag_id: str, affinity: float,
                                 evidence: Optional[Dict] = None) -> Dict[str, Any]:
-        """Create or upsert a user tag affinity"""
+        """
+        Create or upsert a user tag affinity.
+        
+        Args:
+            user_id: User UUID
+            tag_id: Tag UUID
+            affinity: User preference score (0-100 scale)
+            evidence: Optional metadata about how affinity was calculated
+        """
         data = {
             "user_id": user_id,
             "tag_id": tag_id,
@@ -208,7 +216,17 @@ class SupabaseService:
     def get_user_tag_affinities(self, user_id: Optional[str] = None,
                                tag_id: Optional[str] = None,
                                min_affinity: Optional[float] = None) -> List[Dict[str, Any]]:
-        """Get user tag affinities with optional filters"""
+        """
+        Get user tag affinities with optional filters.
+        
+        Args:
+            user_id: Optional user UUID to filter by
+            tag_id: Optional tag UUID to filter by
+            min_affinity: Optional minimum affinity threshold (0-100 scale)
+        
+        Returns:
+            List of affinity records with affinity values on 0-100 scale
+        """
         query = self.client.table("user_tag_affinities").select("*")
         if user_id:
             query = query.eq("user_id", user_id)

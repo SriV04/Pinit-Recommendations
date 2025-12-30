@@ -19,11 +19,24 @@ from recommendation.proximal_recommendation import (
 )
 from recommendation.tag_taxonomy import get_tags_dataframe
 from recommendation.static_tagging import load_locations, load_reviews, build_location_tags
-from recommendation.user_profiles import ensure_user_actions, build_user_tag_affinities
+from recommendation.user_profiles import (
+    ensure_user_actions, 
+    build_user_tag_affinities,
+    load_user_tag_affinities_from_supabase,
+    convert_supabase_affinities_to_profile_format
+)
 from config import PipelineConfig, PipelinePaths, ReviewTagConfig
 
 
 # Pydantic models for request/response
+
+class TagMatch(BaseModel):
+    tag: str = Field(..., description="Tag name")
+    user_score: float = Field(..., description="User preference score (0-100)")
+    location_score: float = Field(..., description="Location score for this tag (0-100)")
+    contribution: float = Field(..., description="Contribution to taste score (0-100)")
+
+
 class ProximalRequest(BaseModel):
     user_id: str = Field(..., description="User identifier")
     latitude: float = Field(..., description="Center point latitude", ge=-90, le=90)
@@ -33,6 +46,7 @@ class ProximalRequest(BaseModel):
     taste_weight: Optional[float] = Field(0.2, description="Weight for taste matching", ge=0, le=1)
     proximity_weight: Optional[float] = Field(0.6, description="Weight for proximity", ge=0, le=1)
     quality_weight: Optional[float] = Field(0.2, description="Weight for quality", ge=0, le=1)
+    include_taste_breakdown: Optional[bool] = Field(False, description="Include detailed taste score breakdown")
 
 
 class BatchProximalRequest(BaseModel):
@@ -57,6 +71,7 @@ class LocationRecommendation(BaseModel):
     quality_score: float
     final_score: float
     rank: int
+    taste_breakdown: Optional[List[TagMatch]] = Field(None, description="Breakdown of taste score by matching tags")
 
 
 class ProximalResponse(BaseModel):
@@ -122,6 +137,49 @@ DATA_CACHE = {
 }
 
 
+def get_taste_breakdown(location_id: int, user_id: str, user_tags: pd.DataFrame, 
+                        location_tags: pd.DataFrame, top_n: int = 5) -> List[Dict]:
+    """
+    Get the breakdown of which tags contributed to the taste score.
+    
+    Returns:
+        List of dicts with tag, user_score, location_score, contribution
+    """
+    user_profile = user_tags[user_tags['user_id'] == user_id]
+    loc_tags = location_tags[location_tags['location_id'] == location_id]
+    
+    if user_profile.empty or loc_tags.empty:
+        return []
+    
+    # Merge to find matching tags
+    merged = user_profile.merge(
+        loc_tags[['tag_id', 'tag_text', 'score']],
+        on='tag_id',
+        how='inner',
+        suffixes=('_user', '_loc')
+    )
+    
+    if merged.empty:
+        return []
+    
+    # Calculate contribution
+    merged['contribution'] = (merged['score_user'] / 100.0) * (merged['score_loc'] / 100.0)
+    merged = merged.sort_values('contribution', ascending=False)
+    
+    results = []
+    for _, row in merged.head(top_n).iterrows():
+        # Use either tag_text_user or tag_text_loc (they should be the same)
+        tag_name = row.get('tag_text_user', row.get('tag_text_loc', 'unknown'))
+        results.append({
+            'tag': tag_name,
+            'user_score': float(row['score_user']),
+            'location_score': float(row['score_loc']),
+            'contribution': float(row['contribution'] * 100)  # Convert to 0-100 scale
+        })
+    
+    return results
+
+
 def load_data():
     """Load all necessary data for recommendations."""
     global DATA_CACHE
@@ -147,8 +205,28 @@ def load_data():
     place_lookup = locations.set_index("google_place_id")["location_id"].to_dict()
     reviews = load_reviews(paths, place_lookup)
     location_tags = build_location_tags(locations, reviews, config.review_tagging)
-    user_actions, synthetic = ensure_user_actions(paths, locations, location_tags, allow_synthetic=True)
-    user_tags, user_history = build_user_tag_affinities(user_actions, location_tags, locations)
+    
+    # Try to load user tag affinities from Supabase first
+    print("Checking for user tag affinities in Supabase...")
+    supabase_affinities = load_user_tag_affinities_from_supabase()
+    
+    if not supabase_affinities.empty:
+        print(f"✓ Loaded {len(supabase_affinities):,} user tag affinities from Supabase")
+        user_tags = convert_supabase_affinities_to_profile_format(supabase_affinities, tags_df)
+        # Build user history from affinity data
+        user_history = (
+            user_tags.groupby("user_id")
+            .size()
+            .reset_index(name="n_actions")
+            .sort_values(by="n_actions", ascending=False)
+        )
+        print(f"✓ Found {len(user_tags['user_id'].unique())} users in Supabase")
+    else:
+        print("No user tag affinities found in Supabase, falling back to synthetic/file data...")
+        user_actions, synthetic = ensure_user_actions(paths, locations, location_tags, allow_synthetic=True)
+        user_tags, user_history = build_user_tag_affinities(user_actions, location_tags, locations)
+        if synthetic:
+            print("✓ Generated synthetic user profiles")
     
     # Cache data
     DATA_CACHE["locations"] = locations
@@ -247,6 +325,19 @@ async def get_proximal_recommendations(request: ProximalRequest):
     # Convert to response model
     recommendations = []
     for _, row in recs.iterrows():
+        # Get taste breakdown if requested
+        taste_breakdown = None
+        if request.include_taste_breakdown:
+            breakdown = get_taste_breakdown(
+                location_id=int(row["location_id"]),
+                user_id=request.user_id,
+                user_tags=DATA_CACHE["user_tags"],
+                location_tags=DATA_CACHE["location_tags"],
+                top_n=5
+            )
+            if breakdown:
+                taste_breakdown = [TagMatch(**item) for item in breakdown]
+        
         recommendations.append(LocationRecommendation(
             location_id=int(row["location_id"]),
             name=row["name"],
@@ -260,7 +351,8 @@ async def get_proximal_recommendations(request: ProximalRequest):
             proximity_score=float(row["proximity_score"]),
             quality_score=float(row["quality_score"]),
             final_score=float(row["final_score"]),
-            rank=int(row["rank"])
+            rank=int(row["rank"]),
+            taste_breakdown=taste_breakdown
         ))
     
     return ProximalResponse(

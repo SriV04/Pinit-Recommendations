@@ -8,7 +8,7 @@ from typing import Dict
 from config import PipelineConfig, PipelinePaths, ReviewTagConfig
 from recommendation.recommendation import build_recommendations
 from recommendation.tag_taxonomy import get_tags_dataframe
-from recommendation.tagging import build_location_tags, load_locations, load_reviews
+from recommendation.static_tagging import build_location_tags, load_locations, load_reviews
 from recommendation.user_profiles import (
     build_user_tag_affinities,
     ensure_user_actions,

@@ -168,7 +168,7 @@ CREATE TABLE public.user_recommendations (
 CREATE TABLE public.user_tag_affinities (
   user_id uuid NOT NULL,
   tag_id uuid NOT NULL,
-  affinity real NOT NULL CHECK (affinity >= 0::double precision AND affinity <= 1::double precision),
+  affinity real NOT NULL CHECK (affinity >= 1::double precision AND affinity <= 100::double precision),
   evidence jsonb,
   updated_at timestamp with time zone NOT NULL DEFAULT now(),
   CONSTRAINT user_tag_affinities_pkey PRIMARY KEY (user_id, tag_id),

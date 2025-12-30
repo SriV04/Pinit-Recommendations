@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Tuple, Optional
 
 import numpy as np
 import pandas as pd
@@ -12,6 +12,7 @@ from config import (
     PipelinePaths,
     RECENCY_HALFLIFE_DAYS,
 )
+from supabase_client.supabase_service import get_supabase_service
 
 
 SYNTHETIC_PROFILES = [
@@ -19,6 +20,85 @@ SYNTHETIC_PROFILES = [
     {"user_id": "demo_vegan", "tags": ["vegan_vegetarian", "vegan_friendly", "cafe"]},
     {"user_id": "demo_group_hang", "tags": ["group_hang", "mexican", "cocktails"]},
 ]
+
+
+def load_user_tag_affinities_from_supabase(
+    user_id: Optional[str] = None,
+    min_affinity: Optional[float] = None,
+) -> pd.DataFrame:
+    """
+    Load user tag affinities from Supabase.
+    
+    Args:
+        user_id: Optional specific user ID to filter by
+        min_affinity: Optional minimum affinity threshold
+    
+    Returns:
+        DataFrame with columns: user_id, tag_id, affinity, evidence, updated_at
+    """
+    try:
+        db = get_supabase_service()
+        records = db.get_user_tag_affinities(
+            user_id=user_id,
+            min_affinity=min_affinity
+        )
+        
+        if not records:
+            return pd.DataFrame(
+                columns=["user_id", "tag_id", "affinity", "evidence", "updated_at"]
+            )
+        
+        df = pd.DataFrame(records)
+        return df
+    except Exception as e:
+        print(f"Error loading user tag affinities from Supabase: {e}")
+        return pd.DataFrame(
+            columns=["user_id", "tag_id", "affinity", "evidence", "updated_at"]
+        )
+
+
+def convert_supabase_affinities_to_profile_format(
+    supabase_affinities: pd.DataFrame,
+    tags_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Convert Supabase user_tag_affinities format to the format expected by recommendation system.
+    
+    Args:
+        supabase_affinities: DataFrame from Supabase with columns user_id, tag_id, affinity, evidence
+        tags_df: Tags DataFrame with tag_id and text columns
+    
+    Returns:
+        DataFrame with columns: user_id, tag_id, tag_text, score, metadata
+        where score is the same as affinity (both use 0-100 scale)
+    """
+    if supabase_affinities.empty:
+        return pd.DataFrame(
+            columns=["user_id", "tag_id", "tag_text", "score", "metadata"]
+        )
+    
+    # Merge with tags to get tag_text
+    df = supabase_affinities.merge(
+        tags_df[["tag_id", "text"]],
+        on="tag_id",
+        how="left"
+    )
+    
+    # Rename columns (affinity and score both use 0-100 scale)
+    df = df.rename(columns={"text": "tag_text", "affinity": "score"})
+    
+    # Convert evidence to metadata JSON string if not already
+    if "evidence" in df.columns:
+        df["metadata"] = df["evidence"].apply(
+            lambda x: json.dumps(x if isinstance(x, dict) else {}, ensure_ascii=False)
+        )
+    else:
+        df["metadata"] = "{}"
+    
+    # Select and order columns
+    result = df[["user_id", "tag_id", "tag_text", "score", "metadata"]]
+    
+    return result.sort_values(by=["user_id", "score"], ascending=[True, False])
 
 
 def load_user_actions(paths: PipelinePaths) -> pd.DataFrame:
