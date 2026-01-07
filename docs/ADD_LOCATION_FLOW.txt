@@ -1,0 +1,76 @@
+"""
+Add Location Endpoint Flow Diagram
+
+┌─────────────────────────────────────────────────────────────────┐
+│                    POST /locations/add                          │
+│                  { google_place_id: "..." }                     │
+└────────────────────────────┬────────────────────────────────────┘
+                             │
+                             ▼
+                  ┌──────────────────────┐
+                  │  Check if location   │
+                  │  exists in Supabase  │
+                  │  by google_place_id  │
+                  └──────────┬───────────┘
+                             │
+                ┌────────────┴────────────┐
+                │                         │
+                ▼                         ▼
+        ┌──────────────┐         ┌──────────────┐
+        │   FOUND      │         │  NOT FOUND   │
+        │  in database │         │              │
+        └──────┬───────┘         └──────┬───────┘
+               │                         │
+               │                         ▼
+               │              ┌──────────────────────┐
+               │              │  Call Google Places  │
+               │              │  API for details     │
+               │              └──────────┬───────────┘
+               │                         │
+               │                         ▼
+               │              ┌──────────────────────┐
+               │              │  Validate it's a     │
+               │              │  food establishment  │
+               │              └──────────┬───────────┘
+               │                         │
+               │                         ▼
+               │              ┌──────────────────────┐
+               │              │  Process location    │
+               │              │  data & reviews      │
+               │              └──────────┬───────────┘
+               │                         │
+               │                         ▼
+               │              ┌──────────────────────┐
+               │              │  Run tagging logic   │
+               │              │  (deterministic +    │
+               │              │   review-based)      │
+               │              └──────────┬───────────┘
+               │                         │
+               │                         ▼
+               │              ┌──────────────────────┐
+               │              │  Save location to    │
+               │              │  Supabase            │
+               │              └──────────┬───────────┘
+               │                         │
+               │                         ▼
+               │              ┌──────────────────────┐
+               │              │  Save tags to        │
+               │              │  location_tags table │
+               │              └──────────┬───────────┘
+               │                         │
+               └─────────────────────────┘
+                             │
+                             ▼
+                  ┌──────────────────────┐
+                  │  Return response     │
+                  │  with location_id,   │
+                  │  name, tags_count,   │
+                  │  already_existed     │
+                  └──────────────────────┘
+
+Key Benefits:
+- ✅ No duplicate API calls (checks DB first)
+- ✅ Automatic tagging (uses existing pipeline)
+- ✅ Error handling at every step
+- ✅ Returns useful feedback
+"""

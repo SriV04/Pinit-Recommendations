@@ -19,10 +19,11 @@ REST API for location-based personalized restaurant recommendations with Supabas
 pip install -r requirements.txt
 ```
 
-2. Ensure your `.env` file has Supabase credentials:
+2. Ensure your `.env` file has Supabase credentials and Google Maps API key:
 ```
 SUPABASE_URL=your_url
 SUPABASE_SERVICE_ROLE_KEY=your_key
+GOOGLE_MAPS_API_KEY=your_google_key  # Required for add location endpoint
 ```
 
 3. Start the API:
@@ -154,6 +155,37 @@ GET /users?limit=10
 GET /users/{user_id}/profile?top_n=10
 ```
 
+### Add New Location
+Add a new restaurant/location by Google Place ID. The API will:
+1. Check if the location already exists
+2. Fetch details from Google Places API (if not exists)
+3. Process and tag the location
+4. Store it in the database
+
+```bash
+POST /locations/add
+Content-Type: application/json
+
+{
+  "google_place_id": "ChIJQSa9d40bdkgRqxpWYKhEMvM"
+}
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "message": "Location successfully added and tagged",
+  "location_id": 1234,
+  "google_place_id": "ChIJQSa9d40bdkgRqxpWYKhEMvM",
+  "name": "Dishoom King's Cross",
+  "tags_count": 12,
+  "already_existed": false
+}
+```
+
+**Note:** Requires `GOOGLE_MAPS_API_KEY` in your `.env` file.
+
 ## Interactive Documentation
 
 FastAPI provides automatic interactive documentation:
@@ -176,6 +208,13 @@ curl -X POST http://localhost:8000/recommendations/proximal \
     "radius_km": 2.0,
     "max_results": 10,
     "include_taste_breakdown": true
+  }'
+
+# Add a new location
+curl -X POST http://localhost:8000/locations/add \
+  -H "Content-Type: application/json" \
+  -d '{
+    "google_place_id": "ChIJQSa9d40bdkgRqxpWYKhEMvM"
   }'
 
 # List users
@@ -216,6 +255,20 @@ for rec in data['recommendations'][:5]:
         print(f"   Taste matches:")
         for match in rec['taste_breakdown'][:3]:
             print(f"     • {match['tag']}: {match['contribution']:.1f}%")
+
+# Add a new location
+add_response = requests.post(
+    "http://localhost:8000/locations/add",
+    json={
+        "google_place_id": "ChIJQSa9d40bdkgRqxpWYKhEMvM"
+    }
+)
+
+add_data = add_response.json()
+if add_data['success']:
+    print(f"Added: {add_data['name']}")
+    print(f"Location ID: {add_data['location_id']}")
+    print(f"Tags: {add_data['tags_count']}")
 ```
 
 ## Configuration

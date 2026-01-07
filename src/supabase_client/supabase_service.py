@@ -69,6 +69,11 @@ class SupabaseService:
         response = self.client.table("locations").select("*").eq("location_id", location_id).execute()
         return response.data[0] if response.data else None
     
+    def get_location_by_google_place_id(self, google_place_id: str) -> Optional[Dict[str, Any]]:
+        """Get a location by Google Place ID"""
+        response = self.client.table("locations").select("*").eq("google_place_id", google_place_id).execute()
+        return response.data[0] if response.data else None
+    
     def get_locations(self, limit: int = 100, offset: int = 0, **filters) -> List[Dict[str, Any]]:
         """Get locations with optional filters"""
         query = self.client.table("locations").select("*").limit(limit).offset(offset)
