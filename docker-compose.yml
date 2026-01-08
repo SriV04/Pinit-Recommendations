@@ -5,7 +5,7 @@ services:
       dockerfile: Dockerfile
     container_name: pinit-recommendations-api
     ports:
-      - "8000:8000"
+      - "8080:8080"
     environment:
       - SUPABASE_URL=${SUPABASE_URL}
       - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
@@ -18,7 +18,7 @@ services:
       # - ./output:/app/output
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8000/health')"]
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8080/health')"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -32,13 +32,13 @@ services:
       dockerfile: Dockerfile
     container_name: pinit-recommendations-api-prod
     ports:
-      - "8000:8000"
+      - "8080:8080"
     environment:
       - SUPABASE_URL=${SUPABASE_URL}
       - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8000/health')"]
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8080/health')"]
       interval: 30s
       timeout: 10s
       retries: 3

@@ -1,0 +1,9 @@
+{
+  "rules": [{
+    "id": "keep-recent",
+    "action": "KEEP",
+    "mostRecentVersions": {
+      "keepCount": 5
+    }
+  }]
+}

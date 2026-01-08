@@ -35,9 +35,11 @@ from recommendation.user_profiles import (
 from config import PipelineConfig, PipelinePaths, ReviewTagConfig
 from supabase_client.supabase_service import get_supabase_service
 
-# Configure logging
+# Configure logging (respect LOG_LEVEL env)
+log_level_name = os.getenv("LOG_LEVEL", "INFO").upper()
+log_level = getattr(logging, log_level_name, logging.INFO)
 logging.basicConfig(
-    level=logging.INFO,
+    level=log_level,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
@@ -195,53 +197,68 @@ def get_taste_breakdown(location_id: int, user_id: str, user_tags: pd.DataFrame,
 
 
 def load_data():
-    """Load all necessary data for recommendations."""
+    """Load all necessary data for recommendations from Supabase."""
     global DATA_CACHE
     
     if DATA_CACHE["loaded"]:
         logger.info("Data already loaded, skipping reload")
         return
     
-    logger.info("Starting to load recommendation data...")
+    logger.info("Starting to load recommendation data from Supabase...")
     
-    # Configuration
-    DATA_DIR = Path("data/raw")
-    CITY_NAME = "london"
-    OUTPUT_DIR = Path("output/api_cache")
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    # Get Supabase client
+    supabase = get_supabase_service()
     
-    paths = PipelinePaths(data_dir=DATA_DIR, city_name=CITY_NAME, output_dir=OUTPUT_DIR)
-    review_cfg = ReviewTagConfig(min_unique_authors=2, min_mentions=3)
-    config = PipelineConfig(paths=paths, review_tagging=review_cfg, synthetic_users=True)
-    
-    # Load data
+    # Load tags from Supabase
+    logger.info("Loading tags from Supabase...")
     tags_df = get_tags_dataframe()
-    locations = load_locations(paths)
-    place_lookup = locations.set_index("google_place_id")["location_id"].to_dict()
-    reviews = load_reviews(paths, place_lookup)
-    location_tags = build_location_tags(locations, reviews, config.review_tagging)
+    logger.info(f"Loaded {len(tags_df)} tags")
     
-    # Try to load user tag affinities from Supabase first
-    logger.info("Checking for user tag affinities in Supabase...")
+    # Load locations from Supabase
+    logger.info("Loading locations from Supabase...")
+    # Fetch all locations (large upper bound)
+    locations_data = supabase.get_locations(limit=1_000_000)
+    if not locations_data:
+        logger.error("No locations found in Supabase")
+        raise ValueError("No locations found in Supabase database")
+    
+    locations = pd.DataFrame(locations_data)
+    logger.info(f"Loaded {len(locations):,} locations")
+    
+    # Load location_tags from Supabase
+    logger.info("Loading location tags from Supabase (bulk)...")
+    location_tags_data = supabase.get_location_tags(limit=1_000_000)
+    
+    if not location_tags_data:
+        logger.warning("No location tags found in Supabase")
+        location_tags = pd.DataFrame(columns=['location_id', 'tag_id', 'score'])
+    else:
+        location_tags = pd.DataFrame(location_tags_data)
+        # Add tag_text for easier lookup
+        tag_id_to_text = tags_df.set_index('tag_id')['text'].to_dict()
+        location_tags['tag_text'] = location_tags['tag_id'].map(tag_id_to_text)
+    
+    logger.info(f"Loaded {len(location_tags):,} location-tag associations")
+    
+    # Load user tag affinities from Supabase
+    logger.info("Loading user tag affinities from Supabase...")
     supabase_affinities = load_user_tag_affinities_from_supabase()
     
-    if not supabase_affinities.empty:
-        logger.info(f"Loaded {len(supabase_affinities):,} user tag affinities from Supabase")
-        user_tags = convert_supabase_affinities_to_profile_format(supabase_affinities, tags_df)
-        # Build user history from affinity data
-        user_history = (
-            user_tags.groupby("user_id")
-            .size()
-            .reset_index(name="n_actions")
-            .sort_values(by="n_actions", ascending=False)
-        )
-        logger.info(f"Found {len(user_tags['user_id'].unique())} users in Supabase")
-    else:
-        logger.warning("No user tag affinities found in Supabase, falling back to synthetic/file data...")
-        user_actions, synthetic = ensure_user_actions(paths, locations, location_tags, allow_synthetic=True)
-        user_tags, user_history = build_user_tag_affinities(user_actions, location_tags, locations)
-        if synthetic:
-            logger.info("Generated synthetic user profiles")
+    if supabase_affinities.empty:
+        logger.error("No user tag affinities found in Supabase")
+        raise ValueError("No user tag affinities found in Supabase. Please ensure users have profiles.")
+    
+    logger.info(f"Loaded {len(supabase_affinities):,} user tag affinities")
+    user_tags = convert_supabase_affinities_to_profile_format(supabase_affinities, tags_df)
+    
+    # Build user history from affinity data
+    user_history = (
+        user_tags.groupby("user_id")
+        .size()
+        .reset_index(name="n_actions")
+        .sort_values(by="n_actions", ascending=False)
+    )
+    logger.info(f"Found {len(user_tags['user_id'].unique())} users")
     
     # Cache data
     DATA_CACHE["locations"] = locations
@@ -251,9 +268,6 @@ def load_data():
     DATA_CACHE["user_history"] = user_history
     DATA_CACHE["loaded"] = True
     
-    logger.info(f"Loaded {len(locations):,} locations")
-    logger.info(f"Loaded {len(tags_df)} tags")
-    logger.info(f"Loaded {len(user_tags):,} user-tag affinities")
     logger.info("Data ready for API requests")
 
 

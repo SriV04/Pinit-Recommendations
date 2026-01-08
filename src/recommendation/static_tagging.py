@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 
 from config import PipelinePaths, ReviewTagConfig
-from analysis.hidden_gems import add_hidden_gem_scores
+from recommendation.hidden_gems import add_hidden_gem_scores
 from recommendation.tag_taxonomy import get_tags_dataframe
 
 

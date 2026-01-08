@@ -12,15 +12,20 @@ src_path = Path(__file__).parent / "src"
 sys.path.insert(0, str(src_path))
 
 if __name__ == "__main__":
+    import os
+    
+    # Cloud Run sets PORT=8080, local dev can use 8000
+    port = int(os.getenv("PORT", "8080"))
+    
     print("Starting Pinit Proximal Recommendations API...")
-    print("API Documentation: http://localhost:8000/docs")
-    print("Health Check: http://localhost:8000/health")
+    print(f"API Documentation: http://localhost:{port}/docs")
+    print(f"Health Check: http://localhost:{port}/health")
     print("\nPress CTRL+C to stop\n")
     
     uvicorn.run(
         "api.proximal_api:app",
         host="0.0.0.0",
-        port=8000,
+        port=port,
         reload=True,
         log_level="info"
     )

@@ -1,22 +1,29 @@
-import os
 from typing import Optional, List, Dict, Any
-from dotenv import load_dotenv
+from urllib.parse import urlparse
+import logging
 from supabase import create_client, Client
-
-# Load environment variables
-load_dotenv()
+from config import SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
 
 
 class SupabaseService:
     """Basic Supabase service for CRUD operations"""
     
     def __init__(self):
-        url = os.getenv("SUPABASE_URL")
+        logger = logging.getLogger(__name__)
+        url = (SUPABASE_URL or "").strip()
         # Use service role key for full access
-        key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+        key = (SUPABASE_SERVICE_ROLE_KEY or "").strip()
         
         if not url or not key:
-            raise ValueError("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set in environment")
+            raise ValueError("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set in environment or Secret Manager")
+        
+        # Basic validation + helpful debug logging without leaking secrets
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            masked = url[:32] + ("…" if len(url) > 32 else "")
+            logger.error(f"Invalid SUPABASE_URL format: '{masked}'. Expected like 'https://<ref>.supabase.co'")
+            raise ValueError("Invalid SUPABASE_URL format")
+        logger.debug(f"Initializing SupabaseService for host: {parsed.netloc}")
         
         self.client: Client = create_client(url, key)
     
@@ -117,13 +124,16 @@ class SupabaseService:
         return response.data[0] if response.data else None
     
     def get_location_tags(self, location_id: Optional[int] = None, 
-                         tag_id: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Get location tags, optionally filtered by location_id or tag_id"""
+                         tag_id: Optional[str] = None,
+                         limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Get location tags, optionally filtered, with optional limit."""
         query = self.client.table("location_tags").select("*")
         if location_id:
             query = query.eq("location_id", location_id)
         if tag_id:
             query = query.eq("tag_id", tag_id)
+        if limit:
+            query = query.limit(limit)
         response = query.execute()
         return response.data
     
