@@ -37,7 +37,7 @@ CREATE TABLE public.user_tag_affinities (
 The system automatically checks Supabase for user tag affinities:
 
 ```python
-from recommendation.user_profiles import load_user_tag_affinities_from_supabase
+from pinit.core.recommendation.user_profiles import load_user_tag_affinities_from_supabase
 
 # Load all user affinities
 affinities = load_user_tag_affinities_from_supabase()
@@ -54,8 +54,8 @@ strong_affinities = load_user_tag_affinities_from_supabase(min_affinity=50.0)
 Supabase data and the recommendation system both use the same 0-100 scale for affinity/score:
 
 ```python
-from recommendation.user_profiles import convert_supabase_affinities_to_profile_format
-from recommendation.tag_taxonomy import get_tags_dataframe
+from pinit.core.recommendation.user_profiles import convert_supabase_affinities_to_profile_format
+from pinit.core.recommendation.tag_taxonomy import get_tags_dataframe
 
 tags_df = get_tags_dataframe()
 profile_format = convert_supabase_affinities_to_profile_format(affinities, tags_df)
@@ -88,7 +88,7 @@ profile_format = convert_supabase_affinities_to_profile_format(affinities, tags_
 The API automatically loads from Supabase on startup:
 
 ```python
-# In proximal_api.py load_data() function:
+# In `src/pinit/api/services/proximal_service.py` load_data() function:
 supabase_affinities = load_user_tag_affinities_from_supabase()
 
 if not supabase_affinities.empty:
@@ -107,16 +107,16 @@ Upload user tag affinities from local data to Supabase:
 
 ```bash
 # Dry run (preview what would be uploaded)
-python src/scripts/sync_user_affinities.py --dry-run
+python scripts/sync_user_affinities.py --dry-run
 
 # Upload with synthetic user profiles
-python src/scripts/sync_user_affinities.py --synthetic
+python scripts/sync_user_affinities.py --synthetic
 
 # Upload real user data with custom batch size
-python src/scripts/sync_user_affinities.py --batch-size 50
+python scripts/sync_user_affinities.py --batch-size 50
 
 # Full command with all options
-python src/scripts/sync_user_affinities.py \
+python scripts/sync_user_affinities.py \
   --synthetic \
   --batch-size 100 \
   --dry-run
@@ -157,7 +157,7 @@ Upload Summary
 ### Manual Upload via Python
 
 ```python
-from supabase_client.supabase_service import get_supabase_service
+from pinit.integrations.supabase import get_supabase_service
 
 db = get_supabase_service()
 
@@ -239,7 +239,7 @@ No user tag affinities found in Supabase, falling back to synthetic/file data...
 Once loaded, user tag affinities are used for taste scoring:
 
 ```python
-from recommendation.proximal_recommendation import build_proximal_recommendations
+from pinit.core.recommendation.proximal_recommendation import build_proximal_recommendations
 
 recommendations = build_proximal_recommendations(
     user_id="demo_date_night",

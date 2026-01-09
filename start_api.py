@@ -23,7 +23,7 @@ if __name__ == "__main__":
     print("\nPress CTRL+C to stop\n")
     
     uvicorn.run(
-        "api.proximal_api:app",
+        "pinit.api.main:app",
         host="0.0.0.0",
         port=port,
         reload=True,

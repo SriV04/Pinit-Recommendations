@@ -21,6 +21,6 @@ __all__ = ["run_pipeline"]
 def run_pipeline(*args: Any, **kwargs: Any):
     """Lazy wrapper so importing pinit doesn't pull heavy deps immediately."""
 
-    from .pipeline import run_pipeline as _run_pipeline
+    from pinit.cli.pipeline import run_pipeline as _run_pipeline
 
     return _run_pipeline(*args, **kwargs)
