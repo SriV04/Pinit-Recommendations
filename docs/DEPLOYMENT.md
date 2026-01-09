@@ -105,7 +105,7 @@ gcloud builds submit \
 gcloud run deploy pinit-recommendations-api \
   --image europe-west2-docker.pkg.dev/pinit-a97eb/pinit-api/pinit-recommendations-api:latest \
   --region europe-west2 \
-  --set-env-vars=GOOGLE_CLOUD_PROJECT=pinit-a97eb,GOOGLE_MAPS_API_KEY=${GOOGLE_MAPS_API_KEY},SUPABASE_URL=${SUPABASE_URL},SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY} \
+  --set-env-vars=GOOGLE_CLOUD_PROJECT=pinit-a97eb \
   --service-account=pinit-api-sa@pinit-a97eb.iam.gserviceaccount.com \
   --allow-unauthenticated \
   --timeout=300 \

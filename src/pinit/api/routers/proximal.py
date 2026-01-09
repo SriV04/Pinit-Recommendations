@@ -14,6 +14,8 @@ from pinit.api.schemas import (
     HealthResponse,
     LocationCoordinatesResponse,
     LocationRecommendation,
+    MagicSearchRequest,
+    MagicSearchResponse,
     ProximalRequest,
     ProximalResponse,
     TagMatch,
@@ -25,6 +27,7 @@ from pinit.api.services.proximal_service import (
     fetch_google_place_details,
     get_taste_breakdown,
     process_and_tag_location,
+    search_google_places,
 )
 from pinit.core.recommendation.proximal_recommendation import (
     ProximalConfig,
@@ -347,15 +350,6 @@ async def add_location_by_place_id(request: AddLocationRequest) -> AddLocationRe
             detail=f"Could not fetch details for Google Place ID: {request.google_place_id}",
         )
 
-    # Verify it's a restaurant/food establishment
-    types = place_details.get("types", [])
-    food_types = {"restaurant", "cafe", "bar", "food", "meal_delivery", "meal_takeaway"}
-    if not any(t in food_types for t in types):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Location is not a restaurant or food establishment. Types: {types}",
-        )
-
     # Step 3: Process and tag the location
     try:
         location_id, tags_count = process_and_tag_location(place_details, supabase)
@@ -397,3 +391,156 @@ async def add_location_by_place_id(request: AddLocationRequest) -> AddLocationRe
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Error processing location: {exc}") from exc
+
+
+@router.post("/locations/magic-search", response_model=MagicSearchResponse)
+async def magic_search(request: MagicSearchRequest) -> MagicSearchResponse:
+    """
+    Search Google Places with a free-text prompt, ingest results, and rank them.
+    """
+    if not DATA_CACHE["loaded"]:
+        raise HTTPException(status_code=503, detail="Data still loading, please try again")
+
+    if request.user_id not in DATA_CACHE["user_tags"]["user_id"].values:
+        raise HTTPException(status_code=404, detail=f"User '{request.user_id}' not found")
+
+    try:
+        place_ids = search_google_places(
+            request.prompt,
+            request.latitude,
+            request.longitude,
+            request.radius_km,
+            request.max_results,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    if not place_ids:
+        return MagicSearchResponse(
+            user_id=request.user_id,
+            center_lat=request.latitude,
+            center_lon=request.longitude,
+            prompt=request.prompt,
+            radius_km=request.radius_km,
+            total_candidates=0,
+            total_ranked=0,
+            recommendations=[],
+            timestamp=datetime.utcnow().isoformat(),
+        )
+
+    supabase = get_supabase_service()
+    collected_locations = []
+    collected_location_tags = []
+
+    food_types = {"restaurant", "cafe", "bar", "food", "meal_delivery", "meal_takeaway"}
+
+    for place_id in place_ids:
+        existing = supabase.get_location_by_google_place_id(place_id)
+        if existing:
+            location_id = existing["location_id"]
+        else:
+            place_details = fetch_google_place_details(place_id)
+            if not place_details:
+                continue
+            types = place_details.get("types", [])
+            if not any(t in food_types for t in types):
+                continue
+            try:
+                location_id, _ = process_and_tag_location(place_details, supabase)
+            except Exception:
+                continue
+
+        location = supabase.get_location(location_id)
+        if not location:
+            continue
+
+        collected_locations.append(location)
+        location_tags = supabase.get_location_tags(location_id=location_id)
+        if location_tags:
+            collected_location_tags.extend(location_tags)
+
+    if not collected_locations:
+        return MagicSearchResponse(
+            user_id=request.user_id,
+            center_lat=request.latitude,
+            center_lon=request.longitude,
+            prompt=request.prompt,
+            radius_km=request.radius_km,
+            total_candidates=len(place_ids),
+            total_ranked=0,
+            recommendations=[],
+            timestamp=datetime.utcnow().isoformat(),
+        )
+
+    locations_df = pd.DataFrame(collected_locations)
+    if collected_location_tags:
+        location_tags_df = pd.DataFrame(collected_location_tags)
+        if "tag_text" not in location_tags_df.columns:
+            tag_id_to_text = {}
+            if DATA_CACHE["tags"] is not None:
+                tag_id_to_text = DATA_CACHE["tags"].set_index("tag_id")["text"].to_dict()
+            location_tags_df["tag_text"] = location_tags_df["tag_id"].map(tag_id_to_text)
+    else:
+        location_tags_df = pd.DataFrame(columns=["location_id", "tag_id", "score", "tag_text"])
+
+    config = ProximalConfig(
+        radius_km=request.radius_km,
+        max_results=request.max_results,
+    )
+
+    recs = build_proximal_recommendations(
+        request.user_id,
+        request.latitude,
+        request.longitude,
+        locations_df,
+        DATA_CACHE["user_tags"],
+        location_tags_df,
+        config,
+    )
+
+    recommendations = []
+    for _, row in recs.iterrows():
+        taste_breakdown = None
+        if request.include_taste_breakdown:
+            breakdown = get_taste_breakdown(
+                location_id=int(row["location_id"]),
+                user_id=request.user_id,
+                user_tags=DATA_CACHE["user_tags"],
+                location_tags=location_tags_df,
+                top_n=5,
+            )
+            if breakdown:
+                taste_breakdown = [TagMatch(**item) for item in breakdown]
+
+        recommendations.append(
+            LocationRecommendation(
+                location_id=int(row["location_id"]),
+                name=row["name"],
+                vicinity=row.get("vicinity"),
+                cuisine_primary=row.get("cuisine_primary"),
+                rating=float(row["rating"]) if pd.notna(row.get("rating")) else None,
+                user_ratings_total=int(row["user_ratings_total"])
+                if pd.notna(row.get("user_ratings_total"))
+                else None,
+                price_level=float(row["price_level"]) if pd.notna(row.get("price_level")) else None,
+                distance_km=float(row["distance_km"]),
+                taste_score=float(row["taste_score"]),
+                proximity_score=float(row["proximity_score"]),
+                quality_score=float(row["quality_score"]),
+                final_score=float(row["final_score"]),
+                rank=int(row["rank"]),
+                taste_breakdown=taste_breakdown,
+            )
+        )
+
+    return MagicSearchResponse(
+        user_id=request.user_id,
+        center_lat=request.latitude,
+        center_lon=request.longitude,
+        prompt=request.prompt,
+        radius_km=request.radius_km,
+        total_candidates=len(place_ids),
+        total_ranked=len(recommendations),
+        recommendations=recommendations,
+        timestamp=datetime.utcnow().isoformat(),
+    )

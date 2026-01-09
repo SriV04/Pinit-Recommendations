@@ -100,3 +100,25 @@ class AddLocationResponse(BaseModel):
     already_existed: bool
     photo_reference: Optional[str] = None
     photo_score: Optional[int] = None
+
+
+class MagicSearchRequest(BaseModel):
+    user_id: str = Field(..., description="User identifier")
+    latitude: float = Field(..., description="Center point latitude", ge=-90, le=90)
+    longitude: float = Field(..., description="Center point longitude", ge=-180, le=180)
+    prompt: str = Field(..., description="Free-text search prompt")
+    radius_km: Optional[float] = Field(2.0, description="Search radius in kilometers", gt=0, le=50)
+    max_results: Optional[int] = Field(20, description="Max number of places to search and rank", ge=1, le=50)
+    include_taste_breakdown: Optional[bool] = Field(False, description="Include detailed taste score breakdown")
+
+
+class MagicSearchResponse(BaseModel):
+    user_id: str
+    center_lat: float
+    center_lon: float
+    prompt: str
+    radius_km: float
+    total_candidates: int
+    total_ranked: int
+    recommendations: List[LocationRecommendation]
+    timestamp: str

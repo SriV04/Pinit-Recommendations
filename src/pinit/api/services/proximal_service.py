@@ -349,6 +349,39 @@ def fetch_google_place_details(google_place_id: str) -> Optional[Dict[str, Any]]
         return None
 
 
+def search_google_places(
+    prompt: str,
+    latitude: float,
+    longitude: float,
+    radius_km: float,
+    max_results: int,
+) -> List[str]:
+    """Search Google Places with a text prompt and return place IDs."""
+    api_key = GOOGLE_MAPS_API_KEY
+    if not api_key:
+        logger.error("GOOGLE_MAPS_API_KEY not found in environment variables")
+        raise ValueError("GOOGLE_MAPS_API_KEY not found in environment variables")
+
+    url = "https://maps.googleapis.com/maps/api/place/textsearch/json"
+    params = {
+        "query": prompt,
+        "location": f"{latitude},{longitude}",
+        "radius": int(radius_km * 1000),
+        "key": api_key,
+    }
+
+    response = requests.get(url, params=params, timeout=10)
+    response.raise_for_status()
+    data = response.json()
+
+    if data.get("status") not in {"OK", "ZERO_RESULTS"}:
+        raise ValueError(f"Google Places Text Search error: {data.get('status')}")
+
+    results = data.get("results", [])
+    place_ids = [item.get("place_id") for item in results if item.get("place_id")]
+    return place_ids[:max_results]
+
+
 def process_and_tag_location(place_details: Dict[str, Any], supabase) -> Tuple[int, int]:
     """
     Process place details, create location entry, and generate tags.
