@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import logging
 from typing import Any, Dict
 
 import pandas as pd
@@ -38,6 +39,7 @@ from pinit.core.recommendation.proximal_recommendation import (
 from pinit.integrations.supabase import get_supabase_service
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 @router.get("/", response_model=Dict[str, str])
@@ -363,7 +365,40 @@ async def add_location_by_place_id(request: AddLocationRequest) -> AddLocationRe
             if not api_key:
                 raise HTTPException(status_code=500, detail="GOOGLE_MAPS_API_KEY not configured")
 
-            photo_ref, photo_score = classify_location_photo(request.google_place_id, api_key)
+            (
+                photo_ref,
+                photo_score,
+                photo_bytes,
+                photo_content_type,
+            ) = classify_location_photo(request.google_place_id, api_key)
+
+            if photo_bytes:
+                logger.info(
+                    "Attempting to upload photo for location %s (%d bytes, type: %s)",
+                    location_id,
+                    len(photo_bytes),
+                    photo_content_type,
+                )
+                try:
+                    upload_result = supabase.upload_location_photo(
+                        location_id,
+                        photo_bytes,
+                        content_type=photo_content_type,
+                    )
+                    logger.info(
+                        "✅ Successfully uploaded photo for location %s. Result: %s",
+                        location_id,
+                        upload_result,
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "❌ Failed to upload photo for location %s: %s",
+                        location_id,
+                        exc,
+                        exc_info=True,
+                    )
+            else:
+                logger.warning("No photo bytes available to upload for location %s", location_id)
 
             # Update location with photo data
             if photo_ref or photo_score:

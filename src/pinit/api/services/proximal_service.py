@@ -180,14 +180,15 @@ def get_photo_reference(place_id: str, api_key: str) -> Optional[str]:
         return None
 
 
-def download_photo(photo_reference: str, api_key: str) -> Optional[bytes]:
-    """Download image bytes from Google Places Photo API."""
+def download_photo(photo_reference: str, api_key: str) -> Optional[Tuple[bytes, str]]:
+    """Download image bytes and content type from Google Places Photo API."""
     url = f"https://places.googleapis.com/v1/{photo_reference}/media?maxHeightPx=400&maxWidthPx=400&key={api_key}"
 
     try:
         response = requests.get(url, timeout=10)
         response.raise_for_status()
-        return response.content
+        content_type = response.headers.get("Content-Type", "image/jpeg")
+        return response.content, content_type
     except Exception as exc:
         logger.warning("Error downloading photo: %s", exc)
         return None
@@ -244,7 +245,8 @@ Score: [1, 2, or 3]""",
         )
 
         result_text = response.choices[0].message.content
-        score_match = re.search(r"Score:\\s*(\\d)", result_text)
+        logger.info("OpenAI response: %s", result_text)
+        score_match = re.search(r"Score:\s*(\d)", result_text)
 
         if score_match:
             score = int(score_match.group(1))
@@ -257,10 +259,12 @@ Score: [1, 2, or 3]""",
         return None
 
 
-def classify_location_photo(google_place_id: str, api_key: str) -> Tuple[Optional[str], Optional[int]]:
+def classify_location_photo(
+    google_place_id: str, api_key: str
+) -> Tuple[Optional[str], Optional[int], Optional[bytes], Optional[str]]:
     """
     Fetch and classify the primary photo for a location.
-    Returns (photo_reference, photo_score) tuple.
+    Returns (photo_reference, photo_score, image_bytes, content_type) tuple.
     """
     logger.info("Starting photo classification for place ID: %s", google_place_id)
 
@@ -268,22 +272,26 @@ def classify_location_photo(google_place_id: str, api_key: str) -> Tuple[Optiona
     photo_ref = get_photo_reference(google_place_id, api_key)
     if not photo_ref:
         logger.info("No photo found for location")
-        return None, None
+        return None, None, None, None
 
     logger.info("Found photo reference: %s", photo_ref)
 
     # Download photo
-    image_bytes = download_photo(photo_ref, api_key)
-    if not image_bytes:
+    download_result = download_photo(photo_ref, api_key)
+    if not download_result:
         logger.warning("Failed to download photo")
-        return photo_ref, None
+        return photo_ref, None, None, None
 
+    image_bytes, content_type = download_result
     logger.info("Downloaded photo (%d bytes)", len(image_bytes))
 
     # Classify with OpenAI
     score = classify_image_with_openai(image_bytes)
+    
+    if score is None:
+        logger.warning("Photo classification returned None, but photo was downloaded successfully")
 
-    return photo_ref, score
+    return photo_ref, score, image_bytes, content_type
 
 
 def fetch_google_place_details(google_place_id: str) -> Optional[Dict[str, Any]]:

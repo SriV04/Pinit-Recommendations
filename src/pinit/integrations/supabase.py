@@ -4,6 +4,20 @@ import logging
 from supabase import create_client, Client
 from pinit.config.secrets import SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
 
+_CONTENT_TYPE_EXTENSIONS = {
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+}
+
+
+def _extension_for_content_type(content_type: Optional[str]) -> str:
+    if not content_type:
+        return ""
+    normalized = content_type.split(";", 1)[0].strip().lower()
+    return _CONTENT_TYPE_EXTENSIONS.get(normalized, "")
+
 
 class SupabaseService:
     """Basic Supabase service for CRUD operations"""
@@ -16,6 +30,10 @@ class SupabaseService:
         
         if not url or not key:
             raise ValueError("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set in environment or Secret Manager")
+        
+        # Ensure URL has trailing slash for storage endpoints
+        if not url.endswith("/"):
+            url = url + "/"
         
         # Basic validation + helpful debug logging without leaking secrets
         parsed = urlparse(url)
@@ -98,6 +116,47 @@ class SupabaseService:
         """Delete a location"""
         response = self.client.table("locations").delete().eq("location_id", location_id).execute()
         return len(response.data) > 0
+
+    def upload_location_photo(
+        self,
+        location_id: int,
+        image_bytes: bytes,
+        content_type: Optional[str] = None,
+    ) -> Any:
+        """Upload a location photo to the location_photos bucket."""
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        file_options = {
+            "content-type": content_type or "image/jpeg",
+            "upsert": "true",
+        }
+        extension = _extension_for_content_type(content_type)
+        object_name = f"{location_id}{extension}"
+        
+        logger.info(
+            "Uploading to Supabase storage: bucket='location_photos', object='%s', size=%d bytes",
+            object_name,
+            len(image_bytes),
+        )
+        logger.debug("File options: %s", file_options)
+        
+        try:
+            result = self.client.storage.from_("location_photos").upload(
+                object_name,
+                image_bytes,
+                file_options,
+            )
+            logger.info("Supabase storage upload response: %s", result)
+            return result
+        except Exception as exc:
+            logger.error(
+                "Supabase storage upload failed for object '%s': %s",
+                object_name,
+                exc,
+                exc_info=True,
+            )
+            raise
     
     # ==================== LOCATION_TAGS CRUD ====================
     
