@@ -88,6 +88,7 @@ class HealthResponse(BaseModel):
 class AddLocationRequest(BaseModel):
     google_place_id: str = Field(..., description="Google Place ID for the location")
     classify_photo: Optional[bool] = Field(True, description="Whether to classify the location's photo with AI")
+    generate_emoji: Optional[bool] = Field(True, description="Whether to generate an emoji for the location")
 
 
 class AddLocationResponse(BaseModel):
@@ -100,6 +101,7 @@ class AddLocationResponse(BaseModel):
     already_existed: bool
     photo_reference: Optional[str] = None
     photo_score: Optional[int] = None
+    emoji: Optional[str] = None
 
 
 class MagicSearchRequest(BaseModel):

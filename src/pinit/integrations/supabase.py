@@ -107,6 +107,12 @@ class SupabaseService:
         response = query.execute()
         return response.data
     
+    def get_location_without_emoji(self) -> List[Dict[str, Any]]:
+        """Get locations without an emoji assigned"""
+        query = self.client.table("locations").select("*").is_("emoji", None)
+        response = query.execute()
+        return response.data
+    
     def update_location(self, location_id: int, **kwargs) -> Optional[Dict[str, Any]]:
         """Update a location"""
         response = self.client.table("locations").update(kwargs).eq("location_id", location_id).execute()
@@ -126,21 +132,21 @@ class SupabaseService:
         """Upload a location photo to the location_photos bucket."""
         import logging
         logger = logging.getLogger(__name__)
-        
+
         file_options = {
             "content-type": content_type or "image/jpeg",
             "upsert": "true",
         }
         extension = _extension_for_content_type(content_type)
         object_name = f"{location_id}{extension}"
-        
+
         logger.info(
             "Uploading to Supabase storage: bucket='location_photos', object='%s', size=%d bytes",
             object_name,
             len(image_bytes),
         )
         logger.debug("File options: %s", file_options)
-        
+
         try:
             result = self.client.storage.from_("location_photos").upload(
                 object_name,
@@ -148,6 +154,20 @@ class SupabaseService:
                 file_options,
             )
             logger.info("Supabase storage upload response: %s", result)
+
+            # Update the location record saying image is stored
+            try:
+                self.update_location(location_id, image_stored=True)
+                logger.info("Successfully updated image_url for location %s", location_id)
+            except Exception as update_exc:
+                logger.error(
+                    "Failed to update image_url for location %s: %s",
+                    location_id,
+                    update_exc,
+                    exc_info=True,
+                )
+                # Don't raise - photo upload succeeded, URL update is secondary
+
             return result
         except Exception as exc:
             logger.error(

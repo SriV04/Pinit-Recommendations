@@ -24,6 +24,7 @@ from pinit.api.schemas import (
 from pinit.config.secrets import GOOGLE_MAPS_API_KEY
 from pinit.api.services.proximal_service import (
     DATA_CACHE,
+    add_location_emoji,
     classify_location_photo,
     fetch_google_place_details,
     get_taste_breakdown,
@@ -356,7 +357,15 @@ async def add_location_by_place_id(request: AddLocationRequest) -> AddLocationRe
     try:
         location_id, tags_count = process_and_tag_location(place_details, supabase)
 
-        # Step 4: Classify photo if requested
+        # Step 4: Generate emoji if requested
+        emoji = None
+        if request.generate_emoji:
+            emoji = add_location_emoji(place_details)
+            if emoji:
+                supabase.update_location(location_id, emoji=emoji)
+                logger.info("Added emoji '%s' for location %s", emoji, location_id)
+
+        # Step 5: Classify photo if requested
         photo_ref = None
         photo_score = None
 
@@ -421,6 +430,7 @@ async def add_location_by_place_id(request: AddLocationRequest) -> AddLocationRe
             already_existed=False,
             photo_reference=photo_ref,
             photo_score=photo_score,
+            emoji=emoji,
         )
     except HTTPException:
         raise

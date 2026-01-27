@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -22,6 +23,39 @@ from pinit.core.recommendation.user_profiles import (
 from pinit.integrations.supabase import get_supabase_service
 
 logger = logging.getLogger(__name__)
+
+# Load emoji classification prompt from file
+EMOJI_PROMPT_TEMPLATE: Optional[str] = None
+EMOJI_PROMPT_FALLBACK = """Based on the restaurant information below, select a SINGLE emoji that best represents this location. Consider the cuisine type, atmosphere, and overall vibe.
+
+Examples:
+- Pizza place → 🍕
+- Coffee shop → ☕
+- Sushi restaurant → 🍣
+- Burger joint → 🍔
+- Fine dining → 🍽️
+- Bar → 🍺
+
+Respond with ONLY the emoji, nothing else.
+
+Restaurant data:
+{restaurant_json}"""
+
+try:
+    prompt_path = Path(__file__).parent / "prompt.md"
+    if prompt_path.exists():
+        EMOJI_PROMPT_TEMPLATE = prompt_path.read_text(encoding="utf-8")
+        # Validate template has the placeholder
+        if "{restaurant_json}" not in EMOJI_PROMPT_TEMPLATE:
+            logger.warning("prompt.md missing {restaurant_json} placeholder, using fallback")
+            EMOJI_PROMPT_TEMPLATE = None
+        else:
+            logger.info("Successfully loaded emoji classification prompt from %s", prompt_path)
+    else:
+        logger.warning("Emoji prompt file not found at %s, using fallback", prompt_path)
+except Exception as exc:
+    logger.error("Error loading emoji prompt file: %s, using fallback", exc)
+    EMOJI_PROMPT_TEMPLATE = None
 
 DATA_CACHE: Dict[str, Any] = {
     "locations": None,
@@ -256,6 +290,113 @@ Score: [1, 2, or 3]""",
         return None
     except Exception as exc:
         logger.error("Error classifying image with OpenAI: %s", exc, exc_info=True)
+        return None
+
+
+def add_location_emoji(place_details: Dict[str, Any]) -> Optional[str]:
+    """Generate an emoji for a location using OpenAI's sophisticated 6-step classification process.
+
+    Uses a comprehensive prompt that prioritizes:
+    1. Drink establishments (coffee, tea, bars)
+    2. Signature food types (pizza, sushi, ramen, etc.)
+    3. Cuisine by country/origin (Italian, Japanese, etc.)
+    4. Venue/place type (fine dining, rooftop, etc.)
+    5. Dietary focus (vegan, etc.)
+    6. Generic fallback
+
+    Args:
+        place_details: Google Places data containing name, types, price_level, rating,
+                      editorial_summary, reviews, vicinity
+
+    Returns:
+        Single emoji string (e.g., "🍕") or None if generation fails
+    """
+    # 1. Check API key
+    openai_key = os.getenv("OPENAI_API_KEY")
+    if not openai_key:
+        logger.warning("OPENAI_API_KEY not found, skipping emoji generation")
+        return None
+
+    # 2. Extract relevant context
+    name = place_details.get("name", "Unknown")
+    types = place_details.get("types", [])
+    # Handle types as either list or comma-separated string
+    if isinstance(types, str):
+        types = [t.strip() for t in types.split(",") if t.strip()]
+
+    price_level = place_details.get("price_level")
+    rating = place_details.get("rating")
+
+    # Handle editorial_summary as both dict and string
+    editorial_summary = place_details.get("editorial_summary", {})
+    if isinstance(editorial_summary, dict):
+        editorial_summary_text = editorial_summary.get("overview", "")
+    else:
+        editorial_summary_text = editorial_summary or ""
+
+    # Extract vicinity
+    vicinity = place_details.get("vicinity", "")
+
+    # Extract and limit reviews to top 3
+    reviews = place_details.get("reviews", [])
+    if reviews and isinstance(reviews, list):
+        reviews = reviews[:3]
+
+    # 3. Build restaurant JSON matching prompt.md expectations
+    restaurant_data = {
+        "name": name,
+        "types": types,
+        "rating": rating,
+        "price_level": price_level,
+        "editorial_summary": {"overview": editorial_summary_text} if editorial_summary_text else None,
+        "reviews": [
+            {
+                "text": review.get("text", ""),
+                "rating": review.get("rating"),
+                "author": review.get("author_name", ""),
+                "time": review.get("time")
+            }
+            for review in reviews
+        ] if reviews else [],
+        "vicinity": vicinity
+    }
+
+    # 4. Build prompt with template replacement
+    if EMOJI_PROMPT_TEMPLATE:
+        restaurant_json = json.dumps(restaurant_data, indent=2, ensure_ascii=False)
+        prompt_content = EMOJI_PROMPT_TEMPLATE.replace("{restaurant_json}", restaurant_json)
+    else:
+        # Use fallback prompt
+        restaurant_json = json.dumps(restaurant_data, indent=2, ensure_ascii=False)
+        prompt_content = EMOJI_PROMPT_FALLBACK.replace("{restaurant_json}", restaurant_json)
+
+    # 5. Call OpenAI
+    try:
+        client = OpenAI(api_key=openai_key)
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt_content
+                }
+            ],
+            max_tokens=20,
+            temperature=0.1,
+        )
+
+        result_text = response.choices[0].message.content.strip()
+        logger.info("Generated emoji for %s: %s", name, result_text)
+
+        # 5. Validate (emoji should be 1-4 chars)
+        if result_text and len(result_text) <= 4:
+            return result_text
+
+        logger.warning("Invalid emoji response: %s", result_text)
+        return None
+
+    except Exception as exc:
+        logger.error("Error generating emoji for %s: %s", name, exc, exc_info=True)
         return None
 
 
