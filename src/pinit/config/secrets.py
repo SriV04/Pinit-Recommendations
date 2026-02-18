@@ -75,6 +75,6 @@ SUPABASE_SERVICE_ROLE_KEY = (
 )
 
 SUPABASE_ANON_KEY = get_secret("supabase-anon-key")
-GOOGLE_MAPS_API_KEY = get_secret("google-maps-api-key")
 GEMINI_API_KEY = get_secret("gemini-api-key")
 GOOGLE_PLACE_API_KEY = get_secret("google-place-api-key")
+XAI_API_KEY = get_secret("xai-api-key")

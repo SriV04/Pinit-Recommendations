@@ -10,7 +10,16 @@ services:
       - PORT=8080
       - SUPABASE_URL=${SUPABASE_URL}
       - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
-      - GOOGLE_MAPS_API_KEY=${GOOGLE_MAPS_API_KEY}
+      - GOOGLE_PLACE_API_KEY=${GOOGLE_PLACE_API_KEY}
+      # Redis config from .env file (using Upstash)
+      - REDIS_HOST=${REDIS_HOST}
+      - REDIS_PORT=${REDIS_PORT:-6379}
+      - REDIS_DB=${REDIS_DB:-0}
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+      - REDIS_SSL=${REDIS_SSL:-false}
+      - CACHING_ENABLED=${CACHING_ENABLED:-true}
+      - CACHE_LARGE_RADIUS_KM=${CACHE_LARGE_RADIUS_KM:-15.0}
+      - CACHE_UNFILTERED_TTL=${CACHE_UNFILTERED_TTL:-1800}
     env_file:
       - .env
     restart: unless-stopped

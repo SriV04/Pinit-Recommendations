@@ -4,6 +4,21 @@ import logging
 from supabase import create_client, Client
 from pinit.config.secrets import SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
 
+# Import cache service (with lazy loading to avoid circular imports)
+_cache_service = None
+
+def _get_cache_service():
+    """Lazy load cache service to avoid circular imports."""
+    global _cache_service
+    if _cache_service is None:
+        try:
+            from pinit.api.services.cache_service import get_cache_service
+            _cache_service = get_cache_service()
+        except Exception as exc:
+            logging.getLogger(__name__).warning("Failed to load cache service: %s", exc)
+            _cache_service = False  # Mark as failed to avoid retrying
+    return _cache_service if _cache_service is not False else None
+
 _CONTENT_TYPE_EXTENSIONS = {
     "image/jpeg": ".jpg",
     "image/jpg": ".jpg",
@@ -44,7 +59,18 @@ class SupabaseService:
         logger.debug(f"Initializing SupabaseService for host: {parsed.netloc}")
         
         self.client: Client = create_client(url, key)
-    
+
+        self.vibe_tag_order = {
+    "cafe": 0, "casual": 1, "cozy": 2, "coffee_shop": 3, "bar": 4,
+    "elegant": 5, "fine_dining": 6, "food_truck": 7, "hole_in_the_wall": 8, "late_night": 9,
+    "live_music": 10, "michelin_starred": 11, "modern": 12, "fast_food": 13, "quiet": 14,
+    "romantic": 15, "sports_bar": 16, "trendy": 17, "takeout_friendly": 18, "pub": 19, "grocery_store": 20, "brunch": 21, "outdoor_dining": 22, "wavy": 23, "bossman": 24
+        }
+
+        self.dietary_requirements_order = {
+            "halal": 0, "vegan": 1, "gluten-free": 2, "vegetarian": 3, "dairy-free": 4, "nut-free": 5
+        }
+
     # ==================== TAGS CRUD ====================
     
     def create_tag(self, text: str, prompt_description: Optional[str] = None, 
@@ -87,6 +113,18 @@ class SupabaseService:
         """Create a new location"""
         data = {"name": name, **kwargs}
         response = self.client.table("locations").insert(data).execute()
+
+        # Invalidate geographic cache if location has coordinates
+        if response.data:
+            location = response.data[0]
+            lat = location.get("lat") or kwargs.get("lat")
+            lng = location.get("lng") or kwargs.get("lng")
+
+            if lat is not None and lng is not None:
+                cache = _get_cache_service()
+                if cache:
+                    cache.invalidate_geographic_cache(lat, lng, radius_km=20.0)
+
         return response.data[0] if response.data else None
     
     def get_location(self, location_id: int) -> Optional[Dict[str, Any]]:
@@ -107,6 +145,60 @@ class SupabaseService:
         response = query.execute()
         return response.data
     
+    def get_locations_with_quality_scores(
+        self,
+        latitude: float,
+        longitude: float,
+        radius_km: float,
+        limit: int = 6000
+    ) -> List[Dict[str, Any]]:
+        """
+        Get locations within a radius with quality scores pre-computed.
+
+        Uses PostGIS geography column for efficient spatial filtering and
+        computes quality scores in the database. Results are user-agnostic
+        and can be cached by lat/lng for all users.
+
+        Args:
+            latitude: Center point latitude
+            longitude: Center point longitude
+            radius_km: Radius in kilometers
+            limit: Maximum number of results
+
+        Returns:
+            List of location dictionaries with quality_score field
+        """
+        logger = logging.getLogger(__name__)
+        try:
+            # PostGIS ST_DWithin uses meters for geography type
+            radius_meters = radius_km * 1000
+
+            # Call the database function that computes quality scores
+            # This returns locations with quality_score already computed
+            response = (
+                self.client.rpc(
+                    'get_locations_with_quality',
+                    {
+                        'center_lat': latitude,
+                        'center_lng': longitude,
+                        'radius_meters': radius_meters,
+                        'result_limit': limit
+                    }
+                ).execute()
+            )
+
+            logger.info(
+                f"Spatial query returned {len(response.data)} locations within {radius_km}km "
+                f"with pre-computed quality scores"
+            )
+            return response.data
+
+        except Exception as exc:
+            logger.error(f"Error querying locations with quality scores: {exc}")
+            logger.warning("Falling back to loading all locations")
+            # Fallback: get locations without quality scores
+            return self.get_locations(limit=limit)
+
     def get_location_without_emoji(self) -> List[Dict[str, Any]]:
         """Get locations without an emoji assigned"""
         query = self.client.table("locations").select("*").is_("emoji", None)
@@ -115,7 +207,21 @@ class SupabaseService:
     
     def update_location(self, location_id: int, **kwargs) -> Optional[Dict[str, Any]]:
         """Update a location"""
+        # Get current location to find coordinates for cache invalidation
+        current_location = self.get_location(location_id)
+
         response = self.client.table("locations").update(kwargs).eq("location_id", location_id).execute()
+
+        # Invalidate geographic cache if location has coordinates
+        if current_location:
+            lat = current_location.get("lat")
+            lng = current_location.get("lng")
+
+            if lat is not None and lng is not None:
+                cache = _get_cache_service()
+                if cache:
+                    cache.invalidate_geographic_cache(lat, lng, radius_km=20.0)
+
         return response.data[0] if response.data else None
     
     def delete_location(self, location_id: int) -> bool:
@@ -178,53 +284,6 @@ class SupabaseService:
             )
             raise
     
-    # ==================== LOCATION_TAGS CRUD ====================
-    
-    def create_location_tag(self, location_id: int, tag_id: str, score: Optional[float] = None,
-                           source: Optional[str] = None, metadata: Optional[Dict] = None) -> Dict[str, Any]:
-        """Create a location-tag association"""
-        data = {
-            "location_id": location_id,
-            "tag_id": tag_id
-        }
-        if score is not None:
-            data["score"] = score
-        if source:
-            data["source"] = source
-        if metadata:
-            data["metadata"] = metadata
-            
-        response = self.client.table("location_tags").insert(data).execute()
-        return response.data[0] if response.data else None
-    
-    def get_location_tag(self, location_tag_id: int) -> Optional[Dict[str, Any]]:
-        """Get a location_tag by ID"""
-        response = self.client.table("location_tags").select("*").eq("id", location_tag_id).execute()
-        return response.data[0] if response.data else None
-    
-    def get_location_tags(self, location_id: Optional[int] = None, 
-                         tag_id: Optional[str] = None,
-                         limit: Optional[int] = None) -> List[Dict[str, Any]]:
-        """Get location tags, optionally filtered, with optional limit."""
-        query = self.client.table("location_tags").select("*")
-        if location_id:
-            query = query.eq("location_id", location_id)
-        if tag_id:
-            query = query.eq("tag_id", tag_id)
-        if limit:
-            query = query.limit(limit)
-        response = query.execute()
-        return response.data
-    
-    def update_location_tag(self, location_tag_id: int, **kwargs) -> Optional[Dict[str, Any]]:
-        """Update a location_tag"""
-        response = self.client.table("location_tags").update(kwargs).eq("id", location_tag_id).execute()
-        return response.data[0] if response.data else None
-    
-    def delete_location_tag(self, location_tag_id: int) -> bool:
-        """Delete a location_tag"""
-        response = self.client.table("location_tags").delete().eq("id", location_tag_id).execute()
-        return len(response.data) > 0
     
     # ==================== RECOMMENDATION_CANDIDATES CRUD ====================
     
@@ -274,13 +333,38 @@ class SupabaseService:
         response = self.client.table("recommendation_candidates").delete().eq("candidate_id", candidate_id).execute()
         return len(response.data) > 0
     
+    # ==================== USERS CRUD ====================
+
+    def get_user(self, user_id: str) -> Optional[Dict[str, Any]]:
+        """Get a user by supabase_id with their vector affinities."""
+        logger = logging.getLogger(__name__)
+        try:
+            response = self.client.table("users").select("*").eq("supabase_id", user_id).execute()
+            return response.data[0] if response.data else None
+        except Exception as exc:
+            logger.error(f"Error getting user {user_id}: {exc}")
+            return None
+
+    def get_users(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Get all users with their vector affinities."""
+        logger = logging.getLogger(__name__)
+        try:
+            query = self.client.table("users").select("*")
+            if limit:
+                query = query.limit(limit)
+            response = query.execute()
+            return response.data if response.data else []
+        except Exception as exc:
+            logger.error(f"Error getting users: {exc}")
+            return []
+
     # ==================== USER_TAG_AFFINITIES CRUD ====================
-    
+
     def create_user_tag_affinity(self, user_id: str, tag_id: str, affinity: float,
                                 evidence: Optional[Dict] = None) -> Dict[str, Any]:
         """
         Create or upsert a user tag affinity.
-        
+
         Args:
             user_id: User UUID
             tag_id: Tag UUID
@@ -294,8 +378,14 @@ class SupabaseService:
         }
         if evidence:
             data["evidence"] = evidence
-            
+
         response = self.client.table("user_tag_affinities").upsert(data).execute()
+
+        # Invalidate user's cache entries
+        cache = _get_cache_service()
+        if cache:
+            cache.invalidate_user_cache(user_id)
+
         return response.data[0] if response.data else None
     
     def get_user_tag_affinity(self, user_id: str, tag_id: str) -> Optional[Dict[str, Any]]:
@@ -338,6 +428,12 @@ class SupabaseService:
                    .eq("user_id", user_id)
                    .eq("tag_id", tag_id)
                    .execute())
+
+        # Invalidate user's cache entries
+        cache = _get_cache_service()
+        if cache:
+            cache.invalidate_user_cache(user_id)
+
         return response.data[0] if response.data else None
     
     def delete_user_tag_affinity(self, user_id: str, tag_id: str) -> bool:
@@ -348,6 +444,52 @@ class SupabaseService:
                    .eq("tag_id", tag_id)
                    .execute())
         return len(response.data) > 0
+
+    # ==================== USER_LOCATION_ACTIONS CRUD ====================
+
+    def get_user_location_actions(self, user_id: Optional[str] = None,
+                                  location_id: Optional[int] = None,
+                                  action_type: Optional[str] = None,
+                                  limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        """
+        Get user location actions (check-ins, saves, ratings, etc.).
+
+        Args:
+            user_id: Optional user ID to filter by
+            location_id: Optional location ID to filter by
+            action_type: Optional action type (e.g., 'check_in', 'save', 'rating')
+            limit: Optional limit on results
+
+        Returns:
+            List of action records
+        """
+        query = self.client.table("user_location_actions").select("*")
+        if user_id:
+            query = query.eq("user_id", user_id)
+        if location_id:
+            query = query.eq("location_id", location_id)
+        if action_type:
+            query = query.eq("action_type", action_type)
+        if limit:
+            query = query.limit(limit)
+        response = query.execute()
+        return response.data
+
+    def get_user_action_count(self, user_id: str) -> int:
+        """
+        Get total number of actions for a user.
+
+        Args:
+            user_id: User ID
+
+        Returns:
+            Total count of actions
+        """
+        response = (self.client.table("user_location_actions")
+                   .select("*", count="exact")
+                   .eq("user_id", user_id)
+                   .execute())
+        return response.count if hasattr(response, 'count') else len(response.data)
 
 
 # Singleton instance

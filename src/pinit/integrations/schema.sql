@@ -52,18 +52,6 @@ CREATE TABLE public.location_reviews (
   CONSTRAINT location_reviews_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(supabase_id),
   CONSTRAINT location_reviews_location_id_fkey FOREIGN KEY (location_id) REFERENCES public.locations(location_id)
 );
-CREATE TABLE public.location_tags (
-  id bigint GENERATED ALWAYS AS IDENTITY NOT NULL,
-  created_at timestamp with time zone NOT NULL DEFAULT now(),
-  location_id bigint,
-  tag_id uuid,
-  score numeric,
-  source text,
-  metadata jsonb,
-  CONSTRAINT location_tags_pkey PRIMARY KEY (id),
-  CONSTRAINT location_tags_location_id_fkey FOREIGN KEY (location_id) REFERENCES public.locations(location_id),
-  CONSTRAINT location_tags_tag_id_fkey FOREIGN KEY (tag_id) REFERENCES public.tags(tag_id)
-);
 CREATE TABLE public.locations (
   location_id bigint NOT NULL DEFAULT nextval('locations_location_id_seq'::regclass),
   name text NOT NULL,
@@ -89,14 +77,11 @@ CREATE TABLE public.locations (
   cuisine_detected text,
   cuisine_source text,
   cuisine_primary text,
-  top_review_language text,
-  top_language_share numeric,
   review_language_counts_json jsonb,
   is_open_late boolean,
   is_open_early boolean,
   is_sunday_open boolean,
   price_bucket text,
-  log_reviews numeric,
   derived_attributes jsonb,
   data_version text NOT NULL DEFAULT 'v1'::text,
   ingested_at timestamp with time zone NOT NULL DEFAULT now(),
@@ -104,6 +89,35 @@ CREATE TABLE public.locations (
   photo_reference_score text,
   image_stored boolean DEFAULT false,
   emoji text,
+  updated_at timestamp with time zone DEFAULT (now() AT TIME ZONE 'utc'::text),
+  google_maps_uri text,
+  photos jsonb,
+  reviews jsonb,
+  review_summary text,
+  good_for_children boolean,
+  good_for_groups boolean,
+  good_for_watching_sports boolean,
+  live_music boolean,
+  outdoor_seating boolean,
+  serves_beer boolean,
+  serves_breakfast boolean,
+  serves_brunch boolean,
+  serves_cocktails boolean,
+  serves_coffee boolean,
+  serves_dessert boolean,
+  serves_dinner boolean,
+  serves_lunch boolean,
+  serves_vegetarian_food boolean,
+  serves_wine boolean,
+  menu text,
+  generated_summary text,
+  reccomended_dishes text,
+  menu_analysis_confidence text,
+  geog USER-DEFINED,
+  vibe_vector ARRAY,
+  updated_vibe boolean DEFAULT false,
+  is_takeaway boolean,
+  dietary_requirement_vector ARRAY,
   CONSTRAINT locations_pkey PRIMARY KEY (location_id)
 );
 CREATE TABLE public.messages (
@@ -160,6 +174,14 @@ CREATE TABLE public.recommendation_runs (
   CONSTRAINT recommendation_runs_pkey PRIMARY KEY (run_id),
   CONSTRAINT recommendation_runs_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(supabase_id)
 );
+CREATE TABLE public.spatial_ref_sys (
+  srid integer NOT NULL CHECK (srid > 0 AND srid <= 998999),
+  auth_name character varying,
+  auth_srid integer,
+  srtext character varying,
+  proj4text character varying,
+  CONSTRAINT spatial_ref_sys_pkey PRIMARY KEY (srid)
+);
 CREATE TABLE public.tags (
   tag_id uuid NOT NULL DEFAULT gen_random_uuid(),
   text text,
@@ -211,16 +233,6 @@ CREATE TABLE public.user_recommendations (
   CONSTRAINT user_recommendations_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(supabase_id),
   CONSTRAINT user_recommendations_location_id_fkey FOREIGN KEY (location_id) REFERENCES public.locations(location_id)
 );
-CREATE TABLE public.user_tag_affinities (
-  user_id uuid NOT NULL,
-  tag_id uuid NOT NULL,
-  affinity real NOT NULL CHECK (affinity >= 0::double precision AND affinity <= 100::double precision),
-  evidence jsonb,
-  updated_at timestamp with time zone NOT NULL DEFAULT now(),
-  CONSTRAINT user_tag_affinities_pkey PRIMARY KEY (user_id, tag_id),
-  CONSTRAINT user_tag_affinities_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(supabase_id),
-  CONSTRAINT user_tag_affinities_tag_id_fkey FOREIGN KEY (tag_id) REFERENCES public.tags(tag_id)
-);
 CREATE TABLE public.users (
   name text NOT NULL DEFAULT ''::text,
   email text NOT NULL DEFAULT ''::text UNIQUE,
@@ -234,6 +246,8 @@ CREATE TABLE public.users (
   username text NOT NULL,
   fcm_token text,
   fcm_token_updated_at timestamp with time zone,
+  vibe_tag_affinity ARRAY,
+  dietary_requirement_tag_affinity ARRAY,
   CONSTRAINT users_pkey PRIMARY KEY (supabase_id)
 );
 CREATE TABLE public.v_action_exists (

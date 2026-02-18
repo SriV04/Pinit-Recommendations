@@ -1,0 +1,617 @@
+"""
+Redis-based caching service for proximal recommendations.
+
+Implements a two-tier caching strategy:
+1. Tier 1: Large-radius (15km) unfiltered recommendations with component scores
+2. Tier 2: User taste score pre-computation (Phase 2)
+
+The cache allows a single entry to serve multiple request variations by:
+- Storing large radius results and filtering in-memory
+- Storing component scores (taste, proximity, quality) separately
+- Supporting re-ranking with different weights without server calls
+"""
+
+from __future__ import annotations
+
+import gzip
+import json
+import logging
+import math
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
+
+import pandas as pd
+import redis
+from redis.exceptions import RedisError
+
+from pinit.config.settings import CacheConfig
+
+logger = logging.getLogger(__name__)
+
+
+class ProximalCacheService:
+    """Redis-based cache service for proximal recommendations."""
+
+    def __init__(self, config: Optional[CacheConfig] = None):
+        """
+        Initialize cache service with Redis connection.
+
+        Args:
+            config: Cache configuration. If None, uses defaults from environment.
+        """
+        self.config = config or CacheConfig()
+        self._redis_client: Optional[redis.Redis] = None
+
+        # Initialize Redis connection if caching is enabled
+        if self.config.caching_enabled:
+            self._connect_redis()
+
+    def _connect_redis(self) -> None:
+        """Establish Redis connection."""
+        try:
+            connection_params = {
+                "host": self.config.redis_host,
+                "port": self.config.redis_port,
+                "db": self.config.redis_db,
+                "password": self.config.redis_password,
+                "decode_responses": False,  # We'll handle encoding ourselves
+                "socket_connect_timeout": 5,
+                "socket_timeout": 5,
+            }
+
+            # Add SSL/TLS support for managed Redis services (e.g., Upstash, Redis Cloud)
+            if self.config.redis_ssl:
+                connection_params["ssl"] = True
+                connection_params["ssl_cert_reqs"] = None  # Don't verify certificates (for managed services)
+                logger.debug("Redis SSL/TLS enabled")
+
+            self._redis_client = redis.Redis(**connection_params)
+
+            # Test connection
+            self._redis_client.ping()
+            logger.info(
+                "Connected to Redis at %s:%d (db=%d, ssl=%s)",
+                self.config.redis_host,
+                self.config.redis_port,
+                self.config.redis_db,
+                self.config.redis_ssl,
+            )
+        except RedisError as exc:
+            logger.error("Failed to connect to Redis: %s. Caching disabled.", exc)
+            self._redis_client = None
+        except Exception as exc:
+            logger.error("Unexpected error connecting to Redis: %s. Caching disabled.", exc)
+            self._redis_client = None
+
+    @property
+    def is_available(self) -> bool:
+        """Check if cache is available."""
+        if not self.config.caching_enabled:
+            return False
+        if self._redis_client is None:
+            return False
+        try:
+            self._redis_client.ping()
+            return True
+        except RedisError:
+            return False
+
+    def _haversine_distance(self, lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+        """
+        Calculate distance between two points using Haversine formula.
+
+        Args:
+            lat1, lng1: First point coordinates
+            lat2, lng2: Second point coordinates
+
+        Returns:
+            Distance in kilometers
+        """
+        import math
+
+        # Convert to radians
+        lat1_rad = math.radians(lat1)
+        lat2_rad = math.radians(lat2)
+        delta_lat = math.radians(lat2 - lat1)
+        delta_lng = math.radians(lng2 - lng1)
+
+        # Haversine formula
+        a = (math.sin(delta_lat / 2) ** 2 +
+             math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(delta_lng / 2) ** 2)
+        c = 2 * math.asin(math.sqrt(a))
+
+        # Earth's radius in kilometers
+        r = 6371.0
+
+        return c * r
+
+    def _snap_coordinates(self, lat: float, lng: float) -> Tuple[float, float]:
+        """
+        Snap coordinates to grid for cache key consistency.
+
+        Rounds to configured precision (default 2 decimal places = ~1.1km grid).
+
+        Args:
+            lat: Latitude
+            lng: Longitude
+
+        Returns:
+            Tuple of (snapped_lat, snapped_lng)
+        """
+        precision = self.config.coordinate_precision
+        lat_snapped = round(lat, precision)
+        lng_snapped = round(lng, precision)
+        return lat_snapped, lng_snapped
+
+    def _build_cache_key(
+        self, center_lat: float, center_lng: float, radius_km: Optional[float] = None
+    ) -> str:
+        """
+        Build cache key for proximal recommendations (user-agnostic).
+
+        Format: proximal:geo:g_{lat_cell}_{lng_cell}:r{radius}
+
+        Args:
+            center_lat: Center latitude
+            center_lng: Center longitude
+            radius_km: Radius in km (uses config default if not provided)
+
+        Returns:
+            Cache key string
+        """
+        lat_snapped, lng_snapped = self._snap_coordinates(center_lat, center_lng)
+        radius = radius_km or self.config.large_radius_km
+
+        # User-agnostic key - shared across all users at this location
+        key = f"proximal:geo:g_{lat_snapped}_{lng_snapped}:r{int(radius)}"
+        return key
+
+    def _compress_data(self, data: Dict[str, Any]) -> bytes:
+        """
+        Compress data for storage.
+
+        Args:
+            data: Dictionary to compress
+
+        Returns:
+            Compressed bytes
+        """
+        json_str = json.dumps(data)
+        if self.config.compression_enabled:
+            return gzip.compress(json_str.encode("utf-8"))
+        return json_str.encode("utf-8")
+
+    def _decompress_data(self, data: bytes) -> Dict[str, Any]:
+        """
+        Decompress cached data.
+
+        Args:
+            data: Compressed bytes
+
+        Returns:
+            Decompressed dictionary
+        """
+        try:
+            if self.config.compression_enabled:
+                decompressed = gzip.decompress(data)
+                return json.loads(decompressed.decode("utf-8"))
+            return json.loads(data.decode("utf-8"))
+        except Exception as exc:
+            logger.error("Failed to decompress cache data: %s", exc)
+            raise
+
+    def get_cached_recommendations(
+        self, center_lat: float, center_lng: float, request_radius_km: float = 2.0
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Retrieve cached recommendations from Redis using distance-based lookup.
+
+        Cache is user-agnostic - shared across all users at a geographic location.
+        Searches for any cached entry that fully covers the request area.
+
+        Args:
+            center_lat: Center latitude of current request
+            center_lng: Center longitude of current request
+            request_radius_km: Radius of the request in km (default 2.0km)
+
+        Returns:
+            Cached data dictionary or None if not found/error
+        """
+        if not self.is_available:
+            return None
+
+        try:
+            # Scan all geographic cache keys (user-agnostic)
+            pattern = f"proximal:geo:*"
+
+            for cache_key in self._redis_client.scan_iter(match=pattern, count=100):
+                try:
+                    # Get cached data
+                    cached_bytes = self._redis_client.get(cache_key)
+                    if cached_bytes is None:
+                        continue
+
+                    # Decompress
+                    data = self._decompress_data(cached_bytes)
+
+                    # Calculate distance from request to cached center
+                    cached_lat = data.get("center_lat")
+                    cached_lng = data.get("center_lng")
+
+                    if cached_lat is None or cached_lng is None:
+                        continue
+
+                    distance_to_cache = self._haversine_distance(
+                        center_lat, center_lng,
+                        cached_lat, cached_lng
+                    )
+
+                    # Get cached radius
+                    cached_radius_km = data.get("cached_radius_km", 15.0)
+
+                    # Cache hit if request area is fully covered by cached area
+                    # Formula: distance + request_radius <= cached_radius
+                    # This ensures all locations within request radius are in cache
+                    max_allowed_distance = cached_radius_km - request_radius_km
+
+                    if distance_to_cache <= max_allowed_distance:
+                        num_candidates = data.get("total_count", 0)
+                        logger.info(
+                            "✅ CACHE HIT at (%.4f, %.4f), "
+                            "using cached data from (%.4f, %.4f) [%.2f km away], "
+                            "request_radius=%.1f km, cached_radius=%.1f km, max_allowed_distance=%.1f km",
+                            center_lat, center_lng,
+                            cached_lat, cached_lng,
+                            distance_to_cache,
+                            request_radius_km,
+                            cached_radius_km,
+                            max_allowed_distance,
+                        )
+                        logger.info("📦 Retrieved from cache: %d candidates (user-agnostic)", num_candidates)
+
+                        # Log cache contents sample for debugging
+                        if data.get("candidates"):
+                            sample = data["candidates"][0]
+                            logger.debug(
+                                "Cache contents sample: location_id=%s, lat=%s, lng=%s, "
+                                "taste_score=%s, quality_score=%s, has_tags=%s",
+                                sample.get("location_id"),
+                                sample.get("lat"),
+                                sample.get("lng"),
+                                sample.get("taste_score"),
+                                sample.get("quality_score"),
+                                "all_tags" in sample
+                            )
+
+                        return data
+
+                except Exception as exc:
+                    logger.warning("Error checking cache key %s: %s", cache_key, exc)
+                    continue
+
+            # No cache found within distance threshold
+            logger.debug(
+                "Cache miss at (%.4f, %.4f), no cache that covers request_radius=%.1f km",
+                center_lat, center_lng, request_radius_km
+            )
+            return None
+
+        except RedisError as exc:
+            logger.error("Redis error retrieving cache: %s", exc)
+            return None
+        except Exception as exc:
+            logger.error("Unexpected error retrieving cache: %s", exc)
+            return None
+
+    def set_cached_recommendations(
+        self,
+        center_lat: float,
+        center_lng: float,
+        candidates: List[Dict[str, Any]],
+    ) -> bool:
+        """
+        Store recommendations in Redis cache (user-agnostic).
+
+        Cache entries are shared across all users at a geographic location.
+
+        Args:
+            center_lat: Center latitude
+            center_lng: Center longitude
+            candidates: List of location candidates with quality scores
+
+        Returns:
+            True if successfully cached, False otherwise
+        """
+        if not self.is_available:
+            return False
+
+        try:
+            # Build cache key (user-agnostic)
+            cache_key = self._build_cache_key(center_lat, center_lng)
+
+            # Prepare cache value (store EXACT coordinates for distance-based lookup)
+            cache_value = {
+                "center_lat": center_lat,      # Store exact, not snapped
+                "center_lng": center_lng,      # Store exact, not snapped
+                "cached_radius_km": self.config.large_radius_km,
+                "candidates": candidates,
+                "total_count": len(candidates),
+                "cached_at": datetime.utcnow().isoformat(),
+            }
+
+            # Compress and store
+            compressed_data = self._compress_data(cache_value)
+
+            # Set with TTL
+            self._redis_client.setex(
+                cache_key, self.config.unfiltered_cache_ttl, compressed_data
+            )
+
+            logger.info(
+                "✅ CACHED: %d locations at (%.4f, %.4f), key=%s, ttl=%ds (user-agnostic)",
+                len(candidates),
+                center_lat,
+                center_lng,
+                cache_key,
+                self.config.unfiltered_cache_ttl,
+            )
+            logger.info("📦 Cache entry size: %d candidates stored", len(candidates))
+
+            # Log what's being cached (sample for debugging)
+            if candidates:
+                sample = candidates[0]
+                logger.debug(
+                    "Caching sample: location_id=%s, lat=%s, lng=%s, "
+                    "taste_score=%s, quality_score=%s, "
+                    "has_distance=%s, has_proximity=%s, has_final_score=%s, has_tags=%s",
+                    sample.get("location_id"),
+                    sample.get("lat"),
+                    sample.get("lng"),
+                    sample.get("taste_score"),
+                    sample.get("quality_score"),
+                    "distance_km" in sample,
+                    "proximity_score" in sample,
+                    "final_score" in sample,
+                    "all_tags" in sample
+                )
+            return True
+
+        except RedisError as exc:
+            logger.error("Redis error storing cache: %s", exc)
+            return False
+        except Exception as exc:
+            logger.error("Unexpected error storing cache: %s", exc)
+            return False
+
+    def invalidate_user_cache(self, user_id: str) -> int:
+        """
+        Invalidate all cache entries for a specific user.
+
+        Called when user profile is updated (tag affinities change).
+
+        Args:
+            user_id: User identifier
+
+        Returns:
+            Number of keys deleted
+        """
+        if not self.is_available:
+            return 0
+
+        try:
+            # Pattern to match all user's cache entries
+            pattern = f"proximal:*:u_{user_id}:*"
+
+            # Find matching keys
+            cursor = 0
+            deleted_count = 0
+
+            while True:
+                cursor, keys = self._redis_client.scan(
+                    cursor, match=pattern, count=100
+                )
+                if keys:
+                    deleted = self._redis_client.delete(*keys)
+                    deleted_count += deleted
+
+                if cursor == 0:
+                    break
+
+            if deleted_count > 0:
+                logger.info("Invalidated %d cache entries for user=%s", deleted_count, user_id)
+            return deleted_count
+
+        except RedisError as exc:
+            logger.error("Redis error invalidating user cache: %s", exc)
+            return 0
+        except Exception as exc:
+            logger.error("Unexpected error invalidating user cache: %s", exc)
+            return 0
+
+    def invalidate_geographic_cache(
+        self, center_lat: float, center_lng: float, radius_km: float = 20.0
+    ) -> int:
+        """
+        Invalidate cache entries within a geographic area.
+
+        Called when a new location is added or an existing location is updated.
+
+        Args:
+            center_lat: Center latitude of affected area
+            center_lng: Center longitude of affected area
+            radius_km: Radius to invalidate (default 20km)
+
+        Returns:
+            Number of keys deleted
+        """
+        if not self.is_available:
+            return 0
+
+        try:
+            # Calculate affected grid cells
+            # Each cell is ~1.1km (0.01 degrees), so we need to check cells within radius
+            cells_to_check = self._get_affected_cells(center_lat, center_lng, radius_km)
+
+            deleted_count = 0
+            for cell_lat, cell_lng in cells_to_check:
+                pattern = f"proximal:*:g_{cell_lat}_{cell_lng}:*"
+
+                cursor = 0
+                while True:
+                    cursor, keys = self._redis_client.scan(
+                        cursor, match=pattern, count=100
+                    )
+                    if keys:
+                        deleted = self._redis_client.delete(*keys)
+                        deleted_count += deleted
+
+                    if cursor == 0:
+                        break
+
+            if deleted_count > 0:
+                logger.info(
+                    "Invalidated %d cache entries within %.1fkm of (%.2f, %.2f)",
+                    deleted_count,
+                    radius_km,
+                    center_lat,
+                    center_lng,
+                )
+            return deleted_count
+
+        except RedisError as exc:
+            logger.error("Redis error invalidating geographic cache: %s", exc)
+            return 0
+        except Exception as exc:
+            logger.error("Unexpected error invalidating geographic cache: %s", exc)
+            return 0
+
+    def _get_affected_cells(
+        self, center_lat: float, center_lng: float, radius_km: float
+    ) -> List[Tuple[float, float]]:
+        """
+        Get list of grid cells affected by a geographic change.
+
+        Args:
+            center_lat: Center latitude
+            center_lng: Center longitude
+            radius_km: Radius in km
+
+        Returns:
+            List of (lat, lng) tuples for affected grid cells
+        """
+        # Approximate: 1 degree latitude ≈ 111km, 1 degree longitude ≈ 111km * cos(lat)
+        precision = self.config.coordinate_precision
+        cell_size = 10 ** (-precision)  # 0.01 for precision=2
+
+        # Calculate how many cells in each direction
+        lat_degrees = radius_km / 111.0
+        lng_degrees = radius_km / (111.0 * math.cos(math.radians(center_lat)))
+
+        lat_cells = int(math.ceil(lat_degrees / cell_size))
+        lng_cells = int(math.ceil(lng_degrees / cell_size))
+
+        # Get center cell
+        center_lat_snapped, center_lng_snapped = self._snap_coordinates(center_lat, center_lng)
+
+        # Generate all cells within radius
+        cells = []
+        for lat_offset in range(-lat_cells, lat_cells + 1):
+            for lng_offset in range(-lng_cells, lng_cells + 1):
+                cell_lat = round(center_lat_snapped + (lat_offset * cell_size), precision)
+                cell_lng = round(center_lng_snapped + (lng_offset * cell_size), precision)
+                cells.append((cell_lat, cell_lng))
+
+        return cells
+
+    def invalidate_pattern(self, pattern: str) -> int:
+        """
+        Invalidate cache entries matching a pattern.
+
+        Args:
+            pattern: Redis key pattern (e.g., "proximal:*")
+
+        Returns:
+            Number of keys deleted
+        """
+        if not self.is_available:
+            return 0
+
+        try:
+            cursor = 0
+            deleted_count = 0
+
+            while True:
+                cursor, keys = self._redis_client.scan(cursor, match=pattern, count=100)
+                if keys:
+                    deleted = self._redis_client.delete(*keys)
+                    deleted_count += deleted
+
+                if cursor == 0:
+                    break
+
+            if deleted_count > 0:
+                logger.info("Invalidated %d cache entries matching pattern: %s", deleted_count, pattern)
+            return deleted_count
+
+        except RedisError as exc:
+            logger.error("Redis error invalidating pattern %s: %s", pattern, exc)
+            return 0
+        except Exception as exc:
+            logger.error("Unexpected error invalidating pattern %s: %s", pattern, exc)
+            return 0
+
+    def get_cache_stats(self) -> Dict[str, Any]:
+        """
+        Get cache statistics.
+
+        Returns:
+            Dictionary with cache metrics
+        """
+        if not self.is_available:
+            return {"status": "unavailable"}
+
+        try:
+            info = self._redis_client.info("stats")
+            keyspace_info = self._redis_client.info("keyspace")
+
+            # Count proximal cache keys
+            cursor = 0
+            proximal_keys = 0
+            while True:
+                cursor, keys = self._redis_client.scan(
+                    cursor, match="proximal:*", count=1000
+                )
+                proximal_keys += len(keys)
+                if cursor == 0:
+                    break
+
+            return {
+                "status": "available",
+                "total_keys": keyspace_info.get(f"db{self.config.redis_db}", {}).get("keys", 0),
+                "proximal_cache_keys": proximal_keys,
+                "hits": info.get("keyspace_hits", 0),
+                "misses": info.get("keyspace_misses", 0),
+                "hit_rate": (
+                    info.get("keyspace_hits", 0)
+                    / max(1, info.get("keyspace_hits", 0) + info.get("keyspace_misses", 0))
+                ),
+            }
+
+        except RedisError as exc:
+            logger.error("Redis error getting cache stats: %s", exc)
+            return {"status": "error", "error": str(exc)}
+        except Exception as exc:
+            logger.error("Unexpected error getting cache stats: %s", exc)
+            return {"status": "error", "error": str(exc)}
+
+
+# Singleton instance
+_cache_service: Optional[ProximalCacheService] = None
+
+
+def get_cache_service() -> ProximalCacheService:
+    """Get or create the singleton cache service instance."""
+    global _cache_service
+    if _cache_service is None:
+        _cache_service = ProximalCacheService()
+    return _cache_service

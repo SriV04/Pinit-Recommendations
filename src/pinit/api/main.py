@@ -7,7 +7,6 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from pinit.api.routers import proximal
-from pinit.api.services.proximal_service import load_data
 
 # Configure logging (respect LOG_LEVEL env)
 log_level_name = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -33,18 +32,6 @@ app.add_middleware(
 )
 
 app.include_router(proximal.router)
-
-
-@app.on_event("startup")
-async def startup_event() -> None:
-    """Load data when API starts."""
-    logger.info("API startup initiated")
-    try:
-        load_data()
-        logger.info("API startup completed successfully")
-    except Exception as exc:
-        logger.error("Error during startup: %s", exc, exc_info=True)
-        raise
 
 
 if __name__ == "__main__":

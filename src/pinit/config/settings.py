@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Optional
@@ -70,3 +71,30 @@ class PipelineConfig:
     )
     synthetic_users: bool = True
     top_k_per_user: int = 30
+
+
+@dataclass
+class CacheConfig:
+    """Redis cache configuration for proximal recommendations."""
+
+    # Redis connection
+    redis_host: str = field(default_factory=lambda: os.getenv("REDIS_HOST", "localhost"))
+    redis_port: int = field(default_factory=lambda: int(os.getenv("REDIS_PORT", "6379")))
+    redis_db: int = field(default_factory=lambda: int(os.getenv("REDIS_DB", "0")))
+    redis_password: Optional[str] = field(default_factory=lambda: os.getenv("REDIS_PASSWORD"))
+    redis_ssl: bool = field(default_factory=lambda: os.getenv("REDIS_SSL", "false").lower() == "true")
+
+    # Cache parameters
+    large_radius_km: float = field(default_factory=lambda: float(os.getenv("CACHE_LARGE_RADIUS_KM", "15.0")))
+    coordinate_precision: int = 2  # Round coords to 0.01 degrees (~1.1km grid)
+
+    # TTLs (seconds)
+    unfiltered_cache_ttl: int = field(default_factory=lambda: int(os.getenv("CACHE_UNFILTERED_TTL", "1800")))  # 30 minutes
+    taste_score_cache_ttl: int = 3600  # 1 hour
+
+    # Memory limits
+    max_cache_entries: int = 10000  # Prevent unbounded growth
+    compression_enabled: bool = True  # Gzip compress large values
+
+    # Feature flags
+    caching_enabled: bool = field(default_factory=lambda: os.getenv("CACHING_ENABLED", "true").lower() == "true")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from enum import Enum
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
@@ -18,10 +19,19 @@ class ProximalRequest(BaseModel):
     longitude: float = Field(..., description="Center point longitude", ge=-180, le=180)
     radius_km: Optional[float] = Field(2.0, description="Search radius in kilometers", gt=0, le=50)
     max_results: Optional[int] = Field(20, description="Maximum number of results", ge=1, le=100)
-    taste_weight: Optional[float] = Field(0.2, description="Weight for taste matching", ge=0, le=1)
-    proximity_weight: Optional[float] = Field(0.6, description="Weight for proximity", ge=0, le=1)
-    quality_weight: Optional[float] = Field(0.2, description="Weight for quality", ge=0, le=1)
+
+    # NEW: Three-component weights
+    quality_weight: Optional[float] = Field(0.6, description="Weight for quality (ratings)", ge=0, le=1)
+    vibe_weight: Optional[float] = Field(0.3, description="Weight for vibe matching", ge=0, le=1)
+    dietary_weight: Optional[float] = Field(0.1, description="Weight for dietary matching", ge=0, le=1)
+
     include_taste_breakdown: Optional[bool] = Field(False, description="Include detailed taste score breakdown")
+
+    # Optional filters (applied with score threshold)
+    filters: Optional[FilterOptions] = Field(
+        None,
+        description="Optional filters for cuisine (OR logic) and vibe (AND logic)"
+    )
 
 
 class BatchProximalRequest(BaseModel):
@@ -41,9 +51,12 @@ class LocationRecommendation(BaseModel):
     user_ratings_total: Optional[int] = None
     price_level: Optional[float] = None
     distance_km: float
-    taste_score: float
-    proximity_score: float
-    quality_score: float
+
+    # NEW: Three-component scores
+    vibe_score: float = Field(..., description="Vibe match score (0-1)")
+    dietary_score: float = Field(..., description="Dietary match score (0-1)")
+    quality_score: float = Field(..., description="Quality score (0-1)")
+
     final_score: float
     rank: int
     taste_breakdown: Optional[List[TagMatch]] = Field(None, description="Breakdown of taste score by matching tags")
@@ -113,6 +126,12 @@ class MagicSearchRequest(BaseModel):
     max_results: Optional[int] = Field(20, description="Max number of places to search and rank", ge=1, le=50)
     include_taste_breakdown: Optional[bool] = Field(False, description="Include detailed taste score breakdown")
 
+    # Optional filters (applied with score threshold)
+    filters: Optional[FilterOptions] = Field(
+        None,
+        description="Optional filters for cuisine (OR logic) and vibe (AND logic)"
+    )
+
 
 class MagicSearchResponse(BaseModel):
     user_id: str
@@ -123,4 +142,132 @@ class MagicSearchResponse(BaseModel):
     total_candidates: int
     total_ranked: int
     recommendations: List[LocationRecommendation]
+    timestamp: str
+
+class FilterOptions(BaseModel):
+    cuisine: Optional[List[str]] = Field(
+        None,
+        description="Cuisine IDs (OR logic - matches one of them )",
+        example=["italian", "japanese", "mexican"]
+    )
+    vibe: Optional[List[str]] = Field(
+        None,
+        description="Required vibe tag IDs (AND logic - must have all)",
+        example=["outdoor-seating", "dog-friendly"]
+    )
+
+
+class BubbleRequest(BaseModel):
+    """Request for group (bubble) recommendations."""
+    user_ids: List[str] = Field(
+        ...,
+        description="List of user IDs in the group",
+        min_items=2,
+        example=["alice", "bob", "charlie"]
+    )
+    latitude: float = Field(..., description="Center point latitude", ge=-90, le=90)
+    longitude: float = Field(..., description="Center point longitude", ge=-180, le=180)
+    radius_km: Optional[float] = Field(2.0, description="Search radius in kilometers", gt=0, le=50)
+    max_results: Optional[int] = Field(20, description="Maximum results", ge=1, le=100)
+
+    vibe_weight: Optional[float] = Field(0.34, description="Weight for group vibe matching", ge=0, le=1)
+    dietary_weight: Optional[float] = Field(0.33, description="Weight for dietary matching", ge=0, le=1)
+    quality_weight: Optional[float] = Field(0.33, description="Weight for quality (ratings)", ge=0, le=1)
+
+    # Optional features
+    include_individual_scores: Optional[bool] = Field(
+        False,
+        description="Include each user's individual scores for transparency"
+    )
+    include_vibe_breakdown: Optional[bool] = Field(
+        False,
+        description="Include breakdown of vibe score contributions"
+    )
+
+    # Optional filters (applied with score >= 50 threshold)
+    filters: Optional[FilterOptions] = Field(
+        None,
+        description="Optional filters for cuisine (OR logic) and vibe (AND logic)"
+    )
+
+
+class IndividualScore(BaseModel):
+    """Individual user's score for a location."""
+    user_id: str
+    vibe_score: float = Field(..., description="Vibe match score")
+    dietary_score: float = Field(..., description="Dietary match score")
+    activity_weight: float = Field(..., description="User's activity weight in aggregation")
+
+
+class BubbleLocationRecommendation(BaseModel):
+    """Location recommendation for a group."""
+    # Basic location info
+    location_id: int
+    name: str
+    vicinity: Optional[str] = None
+    cuisine_primary: Optional[str] = None
+    rating: Optional[float] = None
+    user_ratings_total: Optional[int] = None
+    price_level: Optional[float] = None
+    distance_km: float
+
+    # Group scores
+    group_vibe_score: float = Field(..., description="Aggregated group vibe score (context-aware)")
+    group_dietary_score: float = Field(..., description="Aggregated group dietary score (MAX pooled)")
+    quality_score: float
+    final_score: float
+    rank: int
+
+    # Transparency metrics (optional)
+    individual_scores: Optional[List[IndividualScore]] = Field(
+        None,
+        description="Each user's individual scores (if include_individual_scores=true)"
+    )
+    min_individual_score: Optional[float] = Field(
+        None,
+        description="Lowest individual taste score (fairness metric)"
+    )
+    max_individual_score: Optional[float] = Field(
+        None,
+        description="Highest individual taste score"
+    )
+    score_variance: Optional[float] = Field(
+        None,
+        description="Variance in individual scores (measures disagreement)"
+    )
+    vibe_breakdown: Optional[List[TagMatch]] = Field(
+        None,
+        description="Breakdown of vibe score by tag (if include_vibe_breakdown=true)"
+    )
+
+
+class BubbleResponse(BaseModel):
+    """Response for group (bubble) recommendations."""
+    # Group info
+    user_ids: List[str]
+    group_size: int
+
+    # Search parameters
+    center_lat: float
+    center_lon: float
+    radius_km: float
+
+    # Results
+    total_results: int
+    recommendations: List[BubbleLocationRecommendation]
+
+    # Filtering metadata
+    optional_filters_applied: Optional[FilterOptions] = Field(
+        None,
+        description="Optional filters that were applied (if any)"
+    )
+    locations_before_filtering: int = Field(
+        ...,
+        description="Number of locations before filter constraints"
+    )
+    locations_after_filtering: int = Field(
+        ...,
+        description="Number of locations after all filters applied"
+    )
+
     timestamp: str
