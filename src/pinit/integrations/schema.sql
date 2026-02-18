@@ -35,17 +35,22 @@ CREATE TABLE public.bubbles (
 CREATE TABLE public.location_popularity_app (
   location_id bigint NOT NULL,
   saves_count integer NOT NULL DEFAULT 0,
-  likes_count integer NOT NULL DEFAULT 0,
+  dislikes_count integer NOT NULL DEFAULT 0,
   updated_at timestamp without time zone NOT NULL DEFAULT now(),
   CONSTRAINT location_popularity_app_pkey PRIMARY KEY (location_id),
   CONSTRAINT location_popularity_app_location_id_fkey FOREIGN KEY (location_id) REFERENCES public.locations(location_id)
 );
-CREATE TABLE public.location_popularity_social (
-  location_id bigint NOT NULL,
-  mention_count integer NOT NULL DEFAULT 0,
-  last_scanned timestamp without time zone NOT NULL DEFAULT now(),
-  CONSTRAINT location_popularity_social_pkey PRIMARY KEY (location_id),
-  CONSTRAINT location_popularity_social_location_id_fkey FOREIGN KEY (location_id) REFERENCES public.locations(location_id)
+CREATE TABLE public.location_reviews (
+  id uuid NOT NULL DEFAULT gen_random_uuid(),
+  created_at timestamp with time zone NOT NULL DEFAULT now(),
+  content text,
+  rating integer,
+  user_id uuid,
+  private boolean DEFAULT false,
+  location_id bigint,
+  CONSTRAINT location_reviews_pkey PRIMARY KEY (id),
+  CONSTRAINT location_reviews_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(supabase_id),
+  CONSTRAINT location_reviews_location_id_fkey FOREIGN KEY (location_id) REFERENCES public.locations(location_id)
 );
 CREATE TABLE public.location_tags (
   id bigint GENERATED ALWAYS AS IDENTITY NOT NULL,
@@ -95,7 +100,40 @@ CREATE TABLE public.locations (
   derived_attributes jsonb,
   data_version text NOT NULL DEFAULT 'v1'::text,
   ingested_at timestamp with time zone NOT NULL DEFAULT now(),
+  photo_reference_valid_until timestamp with time zone,
+  photo_reference_score text,
+  image_stored boolean DEFAULT false,
+  emoji text,
   CONSTRAINT locations_pkey PRIMARY KEY (location_id)
+);
+CREATE TABLE public.messages (
+  id uuid NOT NULL DEFAULT gen_random_uuid(),
+  bubble_id uuid NOT NULL,
+  sender_id uuid NOT NULL,
+  content text,
+  message_type text DEFAULT 'text'::text,
+  metadata jsonb,
+  created_at timestamp with time zone DEFAULT now(),
+  updated_at timestamp with time zone DEFAULT now(),
+  is_deleted boolean DEFAULT false,
+  replied_to_message_id uuid,
+  CONSTRAINT messages_pkey PRIMARY KEY (id),
+  CONSTRAINT messages_bubble_id_fkey FOREIGN KEY (bubble_id) REFERENCES public.bubbles(bubble_id),
+  CONSTRAINT messages_sender_id_fkey FOREIGN KEY (sender_id) REFERENCES public.users(supabase_id),
+  CONSTRAINT messages_replied_to_message_id_fkey FOREIGN KEY (replied_to_message_id) REFERENCES public.messages(id)
+);
+CREATE TABLE public.notifications (
+  id uuid NOT NULL DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL,
+  type text NOT NULL,
+  title text,
+  message text,
+  metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+  is_read boolean NOT NULL DEFAULT false,
+  read_at timestamp with time zone,
+  created_at timestamp with time zone NOT NULL DEFAULT now(),
+  CONSTRAINT notifications_pkey PRIMARY KEY (id),
+  CONSTRAINT notifications_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(supabase_id)
 );
 CREATE TABLE public.recommendation_candidates (
   candidate_id uuid NOT NULL DEFAULT gen_random_uuid(),
@@ -130,6 +168,15 @@ CREATE TABLE public.tags (
   Colour text,
   CONSTRAINT tags_pkey PRIMARY KEY (tag_id)
 );
+CREATE TABLE public.user_chat_state (
+  user_id uuid NOT NULL,
+  bubble_id uuid NOT NULL,
+  last_read_at timestamp with time zone DEFAULT now(),
+  muted boolean DEFAULT false,
+  CONSTRAINT user_chat_state_pkey PRIMARY KEY (user_id, bubble_id),
+  CONSTRAINT user_chat_state_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(supabase_id),
+  CONSTRAINT user_chat_state_bubble_id_fkey FOREIGN KEY (bubble_id) REFERENCES public.bubbles(bubble_id)
+);
 CREATE TABLE public.user_friends (
   created_at timestamp without time zone NOT NULL DEFAULT now(),
   followee_id uuid NOT NULL,
@@ -152,7 +199,6 @@ CREATE TABLE public.user_location_actions (
   acked boolean,
   CONSTRAINT user_location_actions_pkey PRIMARY KEY (action_id),
   CONSTRAINT user_location_actions_location_id_fkey FOREIGN KEY (location_id) REFERENCES public.locations(location_id),
-  CONSTRAINT user_location_actions_source_video_url_fkey FOREIGN KEY (source_video_url) REFERENCES public.videos(url),
   CONSTRAINT user_location_actions_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(supabase_id)
 );
 CREATE TABLE public.user_recommendations (
@@ -168,7 +214,7 @@ CREATE TABLE public.user_recommendations (
 CREATE TABLE public.user_tag_affinities (
   user_id uuid NOT NULL,
   tag_id uuid NOT NULL,
-  affinity real NOT NULL CHECK (affinity >= 1::double precision AND affinity <= 100::double precision),
+  affinity real NOT NULL CHECK (affinity >= 0::double precision AND affinity <= 100::double precision),
   evidence jsonb,
   updated_at timestamp with time zone NOT NULL DEFAULT now(),
   CONSTRAINT user_tag_affinities_pkey PRIMARY KEY (user_id, tag_id),
@@ -186,14 +232,15 @@ CREATE TABLE public.users (
   spice_tolerance smallint,
   wizard_completed boolean,
   username text NOT NULL,
+  fcm_token text,
+  fcm_token_updated_at timestamp with time zone,
   CONSTRAINT users_pkey PRIMARY KEY (supabase_id)
 );
-CREATE TABLE public.videos (
-  video_id bigint NOT NULL DEFAULT nextval('videos_video_id_seq'::regclass),
-  platform text NOT NULL,
-  url text NOT NULL UNIQUE,
-  extracted_location_id bigint,
-  created_at timestamp without time zone NOT NULL DEFAULT now(),
-  CONSTRAINT videos_pkey PRIMARY KEY (video_id),
-  CONSTRAINT videos_extracted_location_id_fkey FOREIGN KEY (extracted_location_id) REFERENCES public.locations(location_id)
+CREATE TABLE public.v_action_exists (
+  exists boolean
+);
+CREATE TABLE public.waitlist (
+  created_at timestamp with time zone NOT NULL DEFAULT now(),
+  email text NOT NULL,
+  CONSTRAINT waitlist_pkey PRIMARY KEY (email)
 );
