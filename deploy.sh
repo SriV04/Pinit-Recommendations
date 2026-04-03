@@ -55,37 +55,37 @@ ENV_VARS+=",SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}"
 ENV_VARS+=",GOOGLE_PLACE_API_KEY=${GOOGLE_PLACE_API_KEY}"
 
 # Redis configuration (optional - will use defaults if not set)
-if [ -n "$REDIS_HOST" ]; then
-  ENV_VARS+=",REDIS_HOST=${REDIS_HOST}"
-fi
+# if [ -n "$REDIS_HOST" ]; then
+#   ENV_VARS+=",REDIS_HOST=${REDIS_HOST}"
+# fi
 
-if [ -n "$REDIS_PORT" ]; then
-  ENV_VARS+=",REDIS_PORT=${REDIS_PORT}"
-fi
+# if [ -n "$REDIS_PORT" ]; then
+#   ENV_VARS+=",REDIS_PORT=${REDIS_PORT}"
+# fi
 
-if [ -n "$REDIS_PASSWORD" ]; then
-  ENV_VARS+=",REDIS_PASSWORD=${REDIS_PASSWORD}"
-fi
+# if [ -n "$REDIS_PASSWORD" ]; then
+#   ENV_VARS+=",REDIS_PASSWORD=${REDIS_PASSWORD}"
+# fi
 
-if [ -n "$REDIS_DB" ]; then
-  ENV_VARS+=",REDIS_DB=${REDIS_DB}"
-fi
+# if [ -n "$REDIS_DB" ]; then
+#   ENV_VARS+=",REDIS_DB=${REDIS_DB}"
+# fi
 
-if [ -n "$REDIS_SSL" ]; then
-  ENV_VARS+=",REDIS_SSL=${REDIS_SSL}"
-fi
+# if [ -n "$REDIS_SSL" ]; then
+#   ENV_VARS+=",REDIS_SSL=${REDIS_SSL}"
+# fi
 
-if [ -n "$CACHING_ENABLED" ]; then
-  ENV_VARS+=",CACHING_ENABLED=${CACHING_ENABLED}"
-fi
+# if [ -n "$CACHING_ENABLED" ]; then
+#   ENV_VARS+=",CACHING_ENABLED=${CACHING_ENABLED}"
+# fi
 
-if [ -n "$CACHE_LARGE_RADIUS_KM" ]; then
-  ENV_VARS+=",CACHE_LARGE_RADIUS_KM=${CACHE_LARGE_RADIUS_KM}"
-fi
+# if [ -n "$CACHE_LARGE_RADIUS_KM" ]; then
+#   ENV_VARS+=",CACHE_LARGE_RADIUS_KM=${CACHE_LARGE_RADIUS_KM}"
+# fi
 
-if [ -n "$CACHE_UNFILTERED_TTL" ]; then
-  ENV_VARS+=",CACHE_UNFILTERED_TTL=${CACHE_UNFILTERED_TTL}"
-fi
+# if [ -n "$CACHE_UNFILTERED_TTL" ]; then
+#   ENV_VARS+=",CACHE_UNFILTERED_TTL=${CACHE_UNFILTERED_TTL}"
+# fi
 
 gcloud run deploy $SERVICE_NAME \
   --image $AR_IMAGE \

@@ -199,6 +199,42 @@ class SupabaseService:
             # Fallback: get locations without quality scores
             return self.get_locations(limit=limit)
 
+    def get_locations_by_google_place_ids(
+        self, google_place_ids: List[str]
+    ) -> Dict[str, Dict[str, Any]]:
+        """Batch-fetch locations keyed by google_place_id.
+
+        Returns a dict mapping google_place_id → location row for every ID
+        that exists in the database.  Missing IDs are simply absent from the
+        returned dict.
+        """
+        if not google_place_ids:
+            return {}
+        response = (
+            self.client.table("locations")
+            .select("*")
+            .in_("google_place_id", list(google_place_ids))
+            .execute()
+        )
+        return {row["google_place_id"]: row for row in (response.data or [])}
+
+    def get_locations_by_ids(
+        self, location_ids: List[int]
+    ) -> List[Dict[str, Any]]:
+        """Batch-fetch full location rows by primary key.
+
+        Returns rows in an unspecified order; missing IDs are silently skipped.
+        """
+        if not location_ids:
+            return []
+        response = (
+            self.client.table("locations")
+            .select("*")
+            .in_("location_id", list(location_ids))
+            .execute()
+        )
+        return response.data or []
+
     def get_location_without_emoji(self) -> List[Dict[str, Any]]:
         """Get locations without an emoji assigned"""
         query = self.client.table("locations").select("*").is_("emoji", None)
@@ -345,6 +381,19 @@ class SupabaseService:
             logger.error(f"Error getting user {user_id}: {exc}")
             return None
 
+    def get_user_vectors(self, user_id: str) -> Optional[Dict[str, Any]]:
+        """Get only the vector affinities needed for recommendation scoring."""
+        logger = logging.getLogger(__name__)
+        try:
+            response = (self.client.table("users")
+                       .select("supabase_id, vibe_tag_affinity, dietary_requirement_tag_affinity")
+                       .eq("supabase_id", user_id)
+                       .execute())
+            return response.data[0] if response.data else None
+        except Exception as exc:
+            logger.error(f"Error getting user vectors for {user_id}: {exc}")
+            return None
+
     def get_users(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
         """Get all users with their vector affinities."""
         logger = logging.getLogger(__name__)
@@ -445,6 +494,23 @@ class SupabaseService:
                    .execute())
         return len(response.data) > 0
 
+    # ==================== COUNT HELPERS ====================
+
+    def count_locations(self) -> int:
+        """Get total count of locations without fetching rows."""
+        response = self.client.table("locations").select("location_id", count="exact").limit(0).execute()
+        return response.count if hasattr(response, 'count') and response.count is not None else 0
+
+    def count_users(self) -> int:
+        """Get total count of users without fetching rows."""
+        response = self.client.table("users").select("supabase_id", count="exact").limit(0).execute()
+        return response.count if hasattr(response, 'count') and response.count is not None else 0
+
+    def count_tags(self) -> int:
+        """Get total count of tags without fetching rows."""
+        response = self.client.table("tags").select("tag_id", count="exact").limit(0).execute()
+        return response.count if hasattr(response, 'count') and response.count is not None else 0
+
     # ==================== USER_LOCATION_ACTIONS CRUD ====================
 
     def get_user_location_actions(self, user_id: Optional[str] = None,
@@ -486,10 +552,11 @@ class SupabaseService:
             Total count of actions
         """
         response = (self.client.table("user_location_actions")
-                   .select("*", count="exact")
+                   .select("user_id", count="exact")
                    .eq("user_id", user_id)
+                   .limit(0)
                    .execute())
-        return response.count if hasattr(response, 'count') else len(response.data)
+        return response.count if hasattr(response, 'count') and response.count is not None else 0
 
 
 # Singleton instance

@@ -90,6 +90,7 @@ SATURATION_THRESHOLD = 17
 
 # Nearby Search (New) endpoint
 NEARBY_URL = "https://places.googleapis.com/v1/places:searchNearby"
+TEXT_SEARCH_URL = "https://places.googleapis.com/v1/places:searchText"
 
 # FieldMask — Enterprise-tier: includes all Pro fields plus websites,
 # reviews, opening hours, vibe booleans, and serves booleans.

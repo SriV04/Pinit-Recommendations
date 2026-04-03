@@ -126,11 +126,6 @@ class MagicSearchRequest(BaseModel):
     max_results: Optional[int] = Field(20, description="Max number of places to search and rank", ge=1, le=50)
     include_taste_breakdown: Optional[bool] = Field(False, description="Include detailed taste score breakdown")
 
-    # Optional filters (applied with score threshold)
-    filters: Optional[FilterOptions] = Field(
-        None,
-        description="Optional filters for cuisine (OR logic) and vibe (AND logic)"
-    )
 
 
 class MagicSearchResponse(BaseModel):

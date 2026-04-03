@@ -4,7 +4,9 @@ import base64
 import json
 import logging
 import os
+import random
 import re
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -581,3 +583,170 @@ def search_google_places(
     results = data.get("results", [])
     place_ids = [item.get("place_id") for item in results if item.get("place_id")]
     return place_ids[:max_results]
+
+def text_search(
+    query: str,
+    place_types: List[str],
+    lat: Optional[float] = None,
+    lng: Optional[float] = None,
+    radius_m: Optional[float] = None,
+) -> Tuple[List[dict], int]:
+    """Text Search (New) – Places API v1 wrapper.
+
+    Makes one POST to the Text Search (New) endpoint per entry in
+    *place_types* (the API only accepts a single ``includedType`` per
+    request), deduplicates the combined results by place ID, and returns
+    the aggregated list together with the total number of API calls consumed.
+
+    Returns the same enterprise-tier fields as Nearby Search: rating,
+    userRatingCount, priceLevel, currentOpeningHours, reviews, websiteUri,
+    photos, reviewSummary, vibe booleans, and serves booleans.
+
+    Parameters
+    ----------
+    query:
+        Free-text search query (``textQuery`` field).
+    place_types:
+        List of Google Places type strings.  One API call is made for each
+        type.  If empty, a single call is made without an ``includedType``
+        constraint.
+    lat, lng, radius_m:
+        Optional centre + radius for a ``locationBias`` circle.  When all
+        three are supplied the search is biased (not restricted) toward that
+        area.
+    """
+    # --- Inline constants ---
+    _URL = "https://places.googleapis.com/v1/places:searchText"
+    _FIELD_MASK = ",".join([
+        "places.id",
+        "places.displayName",
+        "places.types",
+        "places.formattedAddress",
+        "places.shortFormattedAddress",
+        "places.location",
+        "places.businessStatus",
+        "places.googleMapsUri",
+        "places.photos",
+        # Pro-tier
+        "places.rating",
+        "places.userRatingCount",
+        "places.priceLevel",
+        "places.currentOpeningHours",
+        # Enterprise-tier
+        "places.reviews",
+        "places.websiteUri",
+        "places.reviewSummary",
+        "places.goodForChildren",
+        "places.goodForGroups",
+        "places.goodForWatchingSports",
+        "places.liveMusic",
+        "places.outdoorSeating",
+        "places.servesBeer",
+        "places.servesBreakfast",
+        "places.servesBrunch",
+        "places.servesCocktails",
+        "places.servesCoffee",
+        "places.servesDessert",
+        "places.servesDinner",
+        "places.servesLunch",
+        "places.servesVegetarianFood",
+        "places.servesWine",
+    ])
+    _MAX_RESULTS = 20
+    _MAX_RETRIES = 6
+    _BACKOFF_BASE = 2.0
+    _MAX_WAIT = 30.0
+    _SLEEP_S = 0.15
+
+    api_key = GOOGLE_PLACE_API_KEY
+    if not api_key:
+        raise ValueError("GOOGLE_PLACE_API_KEY not set")
+
+    headers = {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": api_key,
+        "X-Goog-FieldMask": _FIELD_MASK,
+    }
+
+    def _jitter_sleep(seconds: float) -> None:
+        if seconds > 0:
+            time.sleep(seconds * random.uniform(0.85, 1.15))
+
+    # Build the base body shared by every call in this invocation.
+    base_body: Dict[str, Any] = {
+        "textQuery": query,
+        "maxResultCount": _MAX_RESULTS,
+    }
+    if lat is not None and lng is not None and radius_m is not None:
+        base_body["locationBias"] = {
+            "circle": {
+                "center": {"latitude": lat, "longitude": lng},
+                "radius": float(radius_m),
+            }
+        }
+
+    # Text Search only supports a single includedType; iterate over types.
+    types_to_query: List[Optional[str]] = list(place_types) if place_types else [None]
+
+    seen_ids: dict = {}
+    total_calls = 0
+
+    for place_type in types_to_query:
+        body = dict(base_body)
+        if place_type is not None:
+            body["includedType"] = place_type
+
+        for attempt in range(1, _MAX_RETRIES + 1):
+            try:
+                resp = requests.post(_URL, json=body, headers=headers, timeout=30)
+            except requests.RequestException as exc:
+                wait = min(_SLEEP_S * _BACKOFF_BASE ** (attempt - 1), _MAX_WAIT)
+                logger.warning("  ⚠ HTTP error on attempt %d/%d (type=%s): %s — retrying in %.1fs",
+                               attempt, _MAX_RETRIES, place_type, exc, wait)
+                _jitter_sleep(wait)
+                continue
+
+            if resp.status_code == 429:
+                wait = min(5.0 * _BACKOFF_BASE ** (attempt - 1), _MAX_WAIT)
+                logger.warning("  ⚠ Rate limited (429) on attempt %d/%d (type=%s) — backing off %.1fs",
+                               attempt, _MAX_RETRIES, place_type, wait)
+                _jitter_sleep(wait)
+                continue
+
+            if resp.status_code == 403:
+                msg = resp.text[:200]
+                raise RuntimeError(f"Google Places API 403 Forbidden: {msg}")
+
+            if resp.status_code >= 500:
+                wait = min(2.0 * _BACKOFF_BASE ** (attempt - 1), _MAX_WAIT)
+                logger.warning("  ⚠ Server error %d on attempt %d/%d (type=%s) — retrying in %.1fs",
+                               resp.status_code, attempt, _MAX_RETRIES, place_type, wait)
+                _jitter_sleep(wait)
+                continue
+
+            if resp.status_code == 400:
+                logger.error("  ✗ Bad request (400) for type=%s: %s", place_type, resp.text[:300])
+                total_calls += 1
+                break  # skip this type, continue to next
+
+            try:
+                data = resp.json()
+            except ValueError:
+                logger.warning("  ⚠ Invalid JSON on attempt %d/%d (type=%s)", attempt, _MAX_RETRIES, place_type)
+                _jitter_sleep(min(_SLEEP_S * _BACKOFF_BASE ** (attempt - 1), _MAX_WAIT))
+                continue
+
+            total_calls += 1
+            for place in data.get("places", []):
+                pid = place.get("id")
+                if pid and pid not in seen_ids:
+                    seen_ids[pid] = place
+            break  # successful response — move to next type
+        else:
+            raise RuntimeError(
+                f"text_search failed after {_MAX_RETRIES} retries for type={place_type!r}"
+            )
+
+        _jitter_sleep(_SLEEP_S)
+
+    return list(seen_ids.values()), total_calls

@@ -31,13 +31,12 @@ from pinit.api.services.proximal_service import (
     add_location_emoji,
     classify_location_photo,
     fetch_google_place_details,
-    search_google_places,
+    text_search,
 )
 from pinit.api.services.cache_service import get_cache_service
 from pinit.core.recommendation.proximal_recommendation import (
     ProximalConfig,
     build_batch_proximal_recommendations,
-    build_proximal_recommendations,
     get_location_coordinates,
 )
 from pinit.core.recommendation.bubble_recommendation import (
@@ -257,13 +256,13 @@ def _rank_cached_candidates(
     from pinit.core.recommendation.proximal_recommendation import haversine_distance
     from pinit.core.recommendation.vector_utils import centered_cosine_similarity, dot_product
 
-    # Fetch user data if user_id is provided
+    # Fetch user vectors if user_id is provided (slim query - only vector columns)
     user_vibe_vec = None
     user_dietary_vec = None
     vibe_tag_order = None
     if user_id:
         supabase = get_supabase_service()
-        user_data = supabase.get_user(user_id)
+        user_data = supabase.get_user_vectors(user_id)
         if user_data:
             user_vibe_vec = user_data.get("vibe_tag_affinity")
             user_dietary_vec = user_data.get("dietary_requirement_tag_affinity")
@@ -359,12 +358,11 @@ async def health_check() -> HealthResponse:
     """Health check endpoint."""
     supabase = get_supabase_service()
 
-    # Query database for counts
+    # Query database for counts (lightweight count-only queries)
     try:
-        locations_count = len(supabase.get_locations(limit=10000))
-        users_data = supabase.get_users(limit=10000)
-        users_count = len(users_data)
-        tags_count = len(supabase.get_all_tags(limit=1000))
+        locations_count = supabase.count_locations()
+        users_count = supabase.count_users()
+        tags_count = supabase.count_tags()
 
         return HealthResponse(
             status="healthy",
@@ -451,7 +449,6 @@ async def get_proximal_recommendations(request: ProximalRequest) -> ProximalResp
 
     # Try cache first (user-agnostic - shared across all users)
     cache_service = get_cache_service()
-    deleted_counter = cache_service.invalidate_pattern("proximal:*")
     cached_data = cache_service.get_cached_recommendations(
         request.latitude, request.longitude, request.radius_km
     )
@@ -826,178 +823,179 @@ async def add_location_by_place_id(request: AddLocationRequest) -> AddLocationRe
         raise HTTPException(status_code=500, detail=f"Error processing location: {exc}") from exc
 
 
-# @router.post("/locations/magic-search", response_model=MagicSearchResponse)
-# async def magic_search(request: MagicSearchRequest) -> MagicSearchResponse:
-#     """
-#     Search Google Places with a free-text prompt, ingest results, and rank them.
-#     """
-#     supabase = get_supabase_service()
+@router.post("/locations/magic-search", response_model=MagicSearchResponse)
+async def magic_search(request: MagicSearchRequest) -> MagicSearchResponse:
+    """
+    Search Google Places with a free-text prompt, ingest results, and rank them.
 
-#     # Validate user exists
-#     user_data = supabase.get_user(request.user_id)
-#     if not user_data:
-#         raise HTTPException(status_code=404, detail=f"User '{request.user_id}' not found")
+    Flow:
+    1. Text Search (New) API → raw place dicts with enterprise-tier fields
+    2. Upsert any new places into the database via fetch_google_place_details
+    3. Load full location rows (quality_score, vibe_vector, etc.) from DB
+    4. Rank with _rank_cached_candidates (user-personalised scoring)
+    5. Return MagicSearchResponse
+    """
+    supabase = get_supabase_service()
 
-#     try:
-#         place_ids = search_google_places(
-#             request.prompt,
-#             request.latitude,
-#             request.longitude,
-#             request.radius_km,
-#             request.max_results,
-#         )
-#     except Exception as exc:
-#         raise HTTPException(status_code=502, detail=str(exc)) from exc
+    # Validate user exists
+    user_data = supabase.get_user(request.user_id)
+    if not user_data:
+        raise HTTPException(status_code=404, detail=f"User '{request.user_id}' not found")
 
-#     if not place_ids:
-#         return MagicSearchResponse(
-#             user_id=request.user_id,
-#             center_lat=request.latitude,
-#             center_lon=request.longitude,
-#             prompt=request.prompt,
-#             radius_km=request.radius_km,
-#             total_candidates=0,
-#             total_ranked=0,
-#             recommendations=[],
-#             timestamp=datetime.utcnow().isoformat(),
-#         )
+    _FOOD_TYPES = ["restaurant", "cafe", "bar", "bakery", "meal_takeaway", "night_club"]
+    _FOOD_TYPES_SET = {
+        "restaurant", "cafe", "bar", "food", "bakery",
+        "meal_delivery", "meal_takeaway", "night_club",
+    }
 
-#     supabase = get_supabase_service()
-#     collected_locations = []
+    # Step 1: Text search — returns raw Places API v1 place dicts
+    try:
+        places, api_calls = text_search(
+            query=request.prompt,
+            place_types=_FOOD_TYPES,
+            lat=request.latitude,
+            lng=request.longitude,
+            radius_m=(request.radius_km or 2.0) * 1000,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-#     food_types = {"restaurant", "cafe", "bar", "food", "meal_delivery", "meal_takeaway"}
+    logger.info(
+        "Magic search: text_search returned %d places for prompt=%r (%d API calls)",
+        len(places), request.prompt, api_calls,
+    )
 
-#     for place_id in place_ids:
-#         existing = supabase.get_location_by_google_place_id(place_id)
-#         if existing:
-#             location_id = existing["location_id"]
-#         else:
-#             place_details = fetch_google_place_details(place_id)
-#             if not place_details:
-#                 continue
-#             types = place_details.get("types", [])
-#             if not any(t in food_types for t in types):
-#                 continue
-#             try:
-#                 location_id, _ = process_basic_attributes(place_details, supabase)
-#             except Exception:
-#                 continue
+    if not places:
+        return MagicSearchResponse(
+            user_id=request.user_id,
+            center_lat=request.latitude,
+            center_lon=request.longitude,
+            prompt=request.prompt,
+            radius_km=request.radius_km,
+            total_candidates=0,
+            total_ranked=0,
+            recommendations=[],
+            timestamp=datetime.utcnow().isoformat(),
+        )
 
-#         location = supabase.get_location(location_id)
-#         if not location:
-#             continue
+    # Step 2: Filter to food-type places and collect their google_place_ids
+    food_place_ids: List[str] = []
+    place_types_by_id: Dict[str, List[str]] = {}
+    for place in places:
+        gid = place.get("id")
+        if not gid:
+            continue
+        types_raw = place.get("types", [])
+        # If the API returned types, enforce the food filter; if absent, allow through
+        if types_raw and not any(t in _FOOD_TYPES_SET for t in types_raw):
+            continue
+        food_place_ids.append(gid)
+        place_types_by_id[gid] = types_raw
 
-#         collected_locations.append(location)
+    # Batch-fetch all already-known locations in a single DB round-trip
+    existing_by_gid = supabase.get_locations_by_google_place_ids(food_place_ids)
 
-#     if not collected_locations:
-#         return MagicSearchResponse(
-#             user_id=request.user_id,
-#             center_lat=request.latitude,
-#             center_lon=request.longitude,
-#             prompt=request.prompt,
-#             radius_km=request.radius_km,
-#             total_candidates=len(place_ids),
-#             total_ranked=0,
-#             recommendations=[],
-#             timestamp=datetime.utcnow().isoformat(),
-#         )
+    # For places not yet in the DB, fetch details + upsert one by one
+    location_ids_to_fetch: List[int] = []
+    for gid in food_place_ids:
+        if gid in existing_by_gid:
+            location_ids_to_fetch.append(existing_by_gid[gid]["location_id"])
+        else:
+            place_details = fetch_google_place_details(gid)
+            if not place_details:
+                continue
+            fetched_types = place_details.get("types", [])
+            if isinstance(fetched_types, str):
+                fetched_types = [t.strip() for t in fetched_types.split(",")]
+            if fetched_types and not any(t in _FOOD_TYPES_SET for t in fetched_types):
+                continue
+            lid = place_details.get("location_id")
+            if lid:
+                location_ids_to_fetch.append(lid)
 
-#     locations_df = pd.DataFrame(collected_locations)
+    # Batch-fetch all full rows (quality_score, vibe_vector, etc.) in one query
+    candidates: List[Dict[str, Any]] = supabase.get_locations_by_ids(location_ids_to_fetch)
 
-#     # Ensure coordinate columns exist and are properly named
-#     if "lon" in locations_df.columns and "lng" not in locations_df.columns:
-#         locations_df["lng"] = locations_df["lon"]
+    # Keep only places that are currently open (or whose status is unknown / not stored)
+    before_open_filter = len(candidates)
+    candidates = [c for c in candidates if c.get("open_now") is not False]
+    logger.info(
+        "Magic search: %d food locations collected, %d open (filtered %d closed)",
+        before_open_filter, len(candidates), before_open_filter - len(candidates),
+    )
 
-#     # Ensure vector columns exist (should be loaded from database)
-#     for col in ['vibe_vector', 'dietary_requirement_vector']:
-#         if col not in locations_df.columns:
-#             logger.warning(f"Column {col} missing from magic search locations")
-#             locations_df[col] = None
+    if not candidates:
+        return MagicSearchResponse(
+            user_id=request.user_id,
+            center_lat=request.latitude,
+            center_lon=request.longitude,
+            prompt=request.prompt,
+            radius_km=request.radius_km,
+            total_candidates=len(places),
+            total_ranked=0,
+            recommendations=[],
+            timestamp=datetime.utcnow().isoformat(),
+        )
 
-#     # Log for debugging
-#     logger.info(
-#         "Magic search: collected %d locations, columns: %s",
-#         len(locations_df),
-#         list(locations_df.columns)
-#     )
+    logger.info(
+        "Magic search: fetched the following candidates for ranking (location_id: name): %s",
+        [(c["location_id"], c["name"]) for c in candidates],
+    )
+    # Step 4: Rank using the shared cache-style ranking (user-personalised scores)
+    scored = _rank_cached_candidates(
+        candidates=candidates,
+        request_lat=request.latitude,
+        request_lng=request.longitude,
+        request_radius_km=request.radius_km or 2.0,
+        quality_weight=1.0,
+        vibe_weight=1.0,
+        dietary_weight=1.0,
+        max_results=request.max_results or 20,
+        user_id=request.user_id,
+    )
 
-#     # Extract optional filters
-#     cuisine_filters = None
-#     vibe_filters = None
+    # Step 5: Build response
+    recommendations = []
+    for candidate in scored:
+        recommendations.append(
+            LocationRecommendation(
+                location_id=int(candidate["location_id"]),
+                name=candidate["name"],
+                vicinity=candidate.get("vicinity"),
+                cuisine_primary=candidate.get("cuisine_primary"),
+                rating=float(candidate["rating"]) if candidate.get("rating") is not None else None,
+                user_ratings_total=int(candidate["user_ratings_total"])
+                if candidate.get("user_ratings_total") is not None
+                else None,
+                price_level=float(candidate["price_level"])
+                if candidate.get("price_level") is not None
+                else None,
+                distance_km=float(candidate["distance_km"]),
+                vibe_score=float(candidate["vibe_score"]),
+                dietary_score=float(candidate["dietary_score"]),
+                quality_score=float(candidate["quality_score"]),
+                final_score=float(candidate["final_score"]),
+                rank=int(candidate["rank"]),
+                taste_breakdown=None,
+            )
+        )
 
-#     if request.filters:
-#         cuisine_filters = request.filters.cuisine
-#         vibe_filters = request.filters.vibe
+    logger.info(
+        "Magic search complete: prompt=%r, %d candidates → %d ranked",
+        request.prompt, len(places), len(recommendations),
+    )
 
-#     config = ProximalConfig(
-#         radius_km=request.radius_km,
-#         max_results=request.max_results,
-#     )
-
-#     try:
-#         # Pass empty DataFrames for obsolete parameters (using vectors now)
-#         empty_user_tags = pd.DataFrame(columns=["user_id", "tag_id", "score"])
-#         empty_location_tags = pd.DataFrame(columns=["location_id", "tag_id", "score", "tag_text"])
-
-#         recs = build_proximal_recommendations(
-#             request.user_id,
-#             request.latitude,
-#             request.longitude,
-#             locations_df,
-#             empty_user_tags,
-#             empty_location_tags,
-#             config,
-#             cuisine_filters=cuisine_filters,
-#             vibe_filters=vibe_filters,
-#         )
-#     except Exception as exc:
-#         logger.error("Error in magic search recommendations: %s", exc, exc_info=True)
-#         raise HTTPException(
-#             status_code=500,
-#             detail=f"Error generating recommendations: {str(exc)}"
-#         ) from exc
-
-#     recommendations = []
-#     for _, row in recs.iterrows():
-#         # NOTE: get_taste_breakdown currently returns empty list (vector-based system)
-#         taste_breakdown = None
-#         # if request.include_taste_breakdown:
-#         #     breakdown = get_taste_breakdown(...)
-#         #     if breakdown:
-#         #         taste_breakdown = [TagMatch(**item) for item in breakdown]
-
-#         recommendations.append(
-#             LocationRecommendation(
-#                 location_id=int(row["location_id"]),
-#                 name=row["name"],
-#                 vicinity=row.get("vicinity") if pd.notna(row.get("vicinity")) else None,
-#                 cuisine_primary=row.get("cuisine_primary") if pd.notna(row.get("cuisine_primary")) else None,
-#                 rating=float(row["rating"]) if pd.notna(row.get("rating")) else None,
-#                 user_ratings_total=int(row["user_ratings_total"])
-#                 if pd.notna(row.get("user_ratings_total"))
-#                 else None,
-#                 price_level=float(row["price_level"]) if pd.notna(row.get("price_level")) else None,
-#                 distance_km=float(row["distance_km"]),
-#                 vibe_score=float(row["vibe_score"]),
-#                 dietary_score=float(row["dietary_score"]),
-#                 quality_score=float(row["quality_score"]),
-#                 final_score=float(row["final_score"]),
-#                 rank=int(row["rank"]),
-#                 taste_breakdown=taste_breakdown,
-#             )
-#         )
-
-#     return MagicSearchResponse(
-#         user_id=request.user_id,
-#         center_lat=request.latitude,
-#         center_lon=request.longitude,
-#         prompt=request.prompt,
-#         radius_km=request.radius_km,
-#         total_candidates=len(place_ids),
-#         total_ranked=len(recommendations),
-#         recommendations=recommendations,
-#         timestamp=datetime.utcnow().isoformat(),
-#     )
+    return MagicSearchResponse(
+        user_id=request.user_id,
+        center_lat=request.latitude,
+        center_lon=request.longitude,
+        prompt=request.prompt,
+        radius_km=request.radius_km,
+        total_candidates=len(places),
+        total_ranked=len(recommendations),
+        recommendations=recommendations,
+        timestamp=datetime.utcnow().isoformat(),
+    )
 
 
 @router.post("/recommendations/bubble", response_model=BubbleResponse)
