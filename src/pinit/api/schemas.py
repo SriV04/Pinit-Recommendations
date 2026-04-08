@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -20,10 +20,12 @@ class ProximalRequest(BaseModel):
     radius_km: Optional[float] = Field(2.0, description="Search radius in kilometers", gt=0, le=50)
     max_results: Optional[int] = Field(20, description="Maximum number of results", ge=1, le=100)
 
-    # NEW: Three-component weights
-    quality_weight: Optional[float] = Field(0.6, description="Weight for quality (ratings)", ge=0, le=1)
-    vibe_weight: Optional[float] = Field(0.3, description="Weight for vibe matching", ge=0, le=1)
-    dietary_weight: Optional[float] = Field(0.1, description="Weight for dietary matching", ge=0, le=1)
+    # Five-component weights (adaptive rebalancing may override these)
+    quality_weight: Optional[float] = Field(0.30, description="Weight for quality (ratings)", ge=0, le=1)
+    vibe_weight: Optional[float] = Field(0.25, description="Weight for vibe matching", ge=0, le=1)
+    dietary_weight: Optional[float] = Field(0.10, description="Weight for dietary matching", ge=0, le=1)
+    social_weight: Optional[float] = Field(0.20, description="Weight for friend-based social score", ge=0, le=1)
+    collaborative_weight: Optional[float] = Field(0.15, description="Weight for collaborative filtering", ge=0, le=1)
 
     include_taste_breakdown: Optional[bool] = Field(False, description="Include detailed taste score breakdown")
 
@@ -42,6 +44,24 @@ class BatchProximalRequest(BaseModel):
     max_results: Optional[int] = Field(20, description="Maximum number of results per user", ge=1, le=100)
 
 
+class FriendSave(BaseModel):
+    """A friend's interaction with a location that contributed to its social score."""
+    friend_id: str
+    friend_name: str
+    friend_username: Optional[str] = None
+    friend_profile_image_url: Optional[str] = None
+    action_type: str = Field(..., description="Action type: save, check_in, rating")
+    rating: Optional[int] = Field(None, description="Rating value if action_type is rating")
+    timestamp: str
+
+
+class MomentumIndicator(BaseModel):
+    """Signals whether a location is trending or newly discovered."""
+    trending: bool = Field(False, description="Location has rising saves/reviews recently")
+    momentum_score: float = Field(0.0, description="Momentum score based on recent activity velocity")
+    new_discovery: bool = Field(False, description="Recently added location with limited data")
+
+
 class LocationRecommendation(BaseModel):
     location_id: int
     name: str
@@ -52,14 +72,18 @@ class LocationRecommendation(BaseModel):
     price_level: Optional[float] = None
     distance_km: float
 
-    # NEW: Three-component scores
+    # Five-component scores
     vibe_score: float = Field(..., description="Vibe match score (0-1)")
     dietary_score: float = Field(..., description="Dietary match score (0-1)")
     quality_score: float = Field(..., description="Quality score (0-1)")
+    social_score: float = Field(0.0, description="Friend-based social score (0-1)")
+    collaborative_score: float = Field(0.0, description="Collaborative filtering score (0-1)")
 
     final_score: float
     rank: int
     taste_breakdown: Optional[List[TagMatch]] = Field(None, description="Breakdown of taste score by matching tags")
+    friend_saves: Optional[List[FriendSave]] = Field(None, description="Friends who saved/visited this location")
+    momentum: Optional[MomentumIndicator] = Field(None, description="Trending and discovery indicators")
 
 
 class ProximalResponse(BaseModel):
@@ -69,6 +93,7 @@ class ProximalResponse(BaseModel):
     radius_km: float
     total_results: int
     recommendations: List[LocationRecommendation]
+    weights_used: Optional[Dict[str, float]] = Field(None, description="Actual weights used after adaptive rebalancing")
     timestamp: str
 
 

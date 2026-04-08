@@ -16,6 +16,7 @@ from pinit.api.schemas import (
     BubbleLocationRecommendation,
     BubbleRequest,
     BubbleResponse,
+    FriendSave,
     HealthResponse,
     IndividualScore,
     LocationCoordinatesResponse,
@@ -233,35 +234,45 @@ def _rank_cached_candidates(
     cuisine_filters: Optional[List[str]] = None,
     vibe_filters: Optional[List[str]] = None,
     user_id: Optional[str] = None,
+    social_weight: float = 0.20,
+    collaborative_weight: float = 0.15,
 ) -> List[Dict[str, Any]]:
     """
-    Apply filtering and ranking to cached candidates.
+    Apply filtering and ranking to cached candidates using 5-component scoring.
 
-    Computes user-specific vibe and dietary scores on the fly.
-    Quality scores are pre-computed in the database and cached.
+    Computes user-specific vibe, dietary, social, and collaborative scores on
+    the fly. Quality scores are pre-computed in the database and cached.
 
     Args:
         candidates: List of cached candidate dictionaries
         request_lat, request_lng: Request center coordinates
         request_radius_km: Request radius for filtering
-        quality_weight, vibe_weight, dietary_weight: Scoring weights
+        quality_weight, vibe_weight, dietary_weight: Original scoring weights
         max_results: Maximum number of results to return
         cuisine_filters: Optional cuisine tag filters (OR logic)
         vibe_filters: Optional vibe tag filters (AND logic)
         user_id: User ID for computing user-specific scores
+        social_weight: Weight for friend-based social score
+        collaborative_weight: Weight for collaborative filtering score
 
     Returns:
-        List of scored and ranked candidates
+        List of scored and ranked candidates (includes weights_used metadata)
     """
-    from pinit.core.recommendation.proximal_recommendation import haversine_distance
+    from pinit.core.recommendation.proximal_recommendation import (
+        compute_adaptive_weights,
+        haversine_distance,
+    )
     from pinit.core.recommendation.vector_utils import centered_cosine_similarity, dot_product
+    from pinit.core.recommendation.social_scoring import compute_social_scores
+    from pinit.core.recommendation.collaborative_scoring import compute_collaborative_scores
+
+    supabase = get_supabase_service()
 
     # Fetch user vectors if user_id is provided (slim query - only vector columns)
     user_vibe_vec = None
     user_dietary_vec = None
     vibe_tag_order = None
     if user_id:
-        supabase = get_supabase_service()
         user_data = supabase.get_user_vectors(user_id)
         if user_data:
             user_vibe_vec = user_data.get("vibe_tag_affinity")
@@ -273,62 +284,107 @@ def _rank_cached_candidates(
         candidates, cuisine_filters, vibe_filters
     )
 
-    # Step 2: Calculate distance, filter by radius, and score
-    scored_candidates = []
+    # Step 2: Filter by radius first to get candidate location IDs
+    radius_filtered = []
     for candidate in filtered_candidates:
         lat = candidate.get("lat")
         lng = candidate.get("lng")
-
         if lat is None or lng is None:
             continue
+        distance_km = haversine_distance(request_lat, request_lng, lat, lng)
+        if distance_km <= request_radius_km:
+            candidate["distance_km"] = distance_km
+            radius_filtered.append(candidate)
 
-        # Calculate distance from request center
-        distance_km = haversine_distance(
-            request_lat, request_lng, lat, lng
+    if not radius_filtered:
+        return []
+
+    candidate_location_ids = [c["location_id"] for c in radius_filtered]
+
+    # Step 3: Compute social and collaborative scores in batch (user-specific)
+    social_scores: Dict[int, float] = {}
+    friend_attributions: Dict[int, list] = {}
+    collab_scores: Dict[int, float] = {}
+    has_friends = False
+    action_count = 0
+
+    if user_id:
+        # Social scoring
+        social_scores, friend_attributions = compute_social_scores(
+            user_id, candidate_location_ids, supabase
+        )
+        has_friends = any(s > 0 for s in social_scores.values())
+
+        # Collaborative scoring
+        collab_scores = compute_collaborative_scores(
+            user_id, candidate_location_ids, supabase
         )
 
-        # Filter by requested radius
-        if distance_km > request_radius_km:
-            continue
+        # Get action count for adaptive weights
+        action_count = supabase.get_user_action_count(user_id)
 
-        # Get quality score (pre-computed by database and cached)
+    # Step 4: Compute adaptive weights
+    weights = compute_adaptive_weights(
+        has_friends=has_friends,
+        action_count=action_count,
+        quality_w=quality_weight,
+        vibe_w=vibe_weight,
+        dietary_w=dietary_weight,
+        social_w=social_weight,
+        collaborative_w=collaborative_weight,
+    )
+
+    w_quality = weights["quality"]
+    w_vibe = weights["vibe"]
+    w_dietary = weights["dietary"]
+    w_social = weights["social"]
+    w_collab = weights["collaborative"]
+
+    # Step 5: Score each candidate with all 5 components
+    scored_candidates = []
+    for candidate in radius_filtered:
+        loc_id = candidate["location_id"]
+
         quality_score = candidate.get("quality_score", 0.0)
 
-        # Compute user-specific vibe and dietary scores on the fly
+        # Vibe and dietary (same as before)
         vibe_score = 0.0
         dietary_score = 0.0
-
         if user_id:
             loc_vibe_vec = candidate.get("vibe_vector")
             loc_dietary_vec = candidate.get("dietary_requirement_vector")
-
             if user_vibe_vec and loc_vibe_vec:
                 vibe_score = centered_cosine_similarity(user_vibe_vec, loc_vibe_vec)
-
             if user_dietary_vec and loc_dietary_vec:
                 dietary_score = dot_product(user_dietary_vec, loc_dietary_vec)
 
-        # Calculate final score with request weights
+        social_score = social_scores.get(loc_id, 0.0)
+        collaborative_score = collab_scores.get(loc_id, 0.0)
+
         final_score = (
-            quality_weight * quality_score +
-            vibe_weight * vibe_score +
-            dietary_weight * dietary_score
+            w_quality * quality_score +
+            w_vibe * vibe_score +
+            w_dietary * dietary_score +
+            w_social * social_score +
+            w_collab * collaborative_score
         )
 
-        # Add computed fields
         scored_candidates.append({
             **candidate,
-            "distance_km": distance_km,
-            "vibe_score": vibe_score,  # Computed on the fly
-            "dietary_score": dietary_score,  # Computed on the fly
-            "quality_score": quality_score,  # From cache (database pre-computed)
-            "final_score": final_score
+            "vibe_score": vibe_score,
+            "dietary_score": dietary_score,
+            "quality_score": quality_score,
+            "social_score": social_score,
+            "collaborative_score": collaborative_score,
+            "final_score": final_score,
+            "friend_saves": friend_attributions.get(loc_id),
+            "weights_used": weights,
         })
 
-    # Step 3: Sort by final score
+    # Step 6: Sort by final score
     scored_candidates.sort(key=lambda x: x.get("final_score", 0), reverse=True)
 
-    # Step 4: Diversify across user's top tags proportionally, then re-sort by final_score
+    # Step 7: Diversify across user's top tags proportionally, then re-sort
     if user_vibe_vec and vibe_tag_order:
         diverse_candidates = _diversify_by_top_tags(
             scored_candidates, user_vibe_vec, vibe_tag_order, max_results
@@ -336,7 +392,7 @@ def _rank_cached_candidates(
     else:
         diverse_candidates = scored_candidates[:max_results]
 
-    # Step 5: Assign ranks
+    # Step 8: Assign ranks
     for rank, candidate in enumerate(diverse_candidates, start=1):
         candidate["rank"] = rank
 
@@ -417,10 +473,12 @@ async def get_proximal_recommendations(request: ProximalRequest) -> ProximalResp
         request.max_results,
     )
     logger.info(
-        "⚖️  Weights: quality=%.2f, vibe=%.2f, dietary=%.2f",
+        "⚖️  Weights: quality=%.2f, vibe=%.2f, dietary=%.2f, social=%.2f, collab=%.2f",
         request.quality_weight,
         request.vibe_weight,
         request.dietary_weight,
+        request.social_weight,
+        request.collaborative_weight,
     )
 
     # Extract optional filters
@@ -445,6 +503,8 @@ async def get_proximal_recommendations(request: ProximalRequest) -> ProximalResp
         quality_weight=request.quality_weight,
         vibe_weight=request.vibe_weight,
         dietary_weight=request.dietary_weight,
+        social_weight=request.social_weight,
+        collaborative_weight=request.collaborative_weight,
     )
 
     # Try cache first (user-agnostic - shared across all users)
@@ -478,6 +538,8 @@ async def get_proximal_recommendations(request: ProximalRequest) -> ProximalResp
             cuisine_filters=cuisine_filters,
             vibe_filters=vibe_filters,
             user_id=request.user_id,
+            social_weight=request.social_weight,
+            collaborative_weight=request.collaborative_weight,
         )
 
         logger.info(
@@ -491,12 +553,14 @@ async def get_proximal_recommendations(request: ProximalRequest) -> ProximalResp
             sample = scored_candidates[0]
             logger.debug(
                 "Top result: location_id=%s, distance=%.2f km, "
-                "vibe=%.2f, dietary=%.2f, quality=%.2f, final=%.2f",
+                "vibe=%.2f, dietary=%.2f, quality=%.2f, social=%.2f, collab=%.2f, final=%.2f",
                 sample.get("location_id"),
                 sample.get("distance_km"),
                 sample.get("vibe_score"),
                 sample.get("dietary_score"),
                 sample.get("quality_score"),
+                sample.get("social_score"),
+                sample.get("collaborative_score"),
                 sample.get("final_score")
             )
 
@@ -565,7 +629,7 @@ async def get_proximal_recommendations(request: ProximalRequest) -> ProximalResp
 
             logger.info("✅ Cached %d locations (user-agnostic, quality score pre-computed)", len(candidates_to_cache))
 
-            # Use fresh cache to serve request (compute user-specific vibe/dietary scores)
+            # Use fresh cache to serve request (compute user-specific scores)
             scored_candidates = _rank_cached_candidates(
                 candidates=candidates_to_cache,
                 request_lat=request.latitude,
@@ -578,6 +642,8 @@ async def get_proximal_recommendations(request: ProximalRequest) -> ProximalResp
                 cuisine_filters=cuisine_filters,
                 vibe_filters=vibe_filters,
                 user_id=request.user_id,
+                social_weight=request.social_weight,
+                collaborative_weight=request.collaborative_weight,
             )
 
             logger.info(
@@ -614,16 +680,21 @@ async def get_proximal_recommendations(request: ProximalRequest) -> ProximalResp
             timestamp=datetime.utcnow().isoformat(),
         )
 
+    # Extract weights_used from the first scored candidate (all share the same weights)
+    weights_used = None
+    if not recs.empty and "weights_used" in recs.columns:
+        first_weights = recs.iloc[0].get("weights_used")
+        if isinstance(first_weights, dict):
+            weights_used = first_weights
+
     # Convert to response model
     recommendations = []
     for _, row in recs.iterrows():
-        # Get taste breakdown if requested
-        # NOTE: get_taste_breakdown currently returns empty list (vector-based system)
-        taste_breakdown = None
-        # if request.include_taste_breakdown:
-        #     breakdown = get_taste_breakdown(...)
-        #     if breakdown:
-        #         taste_breakdown = [TagMatch(**item) for item in breakdown]
+        # Build friend attribution list
+        friend_saves_raw = row.get("friend_saves")
+        friend_saves = None
+        if friend_saves_raw and isinstance(friend_saves_raw, list):
+            friend_saves = [FriendSave(**fs) for fs in friend_saves_raw]
 
         recommendations.append(
             LocationRecommendation(
@@ -640,9 +711,11 @@ async def get_proximal_recommendations(request: ProximalRequest) -> ProximalResp
                 vibe_score=float(row["vibe_score"]),
                 dietary_score=float(row["dietary_score"]),
                 quality_score=float(row["quality_score"]),
+                social_score=float(row.get("social_score", 0.0)),
+                collaborative_score=float(row.get("collaborative_score", 0.0)),
                 final_score=float(row["final_score"]),
                 rank=int(row["rank"]),
-                taste_breakdown=taste_breakdown,
+                friend_saves=friend_saves,
             )
         )
 
@@ -658,11 +731,12 @@ async def get_proximal_recommendations(request: ProximalRequest) -> ProximalResp
     if recommendations:
         top_rec = recommendations[0]
         logger.info(
-            "🥇 Top result: %s (id=%d, distance=%.2f km, final_score=%.3f)",
+            "🥇 Top result: %s (id=%d, distance=%.2f km, final_score=%.3f, social=%.3f)",
             top_rec.name,
             top_rec.location_id,
             top_rec.distance_km,
             top_rec.final_score,
+            top_rec.social_score,
         )
     logger.info(
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -675,6 +749,7 @@ async def get_proximal_recommendations(request: ProximalRequest) -> ProximalResp
         radius_km=request.radius_km,
         total_results=len(recommendations),
         recommendations=recommendations,
+        weights_used=weights_used,
         timestamp=datetime.utcnow().isoformat(),
     )
 
@@ -947,16 +1022,23 @@ async def magic_search(request: MagicSearchRequest) -> MagicSearchResponse:
         request_lat=request.latitude,
         request_lng=request.longitude,
         request_radius_km=request.radius_km or 2.0,
-        quality_weight=1.0,
-        vibe_weight=1.0,
-        dietary_weight=1.0,
+        quality_weight=0.30,
+        vibe_weight=0.25,
+        dietary_weight=0.10,
         max_results=request.max_results or 20,
         user_id=request.user_id,
+        social_weight=0.20,
+        collaborative_weight=0.15,
     )
 
     # Step 5: Build response
     recommendations = []
     for candidate in scored:
+        friend_saves_raw = candidate.get("friend_saves")
+        friend_saves = None
+        if friend_saves_raw and isinstance(friend_saves_raw, list):
+            friend_saves = [FriendSave(**fs) for fs in friend_saves_raw]
+
         recommendations.append(
             LocationRecommendation(
                 location_id=int(candidate["location_id"]),
@@ -974,9 +1056,11 @@ async def magic_search(request: MagicSearchRequest) -> MagicSearchResponse:
                 vibe_score=float(candidate["vibe_score"]),
                 dietary_score=float(candidate["dietary_score"]),
                 quality_score=float(candidate["quality_score"]),
+                social_score=float(candidate.get("social_score", 0.0)),
+                collaborative_score=float(candidate.get("collaborative_score", 0.0)),
                 final_score=float(candidate["final_score"]),
                 rank=int(candidate["rank"]),
-                taste_breakdown=None,
+                friend_saves=friend_saves,
             )
         )
 

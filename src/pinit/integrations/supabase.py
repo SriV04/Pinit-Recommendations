@@ -541,6 +541,191 @@ class SupabaseService:
         response = query.execute()
         return response.data
 
+    # ==================== SOCIAL / FRIEND QUERIES ====================
+
+    def get_user_friends(self, user_id: str) -> List[Dict[str, Any]]:
+        """
+        Get accepted friends for a user (both directions of the relationship).
+
+        Returns a deduplicated list of friend records with friend_id and influence.
+        """
+        logger = logging.getLogger(__name__)
+        try:
+            # User is the follower (they follow others)
+            resp1 = (
+                self.client.table("user_friends")
+                .select("followee_id, influence, created_at")
+                .eq("follower_id", user_id)
+                .eq("status", "accepted")
+                .execute()
+            )
+            # User is the followee (others follow them)
+            resp2 = (
+                self.client.table("user_friends")
+                .select("follower_id, influence, created_at")
+                .eq("followee_id", user_id)
+                .eq("status", "accepted")
+                .execute()
+            )
+
+            friends = {}
+            for row in (resp1.data or []):
+                fid = row["followee_id"]
+                friends[fid] = {"friend_id": fid, "influence": row.get("influence")}
+            for row in (resp2.data or []):
+                fid = row["follower_id"]
+                if fid not in friends:
+                    friends[fid] = {"friend_id": fid, "influence": row.get("influence")}
+
+            return list(friends.values())
+        except Exception as exc:
+            logger.error(f"Error fetching friends for {user_id}: {exc}")
+            return []
+
+    def get_friends_location_actions(
+        self, friend_ids: List[str], location_ids: List[int]
+    ) -> List[Dict[str, Any]]:
+        """
+        Batch-fetch friends' actions on candidate locations.
+
+        Returns list of {user_id, location_id, action, created_at} dicts.
+        """
+        logger = logging.getLogger(__name__)
+        if not friend_ids or not location_ids:
+            return []
+        try:
+            response = (
+                self.client.table("user_location_actions")
+                .select("user_id, location_id, action, created_at")
+                .in_("user_id", list(friend_ids))
+                .in_("location_id", list(location_ids))
+                .execute()
+            )
+            return response.data or []
+        except Exception as exc:
+            logger.error(f"Error fetching friend actions: {exc}")
+            return []
+
+    def get_friend_profiles(self, friend_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+        """
+        Slim query to get friend display info for attribution.
+
+        Returns {friend_id: {name, username, profile_image_url}}.
+        """
+        logger = logging.getLogger(__name__)
+        if not friend_ids:
+            return {}
+        try:
+            response = (
+                self.client.table("users")
+                .select("supabase_id, name, username, profile_image_url")
+                .in_("supabase_id", list(friend_ids))
+                .execute()
+            )
+            return {
+                row["supabase_id"]: row
+                for row in (response.data or [])
+            }
+        except Exception as exc:
+            logger.error(f"Error fetching friend profiles: {exc}")
+            return {}
+
+    # ==================== COLLABORATIVE FILTERING QUERIES ====================
+
+    def get_user_positive_actions(self, user_id: str, limit: int = 100) -> List[Dict[str, Any]]:
+        """
+        Fetch user's recent positive actions (save, check_in, positive ratings).
+
+        Returns list of {location_id, action, created_at} ordered by recency.
+        """
+        logger = logging.getLogger(__name__)
+        try:
+            response = (
+                self.client.table("user_location_actions")
+                .select("location_id, action, created_at")
+                .eq("user_id", user_id)
+                .in_("action", ["save", "check_in", "rating"])
+                .order("created_at", desc=True)
+                .limit(limit)
+                .execute()
+            )
+            return response.data or []
+        except Exception as exc:
+            logger.error(f"Error fetching positive actions for {user_id}: {exc}")
+            return []
+
+    def get_location_similarities(
+        self, location_ids: List[int], saved_location_ids: List[int]
+    ) -> List[Dict[str, Any]]:
+        """
+        Fetch precomputed similarities between candidate locations and user's saved set.
+
+        Returns list of {location_id_a, location_id_b, similarity_score}.
+        location_id_a = user's saved location, location_id_b = candidate.
+        """
+        logger = logging.getLogger(__name__)
+        if not location_ids or not saved_location_ids:
+            return []
+        try:
+            response = (
+                self.client.table("location_similarities")
+                .select("location_id_a, location_id_b, similarity_score")
+                .in_("location_id_a", list(saved_location_ids))
+                .in_("location_id_b", list(location_ids))
+                .execute()
+            )
+            return response.data or []
+        except Exception as exc:
+            logger.error(f"Error fetching location similarities: {exc}")
+            return []
+
+    def get_all_positive_actions(self, limit: int = 50000) -> List[Dict[str, Any]]:
+        """
+        Fetch all positive actions across all users for building similarity matrix.
+
+        Used by the batch similarity_builder job.
+        """
+        logger = logging.getLogger(__name__)
+        try:
+            response = (
+                self.client.table("user_location_actions")
+                .select("user_id, location_id, action, created_at")
+                .in_("action", ["save", "check_in", "rating"])
+                .order("created_at", desc=True)
+                .limit(limit)
+                .execute()
+            )
+            return response.data or []
+        except Exception as exc:
+            logger.error(f"Error fetching all positive actions: {exc}")
+            return []
+
+    def upsert_location_similarities(self, rows: List[Dict[str, Any]]) -> int:
+        """
+        Batch upsert location similarity records.
+
+        Args:
+            rows: List of {location_id_a, location_id_b, similarity_score, co_save_count}
+
+        Returns:
+            Number of rows upserted
+        """
+        logger = logging.getLogger(__name__)
+        if not rows:
+            return 0
+        try:
+            response = (
+                self.client.table("location_similarities")
+                .upsert(rows)
+                .execute()
+            )
+            return len(response.data) if response.data else 0
+        except Exception as exc:
+            logger.error(f"Error upserting location similarities: {exc}")
+            return 0
+
+    # ==================== ACTION COUNTS ====================
+
     def get_user_action_count(self, user_id: str) -> int:
         """
         Get total number of actions for a user.

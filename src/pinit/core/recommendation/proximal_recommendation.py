@@ -23,10 +23,65 @@ class ProximalConfig:
     min_results: int = 10  # Minimum number of results to return
     max_results: int = 50  # Maximum number of results to return
 
-    # NEW: Three-component weights (remove taste_weight and proximity_weight)
-    quality_weight: float = 0.33  # Weight for quality metrics (ratings + reviews)
-    vibe_weight: float = 0.34  # Weight for vibe matching (cosine similarity)
-    dietary_weight: float = 0.33  # Weight for dietary matching (dot product)
+    # Five-component weights
+    quality_weight: float = 0.30
+    vibe_weight: float = 0.25
+    dietary_weight: float = 0.10
+    social_weight: float = 0.20
+    collaborative_weight: float = 0.15
+
+
+def compute_adaptive_weights(
+    has_friends: bool,
+    action_count: int,
+    quality_w: float = 0.30,
+    vibe_w: float = 0.25,
+    dietary_w: float = 0.10,
+    social_w: float = 0.20,
+    collaborative_w: float = 0.15,
+) -> Dict[str, float]:
+    """
+    Rebalance scoring weights based on data availability.
+
+    When a user has no friends, social weight is redistributed.
+    When a user has few actions, collaborative and vibe weights are reduced
+    in favour of quality (which works without user history).
+
+    Returns:
+        Dict with keys: quality, vibe, dietary, social, collaborative.
+        Values sum to 1.0.
+    """
+    weights = {
+        "quality": quality_w,
+        "vibe": vibe_w,
+        "dietary": dietary_w,
+        "social": social_w,
+        "collaborative": collaborative_w,
+    }
+
+    # No friends: redistribute social weight
+    if not has_friends:
+        redistributed = weights["social"]
+        weights["social"] = 0.0
+        weights["quality"] += redistributed * 0.4
+        weights["vibe"] += redistributed * 0.3
+        weights["collaborative"] += redistributed * 0.3
+
+    # New user (few actions): reduce collaborative + vibe, boost quality
+    if action_count < 5:
+        cold_ratio = action_count / 5.0
+        collab_reduction = weights["collaborative"] * (1 - cold_ratio)
+        vibe_reduction = weights["vibe"] * (1 - cold_ratio) * 0.3
+        weights["collaborative"] -= collab_reduction
+        weights["vibe"] -= vibe_reduction
+        weights["quality"] += collab_reduction + vibe_reduction
+
+    # Normalize to sum to 1.0
+    total = sum(weights.values())
+    if total > 0:
+        weights = {k: round(v / total, 4) for k, v in weights.items()}
+
+    return weights
 
 
 def haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -123,24 +178,63 @@ def filter_by_radius(
 
 def compute_quality_score(locations: pd.DataFrame) -> pd.Series:
     """
-    Compute quality score based on ratings and review counts.
+    Compute enhanced quality score incorporating Bayesian rating, review trust,
+    review velocity, save/dislike ratio, cold-start bonus, and anti-mispricing.
+
+    Matches the SQL compute_quality_score function in migrations/v3_enhanced_scoring.sql.
 
     Args:
-        locations: DataFrame with 'rating' and 'user_ratings_total' columns
+        locations: DataFrame with 'rating', 'user_ratings_total' columns.
+            Optional columns: 'saves_count_app', 'dislikes_count_app',
+            'recent_reviews_90d', 'total_app_reviews', 'location_age_days',
+            'saved_count'.
 
     Returns:
         Series of quality scores (0-1)
     """
-    # Normalize rating (assuming 0-5 scale)
-    rating_score = locations['rating'].fillna(3.0) / 5.0
+    rating = locations['rating'].fillna(3.8)
+    reviews = locations['user_ratings_total'].fillna(0).astype(float)
 
-    # Log-scale review count (more reviews = more reliable)
-    review_score = np.log1p(locations['user_ratings_total'].fillna(0)) / 10.0
-    review_score = review_score.clip(upper=1.0)
+    # Bayesian rating: shrink toward 3.8 prior with 50 pseudo-reviews
+    bayesian_rating = (rating * reviews + 3.8 * 50) / (reviews + 50)
 
-    # Combine: 70% rating, 30% review reliability
-    quality = (0.7 * rating_score + 0.3 * review_score).clip(upper=1.0)
+    # Review trust: log-power curve
+    review_trust = (0.95 * np.power(np.log1p(reviews) / np.log(501), 0.6)).clip(upper=1.0)
 
+    # Review velocity boost
+    total_app_reviews = locations.get('total_app_reviews', pd.Series(0, index=locations.index)).fillna(0).astype(float)
+    recent_reviews_90d = locations.get('recent_reviews_90d', pd.Series(0, index=locations.index)).fillna(0).astype(float)
+    velocity_boost = pd.Series(1.0, index=locations.index)
+    has_reviews = total_app_reviews > 0
+    velocity_boost[has_reviews] = 1.0 + 0.3 * (recent_reviews_90d[has_reviews] / (total_app_reviews[has_reviews] + 1))
+    review_trust = (review_trust * velocity_boost).clip(upper=1.0)
+
+    # Anti-mispricing: cap trust so volume can't overwhelm quality
+    trust_cap = 0.85 + 0.15 * (bayesian_rating / 5.0)
+    effective_trust = np.minimum(review_trust, trust_cap)
+    rating_score = (bayesian_rating / 5.0) * effective_trust
+
+    # Social proof from in-app engagement
+    saved_count = locations.get('saved_count', pd.Series(0, index=locations.index)).fillna(0).astype(float)
+    saves_app = locations.get('saves_count_app', pd.Series(0, index=locations.index)).fillna(0).astype(float)
+    dislikes_app = locations.get('dislikes_count_app', pd.Series(0, index=locations.index)).fillna(0).astype(float)
+    saves_total = np.maximum(saves_app, saved_count)
+
+    social_score = (np.log1p(saves_total) / np.log(100)).clip(upper=1.0)
+    # Penalize high dislike ratio
+    total_engagement = saves_total + dislikes_app
+    has_engagement = total_engagement > 0
+    dislike_penalty = pd.Series(1.0, index=locations.index)
+    dislike_penalty[has_engagement] = 1.0 - dislikes_app[has_engagement] / (total_engagement[has_engagement] + 1)
+    social_score = social_score * dislike_penalty
+
+    # Cold-start discovery bonus
+    age_days = locations.get('location_age_days', pd.Series(365, index=locations.index)).fillna(365).astype(float)
+    cold_start_bonus = pd.Series(0.0, index=locations.index)
+    is_new = (age_days < 30) & (total_app_reviews < 5)
+    cold_start_bonus[is_new] = 0.1 * (1.0 - age_days[is_new] / 30.0)
+
+    quality = (0.6 * rating_score + 0.4 * social_score + cold_start_bonus).clip(upper=1.0)
     return quality
 
 
@@ -324,31 +418,49 @@ def build_proximal_recommendations(
             ])
 
     # Compute component scores
-    vibe_scores = compute_vibe_score(
-        user_id,
-        nearby['location_id'].tolist(),
-        locations
-    )
+    location_ids = nearby['location_id'].tolist()
 
-    dietary_scores = compute_dietary_score(
-        user_id,
-        nearby['location_id'].tolist(),
-        locations
-    )
-
+    vibe_scores = compute_vibe_score(user_id, location_ids, locations)
+    dietary_scores = compute_dietary_score(user_id, location_ids, locations)
     quality_scores = compute_quality_score(nearby)
+
+    # Compute social and collaborative scores
+    from pinit.core.recommendation.social_scoring import compute_social_scores
+    from pinit.core.recommendation.collaborative_scoring import compute_collaborative_scores
+    from pinit.integrations.supabase import get_supabase_service
+
+    supabase = get_supabase_service()
+    social_scores_dict, _ = compute_social_scores(user_id, location_ids, supabase)
+    collab_scores_dict = compute_collaborative_scores(user_id, location_ids, supabase)
+
+    # Adaptive weights
+    has_friends = any(s > 0 for s in social_scores_dict.values())
+    action_count = supabase.get_user_action_count(user_id)
+    weights = compute_adaptive_weights(
+        has_friends=has_friends,
+        action_count=action_count,
+        quality_w=config.quality_weight,
+        vibe_w=config.vibe_weight,
+        dietary_w=config.dietary_weight,
+        social_w=config.social_weight,
+        collaborative_w=config.collaborative_weight,
+    )
 
     # Combine scores
     nearby_copy = nearby.copy()
     nearby_copy['vibe_score'] = nearby_copy['location_id'].map(vibe_scores)
     nearby_copy['dietary_score'] = nearby_copy['location_id'].map(dietary_scores)
     nearby_copy['quality_score'] = quality_scores.values
+    nearby_copy['social_score'] = nearby_copy['location_id'].map(social_scores_dict).fillna(0.0)
+    nearby_copy['collaborative_score'] = nearby_copy['location_id'].map(collab_scores_dict).fillna(0.0)
 
-    # Calculate final weighted score (NO proximity component)
+    # Calculate final weighted score with all 5 components
     nearby_copy['final_score'] = (
-        config.quality_weight * nearby_copy['quality_score'] +
-        config.vibe_weight * nearby_copy['vibe_score'] +
-        config.dietary_weight * nearby_copy['dietary_score']
+        weights["quality"] * nearby_copy['quality_score'] +
+        weights["vibe"] * nearby_copy['vibe_score'] +
+        weights["dietary"] * nearby_copy['dietary_score'] +
+        weights["social"] * nearby_copy['social_score'] +
+        weights["collaborative"] * nearby_copy['collaborative_score']
     )
     
     # Sort by final score
@@ -396,7 +508,9 @@ def build_proximal_recommendations(
                 max_results=config.max_results,
                 quality_weight=config.quality_weight,
                 vibe_weight=config.vibe_weight,
-                dietary_weight=config.dietary_weight
+                dietary_weight=config.dietary_weight,
+                social_weight=config.social_weight,
+                collaborative_weight=config.collaborative_weight,
             )
             return build_proximal_recommendations(
                 user_id, center_lat, center_lon, locations,
@@ -411,8 +525,9 @@ def build_proximal_recommendations(
     output_cols = [
         'location_id', 'name', 'vicinity', 'cuisine_primary',
         'rating', 'user_ratings_total', 'price_level',
-        'lat', 'lng',  # Include coordinates for distance calculation
-        'distance_km', 'vibe_score', 'dietary_score', 'quality_score', 'final_score', 'rank'
+        'lat', 'lng',
+        'distance_km', 'vibe_score', 'dietary_score', 'quality_score',
+        'social_score', 'collaborative_score', 'final_score', 'rank'
     ]
 
     # Only include columns that exist

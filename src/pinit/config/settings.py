@@ -54,12 +54,11 @@ class ReviewTagConfig:
 class RecommendationWeights:
     """Base weights used when blending the different scoring components."""
 
-    taste: float = 0.5
-    trend_app: float = 0.15
-    hidden_gems: float = 0.2
-    quality: float = 0.15
-    friend: float = 0.0
-    bubble: float = 0.0
+    quality: float = 0.30
+    vibe: float = 0.25
+    dietary: float = 0.10
+    social: float = 0.20
+    collaborative: float = 0.15
 
 
 @dataclass
