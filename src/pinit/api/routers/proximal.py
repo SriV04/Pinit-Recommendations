@@ -18,6 +18,8 @@ from pinit.api.schemas import (
     BubbleResponse,
     FriendSave,
     HealthResponse,
+    HiddenGemLocation,
+    HiddenGemsResponse,
     IndividualScore,
     LocationCoordinatesResponse,
     LocationRecommendation,
@@ -563,6 +565,100 @@ async def health_check() -> HealthResponse:
             total_users=0,
             total_tags=0,
         )
+
+
+@router.get("/hidden-gems", response_model=HiddenGemsResponse)
+async def get_hidden_gems(
+    latitude: float = Query(..., ge=-90, le=90),
+    longitude: float = Query(..., ge=-180, le=180),
+    radius_km: float = Query(2.0, gt=0, le=50),
+    max_results: int = Query(20, ge=1, le=100),
+    min_reviews: int = Query(35, ge=1),
+) -> HiddenGemsResponse:
+    """
+    Get hidden gem restaurants within a radius.
+
+    Returns highly-rated but under-the-radar locations scored by quality relative
+    to popularity: high quality_score * low review count = likely hidden gem.
+    """
+    import math
+    from pinit.core.recommendation.proximal_recommendation import haversine_distance
+
+    supabase = get_supabase_service()
+    nearby_data = supabase.get_locations_with_quality_scores(
+        latitude, longitude, radius_km, limit=2000
+    )
+
+    empty_response = HiddenGemsResponse(
+        center_lat=latitude,
+        center_lon=longitude,
+        radius_km=radius_km,
+        total_results=0,
+        min_reviews=min_reviews,
+        recommendations=[],
+        timestamp=datetime.utcnow().isoformat(),
+    )
+
+    if not nearby_data:
+        return empty_response
+
+    # Filter by radius and minimum review count
+    eligible = []
+    for loc in nearby_data:
+        lat = loc.get("lat")
+        lng = loc.get("lng")
+        if lat is None or lng is None:
+            continue
+        dist = haversine_distance(latitude, longitude, lat, lng)
+        if dist > radius_km:
+            continue
+        if (loc.get("user_ratings_total") or 0) < min_reviews:
+            continue
+        eligible.append({**loc, "distance_km": dist})
+
+    if not eligible:
+        return empty_response
+
+    # Score: quality * (1 - normalised popularity)
+    # Normalise log(reviews) within the candidate set so the penalty is relative
+    log_reviews = [math.log1p(c.get("user_ratings_total") or 0) for c in eligible]
+    min_lr = min(log_reviews)
+    max_lr = max(log_reviews)
+
+    for i, candidate in enumerate(eligible):
+        quality = float(candidate.get("quality_score") or 0.0)
+        norm_pop = (log_reviews[i] - min_lr) / (max_lr - min_lr) if max_lr > min_lr else 0.0
+        candidate["hidden_gem_score"] = quality * (1.0 - norm_pop)
+
+    eligible.sort(key=lambda x: x["hidden_gem_score"], reverse=True)
+
+    recommendations = []
+    for rank, loc in enumerate(eligible[:max_results], start=1):
+        recommendations.append(
+            HiddenGemLocation(
+                location_id=int(loc["location_id"]),
+                name=loc["name"],
+                vicinity=loc.get("vicinity") or None,
+                cuisine_primary=loc.get("cuisine_primary") or None,
+                rating=float(loc["rating"]) if loc.get("rating") is not None else None,
+                user_ratings_total=int(loc["user_ratings_total"]) if loc.get("user_ratings_total") is not None else None,
+                price_level=float(loc["price_level"]) if loc.get("price_level") is not None else None,
+                distance_km=float(loc["distance_km"]),
+                quality_score=float(loc.get("quality_score") or 0.0),
+                hidden_gem_score=float(loc["hidden_gem_score"]),
+                rank=rank,
+            )
+        )
+
+    return HiddenGemsResponse(
+        center_lat=latitude,
+        center_lon=longitude,
+        radius_km=radius_km,
+        total_results=len(recommendations),
+        min_reviews=min_reviews,
+        recommendations=recommendations,
+        timestamp=datetime.utcnow().isoformat(),
+    )
 
 
 @router.post("/recommendations/proximal", response_model=ProximalResponse)

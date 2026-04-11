@@ -218,9 +218,9 @@ def add_location_emoji(place_details: Dict[str, Any]) -> Optional[str]:
         Single emoji string (e.g., "🍕") or None if generation fails
     """
     # 1. Check API key
-    openai_key = os.getenv("OPENAI_API_KEY")
-    if not openai_key:
-        logger.warning("OPENAI_API_KEY not found, skipping emoji generation")
+    from pinit.config.secrets import XAI_API_KEY
+    if not XAI_API_KEY:
+        logger.warning("XAI_API_KEY not found, skipping emoji generation")
         return None
 
     # 2. Extract relevant context
@@ -276,11 +276,11 @@ def add_location_emoji(place_details: Dict[str, Any]) -> Optional[str]:
         restaurant_json = json.dumps(restaurant_data, indent=2, ensure_ascii=False)
         prompt_content = EMOJI_PROMPT_FALLBACK.replace("{restaurant_json}", restaurant_json)
 
-    # 5. Call OpenAI
+    # 5. Call xAI
     try:
-        client = OpenAI(api_key=openai_key)
+        client = OpenAI(api_key=XAI_API_KEY, base_url="https://api.x.ai/v1")
         response = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="grok-3-mini-fast",
             messages=[
                 {
                     "role": "user",
@@ -352,7 +352,6 @@ def fetch_google_place_details(google_place_id: str) -> Optional[Dict[str, Any]]
         "websiteUri",
         "internationalPhoneNumber",
         "editorialSummary",
-        "reviewSummary",
         "goodForChildren",
         "goodForGroups",
         "goodForWatchingSports",
@@ -376,6 +375,8 @@ def fetch_google_place_details(google_place_id: str) -> Optional[Dict[str, Any]]
         logger.error("GOOGLE_PLACE_API_KEY not found in environment variables")
         raise ValueError("GOOGLE_PLACE_API_KEY not found in environment variables")
 
+    logger.info("Using GOOGLE_PLACE_API_KEY: %s...", api_key[:8] if api_key else "None")
+
     url = f"https://places.googleapis.com/v1/places/{google_place_id}"
     headers = {
         "Content-Type": "application/json",
@@ -385,6 +386,13 @@ def fetch_google_place_details(google_place_id: str) -> Optional[Dict[str, Any]]
 
     try:
         response = requests.get(url, headers=headers, timeout=10)
+        if not response.ok:
+            logger.error(
+                "Google Places API %s error for %s: %s",
+                response.status_code,
+                google_place_id,
+                response.text,
+            )
         response.raise_for_status()
         place = response.json()
 

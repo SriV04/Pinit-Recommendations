@@ -87,6 +87,10 @@ if [ -n "$CACHE_COORDINATE_PRECISION" ]; then
   ENV_VARS+=",CACHE_COORDINATE_PRECISION=${CACHE_COORDINATE_PRECISION}"
 fi
 
+if [ -n "$XAI_API_KEY" ]; then
+  ENV_VARS+=",XAI_API_KEY=${XAI_API_KEY}"
+fi
+
 # Secret Manager bindings: ENV_VAR=secret-name:version
 # Requires: secrets created in Secret Manager AND the Cloud Run service
 # account granted roles/secretmanager.secretAccessor on each.

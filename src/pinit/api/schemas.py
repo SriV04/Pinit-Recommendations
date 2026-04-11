@@ -177,6 +177,30 @@ class FilterOptions(BaseModel):
     )
 
 
+class HiddenGemLocation(BaseModel):
+    location_id: int
+    name: str
+    vicinity: Optional[str] = None
+    cuisine_primary: Optional[str] = None
+    rating: Optional[float] = None
+    user_ratings_total: Optional[int] = None
+    price_level: Optional[float] = None
+    distance_km: float
+    quality_score: float
+    hidden_gem_score: float
+    rank: int
+
+
+class HiddenGemsResponse(BaseModel):
+    center_lat: float
+    center_lon: float
+    radius_km: float
+    total_results: int
+    min_reviews: int
+    recommendations: List[HiddenGemLocation]
+    timestamp: str
+
+
 class BubbleRequest(BaseModel):
     """Request for group (bubble) recommendations."""
     user_ids: List[str] = Field(

@@ -21,10 +21,15 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 # Step 1 — Fetch google_place_id values from Supabase
 # ---------------------------------------------------------
 def get_all_google_place_ids():
-    """Fetch all place IDs from locations table"""
-    data = supabase.table("locations").select("google_place_id").execute()
+    """Fetch place IDs from locations that don't have a photo_reference yet."""
+    data = (
+        supabase.table("locations")
+        .select("google_place_id")
+        .is_("photo_reference", "null")
+        .execute()
+    )
     rows = data.data
-    return [row["google_place_id"] for row in rows]
+    return [row["google_place_id"] for row in rows if row.get("google_place_id")]
 
 
 # ---------------------------------------------------------
@@ -262,7 +267,6 @@ def main():
     4. Save classification results to database
     """
     place_ids = get_all_google_place_ids()
-    place_ids = place_ids[253:]
     total = len(place_ids)
 
     print(f"Processing {total} locations...")
@@ -283,21 +287,8 @@ def main():
             skipped += 1
             continue
 
-        # Download image
-        print(f"  ↳ Downloading photo...")
-        image_bytes = download_photo(photo_ref)
-
-        if not image_bytes:
-            print(f"  ↳ Failed to download photo")
-            errors += 1
-            continue
-
-        # Classify with OpenAI
-        print(f"  ↳ Classifying with OpenAI...")
-        classification = classify_image_with_openai(image_bytes)
-        toUpdate = {'photo_reference': photo_ref, 'photo_reference_score':classification}
-        print(toUpdate, 'with a id', place_id)
-        # Update database
+        # Save photo reference to database (skip classification)
+        toUpdate = {'photo_reference': photo_ref}
         success = update_location_with_classification(place_id, toUpdate)
 
         if success:
