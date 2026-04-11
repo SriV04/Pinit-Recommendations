@@ -185,6 +185,16 @@ class BubbleRequest(BaseModel):
         min_items=2,
         example=["alice", "bob", "charlie"]
     )
+    bubble_id: Optional[str] = Field(
+        None,
+        description=(
+            "Optional bubble UUID. When provided, locations the group has "
+            "added to bubble_locations are used to bias each user's effective "
+            "vibe vector toward their current intent for this bubble, and "
+            "those locations get a small ranking boost."
+        ),
+        example="d4f3e2c1-b6a7-4d5f-8e9a-0b1c2d3e4f5a",
+    )
     latitude: float = Field(..., description="Center point latitude", ge=-90, le=90)
     longitude: float = Field(..., description="Center point longitude", ge=-180, le=180)
     radius_km: Optional[float] = Field(2.0, description="Search radius in kilometers", gt=0, le=50)
@@ -209,6 +219,12 @@ class BubbleRequest(BaseModel):
         None,
         description="Optional filters for cuisine (OR logic) and vibe (AND logic)"
     )
+
+
+class UserVibeScore(BaseModel):
+    """One user's individual vibe match score for a location."""
+    user_id: str
+    vibe_score: float = Field(..., description="Centered cosine similarity in [0, 1]")
 
 
 class IndividualScore(BaseModel):
@@ -237,6 +253,18 @@ class BubbleLocationRecommendation(BaseModel):
     quality_score: float
     final_score: float
     rank: int
+
+    # Per-user vibe match for this location (always returned). Each user
+    # is scored with their *effective* vibe vector — that is, their personal
+    # vibe_tag_affinity blended with what they've added to this bubble.
+    individual_vibe_scores: List[UserVibeScore] = Field(
+        default_factory=list,
+        description="Per-user vibe match score for this location",
+    )
+    is_in_bubble: bool = Field(
+        False,
+        description="True if this location is already in the bubble's saved list",
+    )
 
     # Transparency metrics (optional)
     individual_scores: Optional[List[IndividualScore]] = Field(

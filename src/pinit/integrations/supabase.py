@@ -204,6 +204,39 @@ class SupabaseService:
             )
             return []
 
+    def get_bubble_added_locations(self, bubble_id: str) -> List[Dict[str, Any]]:
+        """
+        Fetch every location added to a bubble along with the user who added
+        it and the location's vibe vector.
+
+        Returns rows of {added_by, location_id, vibe_vector}. Used by the
+        bubble recommendation flow to bias each user's effective vibe vector
+        toward what they've actually shortlisted in this specific bubble.
+        """
+        logger = logging.getLogger(__name__)
+        try:
+            response = (
+                self.client.table("bubble_locations")
+                .select("added_by, location_id, locations(vibe_vector)")
+                .eq("bubble_id", bubble_id)
+                .execute()
+            )
+            rows = response.data or []
+            # Flatten the embedded `locations` join to top-level vibe_vector.
+            flat = []
+            for row in rows:
+                loc = row.get("locations") or {}
+                vibe = loc.get("vibe_vector") if isinstance(loc, dict) else None
+                flat.append({
+                    "added_by": row.get("added_by"),
+                    "location_id": row.get("location_id"),
+                    "vibe_vector": vibe,
+                })
+            return flat
+        except Exception as exc:
+            logger.error(f"Error fetching bubble added locations for {bubble_id}: {exc}")
+            return []
+
     def refresh_quality_scores(self) -> Optional[int]:
         """Manually trigger the v4 quality score refresh job.
 
@@ -578,7 +611,7 @@ class SupabaseService:
             # User is the follower (they follow others)
             resp1 = (
                 self.client.table("user_friends")
-                .select("followee_id, influence, created_at")
+                .select("followee_id, influence")
                 .eq("follower_id", user_id)
                 .eq("status", "accepted")
                 .execute()
@@ -586,7 +619,7 @@ class SupabaseService:
             # User is the followee (others follow them)
             resp2 = (
                 self.client.table("user_friends")
-                .select("follower_id, influence, created_at")
+                .select("follower_id, influence")
                 .eq("followee_id", user_id)
                 .eq("status", "accepted")
                 .execute()

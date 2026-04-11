@@ -26,6 +26,7 @@ from pinit.api.schemas import (
     ProximalRequest,
     ProximalResponse,
     TagMatch,
+    UserVibeScore,
 )
 from pinit.config.secrets import GOOGLE_PLACE_API_KEY
 from pinit.api.services.proximal_service import (
@@ -236,6 +237,7 @@ def _rank_cached_candidates(
     user_id: Optional[str] = None,
     social_weight: float = 0.20,
     collaborative_weight: float = 0.15,
+    group_context: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Apply filtering and ranking to cached candidates using 5-component scoring.
@@ -268,16 +270,34 @@ def _rank_cached_candidates(
 
     supabase = get_supabase_service()
 
+    # ── Mode resolution ────────────────────────────────────────────────
+    # PROXIMAL mode: user_id is set, group_context is None
+    # BUBBLE mode:   group_context is set, user_id may be None
+    #
+    # group_context shape (all keys required when set):
+    #   {
+    #     "group_vibe_vec":           List[float] | np.ndarray,    # used for the
+    #                                                              # vibe_score
+    #     "user_dietary_vectors":     Dict[str, List[float]],      # per user
+    #     "user_effective_vibe_vecs": Dict[str, np.ndarray],       # per user,
+    #                                                              # for the
+    #                                                              # individual
+    #                                                              # breakdown
+    #     "activity_weights":         Dict[str, float],            # per user
+    #     "bubble_location_ids":      Set[int],                    # for boost
+    #     "bubble_boost":             float,                       # e.g. 0.1
+    #   }
+    is_group_mode = group_context is not None
+
     # Fetch user vectors if user_id is provided (slim query - only vector columns)
     user_vibe_vec = None
     user_dietary_vec = None
-    vibe_tag_order = None
-    if user_id:
+    vibe_tag_order = supabase.vibe_tag_order  # used by diversification in both modes
+    if user_id and not is_group_mode:
         user_data = supabase.get_user_vectors(user_id)
         if user_data:
             user_vibe_vec = user_data.get("vibe_tag_affinity")
             user_dietary_vec = user_data.get("dietary_requirement_tag_affinity")
-        vibe_tag_order = supabase.vibe_tag_order
 
     # Step 1: Filter by cuisine and vibe tags if specified
     filtered_candidates = _filter_candidates_by_tags(
@@ -327,14 +347,15 @@ def _rank_cached_candidates(
 
     candidate_location_ids = [c["location_id"] for c in radius_filtered]
 
-    # Step 3: Compute social and collaborative scores in batch (user-specific)
+    # Step 3: Compute social and collaborative scores in batch (user-specific).
+    # Skipped entirely in group mode — bubble recs ignore both signals.
     social_scores: Dict[int, float] = {}
     friend_attributions: Dict[int, list] = {}
     collab_scores: Dict[int, float] = {}
     has_friends = False
     action_count = 0
 
-    if user_id:
+    if user_id and not is_group_mode:
         # Social scoring
         social_scores, friend_attributions = compute_social_scores(
             user_id, candidate_location_ids, supabase
@@ -349,15 +370,23 @@ def _rank_cached_candidates(
         # Get action count for adaptive weights
         action_count = supabase.get_user_action_count(user_id)
 
-    # Step 4: Compute adaptive weights
+    # Step 4: Compute adaptive weights. In group mode, force social/collab to 0
+    # so the request weights are renormalised across just quality / vibe / dietary.
+    if is_group_mode:
+        effective_social_w = 0.0
+        effective_collab_w = 0.0
+    else:
+        effective_social_w = social_weight
+        effective_collab_w = collaborative_weight
+
     weights = compute_adaptive_weights(
         has_friends=has_friends,
         action_count=action_count,
         quality_w=quality_weight,
         vibe_w=vibe_weight,
         dietary_w=dietary_weight,
-        social_w=social_weight,
-        collaborative_w=collaborative_weight,
+        social_w=effective_social_w,
+        collaborative_w=effective_collab_w,
     )
 
     w_quality = weights["quality"]
@@ -366,23 +395,70 @@ def _rank_cached_candidates(
     w_social = weights["social"]
     w_collab = weights["collaborative"]
 
-    # Step 5: Score each candidate with all 5 components
+    # Step 5: Score each candidate.
+    #
+    # PROXIMAL mode: 5 components (quality, vibe, dietary, social, collab)
+    # BUBBLE mode:   3 components (quality, vibe, dietary). Vibe is one
+    #                cosine against the group's blended vector. Dietary is
+    #                MAX-pooled across per-user dot products. Each candidate
+    #                also gets `individual_vibe_scores` and `is_in_bubble`.
+    group_vibe_vec_local = (
+        group_context.get("group_vibe_vec") if is_group_mode else None
+    )
+    user_dietary_vectors = (
+        group_context.get("user_dietary_vectors", {}) if is_group_mode else {}
+    )
+    user_effective_vibe_vecs = (
+        group_context.get("user_effective_vibe_vecs", {}) if is_group_mode else {}
+    )
+    bubble_location_ids = (
+        group_context.get("bubble_location_ids", set()) if is_group_mode else set()
+    )
+
     scored_candidates = []
     for candidate in radius_filtered:
         loc_id = candidate["location_id"]
+        loc_vibe_vec = candidate.get("vibe_vector")
+        loc_dietary_vec = candidate.get("dietary_requirement_vector")
 
         quality_score = candidate.get("quality_score", 0.0)
 
-        # Vibe and dietary (same as before)
         vibe_score = 0.0
         dietary_score = 0.0
-        if user_id:
-            loc_vibe_vec = candidate.get("vibe_vector")
-            loc_dietary_vec = candidate.get("dietary_requirement_vector")
-            if user_vibe_vec and loc_vibe_vec:
-                vibe_score = centered_cosine_similarity(user_vibe_vec, loc_vibe_vec)
-            if user_dietary_vec and loc_dietary_vec:
-                dietary_score = dot_product(user_dietary_vec, loc_dietary_vec)
+        individual_vibe_scores: List[Dict[str, Any]] = []
+
+        if is_group_mode:
+            # ── group vibe: one cosine against the blended group vector
+            if group_vibe_vec_local is not None and loc_vibe_vec:
+                vibe_score = centered_cosine_similarity(
+                    list(group_vibe_vec_local), loc_vibe_vec
+                )
+
+            # ── group dietary: MAX of per-user dot products
+            if user_dietary_vectors and loc_dietary_vec:
+                per_user = []
+                for uid, uvec in user_dietary_vectors.items():
+                    if uvec:
+                        per_user.append(dot_product(uvec, loc_dietary_vec))
+                if per_user:
+                    dietary_score = max(per_user)
+
+            # ── per-user vibe breakdown using each user's effective vector
+            if loc_vibe_vec:
+                for uid, eff_vec in user_effective_vibe_vecs.items():
+                    individual_vibe_scores.append({
+                        "user_id": uid,
+                        "vibe_score": centered_cosine_similarity(
+                            list(eff_vec), loc_vibe_vec
+                        ),
+                    })
+        else:
+            # Original proximal flow — single user
+            if user_id:
+                if user_vibe_vec and loc_vibe_vec:
+                    vibe_score = centered_cosine_similarity(user_vibe_vec, loc_vibe_vec)
+                if user_dietary_vec and loc_dietary_vec:
+                    dietary_score = dot_product(user_dietary_vec, loc_dietary_vec)
 
         social_score = social_scores.get(loc_id, 0.0)
         collaborative_score = collab_scores.get(loc_id, 0.0)
@@ -405,18 +481,41 @@ def _rank_cached_candidates(
             "final_score": final_score,
             "friend_saves": friend_attributions.get(loc_id),
             "weights_used": weights,
+            # Group-mode-only fields (always present so the bubble endpoint
+            # can read them; empty list and False for proximal).
+            "individual_vibe_scores": individual_vibe_scores,
+            "is_in_bubble": loc_id in bubble_location_ids,
         })
 
     # Step 6: Sort by final score
     scored_candidates.sort(key=lambda x: x.get("final_score", 0), reverse=True)
 
-    # Step 7: Diversify across user's top tags proportionally, then re-sort
-    if user_vibe_vec and vibe_tag_order:
+    # Step 7: Diversify across the seed vibe vector's top tags, then re-sort.
+    # In group mode that's the blended group vector; in proximal it's the
+    # individual user's vibe_tag_affinity.
+    if is_group_mode and group_vibe_vec_local is not None:
+        diversify_seed = list(group_vibe_vec_local)
+    else:
+        diversify_seed = user_vibe_vec
+
+    if diversify_seed and vibe_tag_order:
         diverse_candidates = _diversify_by_top_tags(
-            scored_candidates, user_vibe_vec, vibe_tag_order, max_results
+            scored_candidates, diversify_seed, vibe_tag_order, max_results
         )
     else:
         diverse_candidates = scored_candidates[:max_results]
+
+    # Step 7b: Bubble boost — locations the group has already added get a
+    # small additive bonus so they surface near the top of their own list,
+    # without dominating discovery. Only applied in group mode.
+    if is_group_mode and bubble_location_ids:
+        bubble_boost = float(group_context.get("bubble_boost", 0.1))
+        for c in diverse_candidates:
+            if c.get("is_in_bubble"):
+                c["final_score"] = c.get("final_score", 0.0) + bubble_boost
+        diverse_candidates.sort(
+            key=lambda x: x.get("final_score", 0.0), reverse=True
+        )
 
     # Step 8: Assign ranks
     for rank, candidate in enumerate(diverse_candidates, start=1):
@@ -1147,81 +1246,229 @@ async def magic_search(request: MagicSearchRequest) -> MagicSearchResponse:
 @router.post("/recommendations/bubble", response_model=BubbleResponse)
 async def get_bubble_recommendations(request: BubbleRequest) -> BubbleResponse:
     """
-    Get group recommendations for multiple users (bubble).
+    Group (bubble) recommendations.
 
-    COMPLETE FLOW:
-    1. Filter by geographic radius
-    2. OPTIONAL-FILTER by cuisine (OR logic) and vibe (AND logic) if specified
-    3. Compute individual vibe scores (centered cosine similarity)
-    4. Compute individual dietary scores (dot product) - soft scoring, not hard filter
-    5. Aggregate vibe using context-aware strategy
-    6. Aggregate dietary using MAX pooling
-    7. Combine with quality
-    8. Diversify across group's top vibe tags
-    9. Rank and return
+    Reuses the same data path as /recommendations/proximal — same Redis cache,
+    same slim PostGIS RPC, same diversification — and adds:
+      * Activity-weighted average of users' effective vibe vectors as the
+        single group vibe vector (one cosine per location).
+      * Optional bias toward locations the group has added to bubble_locations
+        for this bubble_id (intent_weight=0.5 by default).
+      * Per-user vibe score breakdown returned per location.
+      * Small additive boost (+0.1) on locations already in the bubble so the
+        group's existing list surfaces near the top.
 
-    KEY FEATURES:
-    - Vibe matching: Centered cosine similarity (same as proximal)
-    - Dietary matching: Dot product, MAX pooled across users (soft signal, not hard filter)
-    - Activity weighting: Prevents inactive users from dominating group preferences
-      - < 20 actions: Scaled weight (new/inactive users have reduced influence)
-      - >= 20 actions: Full weight (all active users treated equally)
-    - Diversification: Results spread across group's top vibe tags proportionally
-
-    CONTEXT-AWARE AGGREGATION:
-    - Group size == 2: Uses minimum score (both must like it)
-    - Group size >= 3 and high disagreement (variance > 0.15): Uses fairness blend (40% min + 60% avg)
-    - Group size >= 3 and low disagreement (variance <= 0.15): Uses weighted average
+    Social and collaborative scores are intentionally disabled in bubble mode.
     """
+    from pinit.core.recommendation.bubble_recommendation import (
+        compute_user_activity_scores,
+    )
+    from pinit.core.recommendation.bubble_vibe import (
+        build_effective_user_vectors,
+        aggregate_group_vibe_vector,
+    )
+
     supabase = get_supabase_service()
 
-    # Validate all users exist
-    invalid_users = []
+    logger.info(
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    )
+    logger.info(
+        "🫧  BUBBLE REQUEST: users=%s, bubble_id=%s, position=(%.4f, %.4f), "
+        "radius=%.1f km, max_results=%d",
+        request.user_ids,
+        request.bubble_id,
+        request.latitude,
+        request.longitude,
+        request.radius_km,
+        request.max_results,
+    )
+
+    # ── Validate all users exist + fetch their slim vector rows in one pass.
+    user_vectors: Dict[str, Optional[List[float]]] = {}
+    user_dietary_vectors: Dict[str, Optional[List[float]]] = {}
+    invalid_users: List[str] = []
     for user_id in request.user_ids:
-        user_data = supabase.get_user(user_id)
-        if not user_data:
+        row = supabase.get_user_vectors(user_id)
+        if not row:
             invalid_users.append(user_id)
+            continue
+        user_vectors[user_id] = row.get("vibe_tag_affinity")
+        user_dietary_vectors[user_id] = row.get("dietary_requirement_tag_affinity")
 
     if invalid_users:
         raise HTTPException(
             status_code=404,
-            detail=f"Users not found: {invalid_users}"
+            detail=f"Users not found: {invalid_users}",
         )
 
-    # Extract optional filters
-    cuisine_filters = None
-    vibe_filters = None
+    # ── Extract optional filters
+    cuisine_filters = request.filters.cuisine if request.filters else None
+    vibe_filters = request.filters.vibe if request.filters else None
 
-    if request.filters:
-        cuisine_filters = request.filters.cuisine
-        vibe_filters = request.filters.vibe
+    # ── Bubble intent: pull what the group has shortlisted, if a bubble was
+    # supplied. Adds at most ~5-15 rows of egress.
+    bubble_added_rows: List[Dict[str, Any]] = []
+    if request.bubble_id:
+        bubble_added_rows = supabase.get_bubble_added_locations(request.bubble_id)
+        logger.info(
+            "🫧  Bubble %s has %d added location(s) used for intent blending",
+            request.bubble_id,
+            len(bubble_added_rows),
+        )
 
-    # Create config
-    config = BubbleConfig(
-        radius_km=request.radius_km,
-        max_results=request.max_results,
+    bubble_location_ids: set = {
+        row["location_id"]
+        for row in bubble_added_rows
+        if row.get("location_id") is not None
+    }
+
+    # ── Activity weights (per user_id, sums to 1.0)
+    activity_weights = compute_user_activity_scores(request.user_ids)
+
+    # ── Per-user effective vibe vectors (personal blended with bubble intent)
+    effective_user_vibe_vecs = build_effective_user_vectors(
+        user_vectors, bubble_added_rows
+    )
+
+    # ── Diagnostics: surface degenerate vectors early. A user whose personal
+    # vibe_tag_affinity is None, empty, or uniform contributes zero signal to
+    # centered cosine — their individual score will be 0 and the group score
+    # will collapse to whatever non-uniform users remain.
+    import numpy as _np_diag
+    for uid in request.user_ids:
+        personal = user_vectors.get(uid)
+        if personal is None:
+            logger.warning("🫧  User %s: vibe_tag_affinity is NULL in DB", uid)
+            continue
+        try:
+            arr = _np_diag.asarray(personal, dtype=float)
+        except Exception:
+            logger.warning("🫧  User %s: vibe_tag_affinity unparseable (%r)", uid, personal)
+            continue
+        if arr.size == 0:
+            logger.warning("🫧  User %s: vibe_tag_affinity is empty", uid)
+            continue
+        centered = arr - arr.mean()
+        c_norm = float(_np_diag.linalg.norm(centered))
+        logger.info(
+            "🫧  User %s: vibe vector len=%d, mean=%.2f, centered_norm=%.3f, "
+            "activity_weight=%.3f%s",
+            uid, arr.size, float(arr.mean()), c_norm,
+            activity_weights.get(uid, 0.0),
+            " [UNIFORM — will contribute 0 to centered cosine]" if c_norm < 1e-9 else "",
+        )
+
+    # ── Single blended group vibe vector
+    group_vibe_arr = aggregate_group_vibe_vector(
+        effective_user_vibe_vecs, activity_weights
+    )
+    if group_vibe_arr is None:
+        logger.warning(
+            "🫧  No usable vibe vectors for any user in %s — bubble vibe "
+            "scoring will return 0.0 for every candidate",
+            request.user_ids,
+        )
+    else:
+        centered_group = group_vibe_arr - group_vibe_arr.mean()
+        logger.info(
+            "🫧  Group vibe vector: len=%d, mean=%.2f, centered_norm=%.3f",
+            group_vibe_arr.size,
+            float(group_vibe_arr.mean()),
+            float(_np_diag.linalg.norm(centered_group)),
+        )
+
+    # ── Cache → spatial RPC → rank, exactly like proximal
+    cache_service = get_cache_service()
+    cached_data = cache_service.get_cached_recommendations(
+        request.latitude, request.longitude, request.radius_km
+    )
+
+    if cached_data is not None:
+        candidates = cached_data.get("candidates", [])
+        logger.info(
+            "🫧  ✅ CACHE HIT: %d candidates from cache at (%.4f, %.4f)",
+            len(candidates),
+            cached_data.get("center_lat"),
+            cached_data.get("center_lng"),
+        )
+    else:
+        cache_radius_km = 15.0
+        logger.info(
+            "🫧  ❌ CACHE MISS at (%.4f, %.4f), querying %.1f km via PostGIS",
+            request.latitude,
+            request.longitude,
+            cache_radius_km,
+        )
+        nearby_locations_data = supabase.get_locations_with_quality_scores(
+            request.latitude,
+            request.longitude,
+            cache_radius_km,
+            limit=2000,
+        )
+        if not nearby_locations_data:
+            return BubbleResponse(
+                user_ids=request.user_ids,
+                group_size=len(request.user_ids),
+                center_lat=request.latitude,
+                center_lon=request.longitude,
+                radius_km=request.radius_km,
+                total_results=0,
+                recommendations=[],
+                optional_filters_applied=request.filters,
+                locations_before_filtering=0,
+                locations_after_filtering=0,
+                timestamp=datetime.utcnow().isoformat(),
+            )
+
+        df = pd.DataFrame(nearby_locations_data)
+        cache_cols = [
+            'location_id', 'name', 'vicinity', 'cuisine_primary',
+            'rating', 'user_ratings_total', 'price_level',
+            'lat', 'lng', 'distance_km',
+            'vibe_vector', 'dietary_requirement_vector',
+            'quality_score',
+        ]
+        cache_cols_available = [c for c in cache_cols if c in df.columns]
+        candidates = df[cache_cols_available].to_dict("records")
+
+        cache_service.set_cached_recommendations(
+            request.latitude, request.longitude, candidates
+        )
+        logger.info("🫧  ✅ Cached %d locations", len(candidates))
+
+    locations_before = len(candidates)
+
+    # ── Build group_context and call the shared ranker
+    group_context: Dict[str, Any] = {
+        "group_vibe_vec": group_vibe_arr.tolist() if group_vibe_arr is not None else None,
+        "user_dietary_vectors": user_dietary_vectors,
+        "user_effective_vibe_vecs": effective_user_vibe_vecs,
+        "activity_weights": activity_weights,
+        "bubble_location_ids": bubble_location_ids,
+        "bubble_boost": 0.1,
+    }
+
+    scored = _rank_cached_candidates(
+        candidates=candidates,
+        request_lat=request.latitude,
+        request_lng=request.longitude,
+        request_radius_km=request.radius_km,
+        quality_weight=request.quality_weight,
         vibe_weight=request.vibe_weight,
         dietary_weight=request.dietary_weight,
-        quality_weight=request.quality_weight,
-    )
-
-    # Fetch locations from database
-    locations_data = supabase.get_locations(limit=10000)
-    locations_df = pd.DataFrame(locations_data)
-
-    # Generate bubble recommendations
-    recs = build_bubble_recommendations(
-        request.user_ids,
-        request.latitude,
-        request.longitude,
-        locations_df,
+        max_results=request.max_results,
         cuisine_filters=cuisine_filters,
         vibe_filters=vibe_filters,
-        config=config,
+        user_id=None,
+        social_weight=0.0,
+        collaborative_weight=0.0,
+        group_context=group_context,
     )
 
-    # Handle empty results
-    if recs.empty:
+    locations_after = len(scored)
+
+    if not scored:
         return BubbleResponse(
             user_ids=request.user_ids,
             group_size=len(request.user_ids),
@@ -1231,58 +1478,80 @@ async def get_bubble_recommendations(request: BubbleRequest) -> BubbleResponse:
             total_results=0,
             recommendations=[],
             optional_filters_applied=request.filters,
-            locations_before_filtering=0,
+            locations_before_filtering=locations_before,
             locations_after_filtering=0,
             timestamp=datetime.utcnow().isoformat(),
         )
 
-    # Extract metadata
-    locations_before = int(recs.iloc[0]['locations_before_filtering']) if len(recs) > 0 else 0
-    locations_after = int(recs.iloc[0]['locations_after_filtering']) if len(recs) > 0 else 0
+    # ── Serialise. Every numeric field is sanitised against NaN / inf / None
+    # because individual numpy operations upstream can silently produce NaN
+    # (e.g. when a user has a degenerate all-zero vibe vector) and json.dumps
+    # refuses to encode it.
+    import math as _math
 
-    # Convert to response model
+    def _safe_float(value: Any, default: Optional[float] = 0.0) -> Optional[float]:
+        if value is None:
+            return default
+        try:
+            f = float(value)
+        except (TypeError, ValueError):
+            return default
+        if _math.isnan(f) or _math.isinf(f):
+            return default
+        return f
+
+    def _safe_optional_float(value: Any) -> Optional[float]:
+        return _safe_float(value, default=None)
+
+    def _safe_optional_int(value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        try:
+            f = float(value)
+        except (TypeError, ValueError):
+            return None
+        if _math.isnan(f) or _math.isinf(f):
+            return None
+        return int(f)
+
     recommendations = []
-    for _, row in recs.iterrows():
-        # Prepare individual scores if requested
-        individual_scores = None
-        if request.include_individual_scores and 'individual_scores' in row:
-            individual_scores = [
-                IndividualScore(**score)
-                for score in row['individual_scores']
-            ]
-
-        # Prepare vibe breakdown if requested
-        # NOTE: get_taste_breakdown currently returns empty list (vector-based system)
-        vibe_breakdown = None
-        # if request.include_vibe_breakdown:
-        #     breakdown = get_taste_breakdown(...)
-        #     if breakdown:
-        #         vibe_breakdown = [TagMatch(**item) for item in breakdown]
+    for c in scored:
+        per_user_vibes = [
+            UserVibeScore(
+                user_id=ivs["user_id"],
+                vibe_score=_safe_float(ivs.get("vibe_score"), default=0.0),
+            )
+            for ivs in (c.get("individual_vibe_scores") or [])
+        ]
 
         recommendations.append(
             BubbleLocationRecommendation(
-                location_id=int(row["location_id"]),
-                name=row["name"],
-                vicinity=row.get("vicinity") if pd.notna(row.get("vicinity")) else None,
-                cuisine_primary=row.get("cuisine_primary") if pd.notna(row.get("cuisine_primary")) else None,
-                rating=float(row["rating"]) if pd.notna(row.get("rating")) else None,
-                user_ratings_total=int(row["user_ratings_total"])
-                if pd.notna(row.get("user_ratings_total"))
-                else None,
-                price_level=float(row["price_level"]) if pd.notna(row.get("price_level")) else None,
-                distance_km=float(row["distance_km"]),
-                group_vibe_score=float(row["group_vibe_score"]),
-                group_dietary_score=float(row["group_dietary_score"]),
-                quality_score=float(row["quality_score"]),
-                final_score=float(row["final_score"]),
-                rank=int(row["rank"]),
-                individual_scores=individual_scores,
-                min_individual_score=float(row.get("min_individual_score", 0)),
-                max_individual_score=float(row.get("max_individual_score", 0)),
-                score_variance=float(row.get("score_variance", 0)),
-                vibe_breakdown=vibe_breakdown,
+                location_id=int(c["location_id"]),
+                name=c["name"],
+                vicinity=c.get("vicinity") if c.get("vicinity") is not None else None,
+                cuisine_primary=c.get("cuisine_primary"),
+                rating=_safe_optional_float(c.get("rating")),
+                user_ratings_total=_safe_optional_int(c.get("user_ratings_total")),
+                price_level=_safe_optional_float(c.get("price_level")),
+                distance_km=_safe_float(c.get("distance_km"), default=0.0),
+                group_vibe_score=_safe_float(c.get("vibe_score"), default=0.0),
+                group_dietary_score=_safe_float(c.get("dietary_score"), default=0.0),
+                quality_score=_safe_float(c.get("quality_score"), default=0.0),
+                final_score=_safe_float(c.get("final_score"), default=0.0),
+                rank=int(c["rank"]),
+                individual_vibe_scores=per_user_vibes,
+                is_in_bubble=bool(c.get("is_in_bubble", False)),
             )
         )
+
+    logger.info(
+        "🫧  ✅ BUBBLE COMPLETE: %d recommendations (in_bubble=%d)",
+        len(recommendations),
+        sum(1 for r in recommendations if r.is_in_bubble),
+    )
+    logger.info(
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    )
 
     return BubbleResponse(
         user_ids=request.user_ids,

@@ -85,7 +85,19 @@ class CacheConfig:
 
     # Cache parameters
     large_radius_km: float = field(default_factory=lambda: float(os.getenv("CACHE_LARGE_RADIUS_KM", "15.0")))
-    coordinate_precision: int = 2  # Round coords to 0.01 degrees (~1.1km grid)
+    # Grid precision in decimal places — how aggressively we snap request
+    # coordinates before building the cache key. Coarser grids share cache
+    # entries across more users → higher hit rate.
+    #
+    #   precision=2  →  0.01° (~1.1 km)  many entries, low hit rate
+    #   precision=1  →  0.1°  (~11 km)   few entries, high hit rate  ← default
+    #
+    # Hit check needs `distance_to_cached_centre + request_radius <= cached_radius`.
+    # At precision=1 the worst-case offset from snapped centre is ~6.5 km
+    # (cell corner at London latitude). With cached_radius=15 km that means
+    # requests up to ~8.5 km radius still hit. The app's default request
+    # radius is 2 km and typical max is 5 km, so precision=1 is safe.
+    coordinate_precision: int = field(default_factory=lambda: int(os.getenv("CACHE_COORDINATE_PRECISION", "1")))
 
     # TTLs (seconds)
     unfiltered_cache_ttl: int = field(default_factory=lambda: int(os.getenv("CACHE_UNFILTERED_TTL", "7200")))  # 2 hours

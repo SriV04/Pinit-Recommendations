@@ -448,8 +448,9 @@ class ProximalCacheService:
             return 0
 
         try:
-            # Calculate affected grid cells
-            # Each cell is ~1.1km (0.01 degrees), so we need to check cells within radius
+            # Calculate affected grid cells (cell size comes from
+            # CacheConfig.coordinate_precision — see settings.py for the
+            # precision → cell size mapping).
             cells_to_check = self._get_affected_cells(center_lat, center_lng, radius_km)
 
             deleted_count = 0
@@ -501,7 +502,7 @@ class ProximalCacheService:
         """
         # Approximate: 1 degree latitude ≈ 111km, 1 degree longitude ≈ 111km * cos(lat)
         precision = self.config.coordinate_precision
-        cell_size = 10 ** (-precision)  # 0.01 for precision=2
+        cell_size = 10 ** (-precision)  # e.g. 0.01° for precision=2, 0.1° for precision=1
 
         # Calculate how many cells in each direction
         lat_degrees = radius_km / 111.0

@@ -49,51 +49,58 @@ else
   exit 1
 fi
 
-# Build environment variables string
+# Build environment variables string (NON-SENSITIVE values only).
+# Sensitive values (service role key, API keys, redis password) come from
+# Secret Manager via --set-secrets below.
 ENV_VARS="SUPABASE_URL=${SUPABASE_URL}"
-ENV_VARS+=",SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}"
-ENV_VARS+=",GOOGLE_PLACE_API_KEY=${GOOGLE_PLACE_API_KEY}"
 
 # Redis configuration (optional - will use defaults if not set)
-# if [ -n "$REDIS_HOST" ]; then
-#   ENV_VARS+=",REDIS_HOST=${REDIS_HOST}"
-# fi
+if [ -n "$REDIS_HOST" ]; then
+  ENV_VARS+=",REDIS_HOST=${REDIS_HOST}"
+fi
 
-# if [ -n "$REDIS_PORT" ]; then
-#   ENV_VARS+=",REDIS_PORT=${REDIS_PORT}"
-# fi
+if [ -n "$REDIS_PORT" ]; then
+  ENV_VARS+=",REDIS_PORT=${REDIS_PORT}"
+fi
 
-# if [ -n "$REDIS_PASSWORD" ]; then
-#   ENV_VARS+=",REDIS_PASSWORD=${REDIS_PASSWORD}"
-# fi
+if [ -n "$REDIS_DB" ]; then
+  ENV_VARS+=",REDIS_DB=${REDIS_DB}"
+fi
 
-# if [ -n "$REDIS_DB" ]; then
-#   ENV_VARS+=",REDIS_DB=${REDIS_DB}"
-# fi
+if [ -n "$REDIS_SSL" ]; then
+  ENV_VARS+=",REDIS_SSL=${REDIS_SSL}"
+fi
 
-# if [ -n "$REDIS_SSL" ]; then
-#   ENV_VARS+=",REDIS_SSL=${REDIS_SSL}"
-# fi
+if [ -n "$CACHING_ENABLED" ]; then
+  ENV_VARS+=",CACHING_ENABLED=${CACHING_ENABLED}"
+fi
 
-# if [ -n "$CACHING_ENABLED" ]; then
-#   ENV_VARS+=",CACHING_ENABLED=${CACHING_ENABLED}"
-# fi
+if [ -n "$CACHE_LARGE_RADIUS_KM" ]; then
+  ENV_VARS+=",CACHE_LARGE_RADIUS_KM=${CACHE_LARGE_RADIUS_KM}"
+fi
 
-# if [ -n "$CACHE_LARGE_RADIUS_KM" ]; then
-#   ENV_VARS+=",CACHE_LARGE_RADIUS_KM=${CACHE_LARGE_RADIUS_KM}"
-# fi
+if [ -n "$CACHE_UNFILTERED_TTL" ]; then
+  ENV_VARS+=",CACHE_UNFILTERED_TTL=${CACHE_UNFILTERED_TTL}"
+fi
 
-# if [ -n "$CACHE_UNFILTERED_TTL" ]; then
-#   ENV_VARS+=",CACHE_UNFILTERED_TTL=${CACHE_UNFILTERED_TTL}"
-# fi
+if [ -n "$CACHE_COORDINATE_PRECISION" ]; then
+  ENV_VARS+=",CACHE_COORDINATE_PRECISION=${CACHE_COORDINATE_PRECISION}"
+fi
+
+# Secret Manager bindings: ENV_VAR=secret-name:version
+# Requires: secrets created in Secret Manager AND the Cloud Run service
+# account granted roles/secretmanager.secretAccessor on each.
+SECRETS="SUPABASE_SERVICE_ROLE_KEY=supabase-service-role-key:latest"
+SECRETS+=",GOOGLE_PLACE_API_KEY=google-place-api-key:latest"
+SECRETS+=",REDIS_PASSWORD=redis-password:latest"
 
 gcloud run deploy $SERVICE_NAME \
   --image $AR_IMAGE \
   --platform managed \
   --region $REGION \
   --allow-unauthenticated \
-  --clear-secrets \
   --set-env-vars "$ENV_VARS" \
+  --set-secrets "$SECRETS" \
   --memory 2Gi \
   --timeout 540 \
   --max-instances 10 \
