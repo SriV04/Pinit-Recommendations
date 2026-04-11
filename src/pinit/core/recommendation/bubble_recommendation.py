@@ -21,10 +21,7 @@ import numpy as np
 from dataclasses import dataclass
 import logging
 
-from pinit.core.recommendation.proximal_recommendation import (
-    filter_by_radius,
-    compute_quality_score,
-)
+from pinit.core.recommendation.proximal_recommendation import filter_by_radius
 from pinit.core.recommendation.vector_utils import centered_cosine_similarity, dot_product
 from pinit.integrations.supabase import get_supabase_service
 
@@ -436,8 +433,11 @@ def build_bubble_recommendations(
     # 7. Aggregate dietary (MAX pool)
     group_dietary = aggregate_dietary_scores_max(individual_dietary)
 
-    # 8. Quality scores
-    quality_scores = compute_quality_score(nearby)
+    # 8. Quality scores — precomputed by v4 cron, surfaced via the RPC
+    if 'quality_score' in nearby.columns:
+        quality_scores = nearby['quality_score'].fillna(0.0)
+    else:
+        quality_scores = pd.Series(0.0, index=nearby.index)
 
     # 9. Merge
     result = nearby.copy()

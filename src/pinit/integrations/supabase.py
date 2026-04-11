@@ -150,7 +150,7 @@ class SupabaseService:
         latitude: float,
         longitude: float,
         radius_km: float,
-        limit: int = 6000
+        limit: int = 2000
     ) -> List[Dict[str, Any]]:
         """
         Get locations within a radius with quality scores pre-computed.
@@ -194,10 +194,33 @@ class SupabaseService:
             return response.data
 
         except Exception as exc:
-            logger.error(f"Error querying locations with quality scores: {exc}")
-            logger.warning("Falling back to loading all locations")
-            # Fallback: get locations without quality scores
-            return self.get_locations(limit=limit)
+            # Never fall back to SELECT * on the full locations table — that
+            # pulls megabytes of unrelated data per request. Fail loud and
+            # return empty so the caller short-circuits.
+            logger.error(
+                "Spatial RPC get_locations_with_quality failed: %s. "
+                "Returning empty result (no fallback).",
+                exc,
+            )
+            return []
+
+    def refresh_quality_scores(self) -> Optional[int]:
+        """Manually trigger the v4 quality score refresh job.
+
+        Calls refresh_location_quality_scores() in Postgres, which aggregates
+        signals from user_location_actions and location_reviews and upserts
+        location_popularity_app for every location. Useful for backfills and
+        for iterating on the formula without waiting for the nightly cron.
+        """
+        logger = logging.getLogger(__name__)
+        try:
+            response = self.client.rpc("refresh_location_quality_scores", {}).execute()
+            affected = response.data if isinstance(response.data, int) else None
+            logger.info("refresh_location_quality_scores returned: %s", affected)
+            return affected
+        except Exception as exc:
+            logger.error("Failed to refresh quality scores: %s", exc)
+            return None
 
     def get_locations_by_google_place_ids(
         self, google_place_ids: List[str]
@@ -523,7 +546,8 @@ class SupabaseService:
         Args:
             user_id: Optional user ID to filter by
             location_id: Optional location ID to filter by
-            action_type: Optional action type (e.g., 'check_in', 'save', 'rating')
+            action_type: Optional action type (e.g., 'been_to', 'save', 'like',
+                'dislike', 'bubble_save', 'shared_video')
             limit: Optional limit on results
 
         Returns:
@@ -634,7 +658,10 @@ class SupabaseService:
 
     def get_user_positive_actions(self, user_id: str, limit: int = 100) -> List[Dict[str, Any]]:
         """
-        Fetch user's recent positive actions (save, check_in, positive ratings).
+        Fetch user's recent positive actions.
+
+        Action enum values that count as positive: save, been_to, like,
+        bubble_save, shared_video.
 
         Returns list of {location_id, action, created_at} ordered by recency.
         """
@@ -644,7 +671,7 @@ class SupabaseService:
                 self.client.table("user_location_actions")
                 .select("location_id, action, created_at")
                 .eq("user_id", user_id)
-                .in_("action", ["save", "check_in", "rating"])
+                .in_("action", ["save", "been_to", "like", "bubble_save", "shared_video"])
                 .order("created_at", desc=True)
                 .limit(limit)
                 .execute()
@@ -690,7 +717,7 @@ class SupabaseService:
             response = (
                 self.client.table("user_location_actions")
                 .select("user_id, location_id, action, created_at")
-                .in_("action", ["save", "check_in", "rating"])
+                .in_("action", ["save", "been_to", "like", "bubble_save", "shared_video"])
                 .order("created_at", desc=True)
                 .limit(limit)
                 .execute()

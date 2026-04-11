@@ -297,7 +297,33 @@ def _rank_cached_candidates(
             radius_filtered.append(candidate)
 
     if not radius_filtered:
+        logger.info(
+            "🧭 _rank_cached_candidates: 0 candidates survived radius filter "
+            "(%d input, radius=%.1f km)",
+            len(candidates),
+            request_radius_km,
+        )
         return []
+
+    # Diagnostic: how many of the radius-filtered candidates have a
+    # populated quality_score? If this is 0 while the count is large, the
+    # cache payload was written before location_popularity_app was seeded.
+    rf_qs_present = sum(
+        1 for c in radius_filtered if (c.get("quality_score") or 0) > 0
+    )
+    rf_qs_max = max(
+        (float(c.get("quality_score") or 0) for c in radius_filtered), default=0.0
+    )
+    logger.info(
+        "🧭 _rank_cached_candidates: %d candidates in radius %.1f km "
+        "(input=%d, tag-filtered=%d, quality_score>0: %d, max=%.3f)",
+        len(radius_filtered),
+        request_radius_km,
+        len(candidates),
+        len(filtered_candidates),
+        rf_qs_present,
+        rf_qs_max,
+    )
 
     candidate_location_ids = [c["location_id"] for c in radius_filtered]
 
@@ -518,11 +544,23 @@ async def get_proximal_recommendations(request: ProximalRequest) -> ProximalResp
         # Cached candidates have quality_score pre-computed, compute user-specific scores
         candidates = cached_data.get("candidates", [])
 
+        # Diagnostics on cached quality scores — if the cache was populated
+        # before the v4/v5 cron seeded location_popularity_app, every value
+        # here will be 0 until the cache entry expires (2h TTL).
+        cached_qs_present = sum(
+            1 for c in candidates if (c.get("quality_score") or 0) > 0
+        )
+        cached_qs_max = max(
+            (float(c.get("quality_score") or 0) for c in candidates), default=0.0
+        )
         logger.info(
-            "✅ CACHE HIT: Retrieved %d candidates from cache at (%.4f, %.4f) (user-agnostic)",
+            "✅ CACHE HIT: Retrieved %d candidates from cache at (%.4f, %.4f) "
+            "(user-agnostic, quality_score>0: %d, max=%.3f)",
             len(candidates),
             cached_data.get("center_lat"),
-            cached_data.get("center_lng")
+            cached_data.get("center_lng"),
+            cached_qs_present,
+            cached_qs_max,
         )
 
         # Apply shared filtering and ranking logic (compute user-specific scores)
@@ -580,13 +618,16 @@ async def get_proximal_recommendations(request: ProximalRequest) -> ProximalResp
             cache_radius_km
         )
 
-        # Use spatial query to get nearby locations with quality scores pre-computed
+        # Use spatial query to get nearby locations with quality scores pre-computed.
+        # limit=2000 is the nearest-2000 in the 15km radius — more than enough
+        # coverage for any reasonable request radius within central London and
+        # well inside the Supabase statement timeout.
         supabase = get_supabase_service()
         nearby_locations_data = supabase.get_locations_with_quality_scores(
             request.latitude,
             request.longitude,
             cache_radius_km,
-            limit=7000  # Increased cache size for better coverage
+            limit=2000,
         )
 
         if not nearby_locations_data:
@@ -603,9 +644,30 @@ async def get_proximal_recommendations(request: ProximalRequest) -> ProximalResp
 
         # Convert to DataFrame - quality_score, vibe_vector, dietary_requirement_vector already included
         nearby_locations_df = pd.DataFrame(nearby_locations_data)
+
+        # Diagnostics: how many of the spatial results actually have a
+        # populated quality_score? If this is 0 or very low, the v4/v5
+        # refresh job hasn't populated location_popularity_app for this area.
+        qs_col = nearby_locations_df.get("quality_score")
+        if qs_col is not None:
+            qs_numeric = pd.to_numeric(qs_col, errors="coerce").fillna(0.0)
+            qs_present = int((qs_numeric > 0).sum())
+            qs_missing = int((qs_numeric <= 0).sum())
+            qs_max = float(qs_numeric.max()) if len(qs_numeric) else 0.0
+            qs_mean = float(qs_numeric.mean()) if len(qs_numeric) else 0.0
+        else:
+            qs_present = qs_missing = 0
+            qs_max = qs_mean = 0.0
+
         logger.info(
-            f"📍 Spatial query found {len(nearby_locations_df)} locations within {cache_radius_km}km "
-            f"with quality scores and vectors pre-loaded"
+            "📍 Spatial query found %d locations within %.1f km "
+            "(quality_score>0: %d, quality_score<=0: %d, max=%.3f, mean=%.3f)",
+            len(nearby_locations_df),
+            cache_radius_km,
+            qs_present,
+            qs_missing,
+            qs_max,
+            qs_mean,
         )
 
         # Cache locations with quality scores (user-agnostic)

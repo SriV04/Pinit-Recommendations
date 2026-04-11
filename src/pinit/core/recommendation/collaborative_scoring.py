@@ -17,11 +17,15 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-# Action strength weights for the user's own interactions
+# Action strength weights for the user's own interactions.
+# Values must match the action_type enum in the DB:
+#   save, like, shared_video, dislike, bubble_save, been_to
 USER_ACTION_STRENGTH: Dict[str, float] = {
-    "check_in": 1.0,
+    "been_to": 1.0,
+    "shared_video": 0.9,
     "save": 0.7,
-    "rating": 0.6,
+    "bubble_save": 0.7,
+    "like": 0.5,
 }
 
 # Recency half-life for user's own actions (90 days)
@@ -40,7 +44,12 @@ def _parse_timestamp(ts: Any) -> Optional[datetime]:
         return ts
     try:
         ts_str = str(ts).replace("Z", "+00:00")
-        return datetime.fromisoformat(ts_str)
+        parsed = datetime.fromisoformat(ts_str)
+        # user_location_actions.created_at is `timestamp without time zone`,
+        # so Supabase serialises it without an offset. Treat those as UTC.
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
     except (ValueError, TypeError):
         return None
 

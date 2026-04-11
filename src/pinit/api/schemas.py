@@ -50,8 +50,8 @@ class FriendSave(BaseModel):
     friend_name: str
     friend_username: Optional[str] = None
     friend_profile_image_url: Optional[str] = None
-    action_type: str = Field(..., description="Action type: save, check_in, rating")
-    rating: Optional[int] = Field(None, description="Rating value if action_type is rating")
+    action_type: str = Field(..., description="Action type: save, been_to, like, bubble_save, shared_video, dislike")
+    rating: Optional[int] = Field(None, description="Rating value (unused — retained for backwards compatibility)")
     timestamp: str
 
 

@@ -15,11 +15,15 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-# Action weights: how strongly each action type signals recommendation quality
+# Action weights: how strongly each action type signals recommendation quality.
+# Values must match the action_type enum in the DB:
+#   save, like, shared_video, dislike, bubble_save, been_to
 ACTION_WEIGHTS: Dict[str, float] = {
-    "check_in": 1.0,
+    "been_to": 1.0,        # strongest signal — friend actually visited
+    "shared_video": 0.9,   # posted it to their feed
     "save": 0.7,
-    "rating": 0.8,  # adjusted below based on rating value
+    "bubble_save": 0.7,
+    "like": 0.5,
     "dislike": -0.5,
 }
 
@@ -51,7 +55,13 @@ def _parse_timestamp(ts: Any) -> Optional[datetime]:
     try:
         # Handle ISO format strings from Supabase
         ts_str = str(ts).replace("Z", "+00:00")
-        return datetime.fromisoformat(ts_str)
+        parsed = datetime.fromisoformat(ts_str)
+        # Supabase serialises `timestamp without time zone` columns with no
+        # offset. Treat those as UTC so arithmetic against `datetime.now(utc)`
+        # doesn't raise `can't subtract offset-naive and offset-aware datetimes`.
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
     except (ValueError, TypeError):
         return None
 

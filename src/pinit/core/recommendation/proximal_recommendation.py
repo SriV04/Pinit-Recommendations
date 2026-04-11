@@ -176,68 +176,6 @@ def filter_by_radius(
     return result
 
 
-def compute_quality_score(locations: pd.DataFrame) -> pd.Series:
-    """
-    Compute enhanced quality score incorporating Bayesian rating, review trust,
-    review velocity, save/dislike ratio, cold-start bonus, and anti-mispricing.
-
-    Matches the SQL compute_quality_score function in migrations/v3_enhanced_scoring.sql.
-
-    Args:
-        locations: DataFrame with 'rating', 'user_ratings_total' columns.
-            Optional columns: 'saves_count_app', 'dislikes_count_app',
-            'recent_reviews_90d', 'total_app_reviews', 'location_age_days',
-            'saved_count'.
-
-    Returns:
-        Series of quality scores (0-1)
-    """
-    rating = locations['rating'].fillna(3.8)
-    reviews = locations['user_ratings_total'].fillna(0).astype(float)
-
-    # Bayesian rating: shrink toward 3.8 prior with 50 pseudo-reviews
-    bayesian_rating = (rating * reviews + 3.8 * 50) / (reviews + 50)
-
-    # Review trust: log-power curve
-    review_trust = (0.95 * np.power(np.log1p(reviews) / np.log(501), 0.6)).clip(upper=1.0)
-
-    # Review velocity boost
-    total_app_reviews = locations.get('total_app_reviews', pd.Series(0, index=locations.index)).fillna(0).astype(float)
-    recent_reviews_90d = locations.get('recent_reviews_90d', pd.Series(0, index=locations.index)).fillna(0).astype(float)
-    velocity_boost = pd.Series(1.0, index=locations.index)
-    has_reviews = total_app_reviews > 0
-    velocity_boost[has_reviews] = 1.0 + 0.3 * (recent_reviews_90d[has_reviews] / (total_app_reviews[has_reviews] + 1))
-    review_trust = (review_trust * velocity_boost).clip(upper=1.0)
-
-    # Anti-mispricing: cap trust so volume can't overwhelm quality
-    trust_cap = 0.85 + 0.15 * (bayesian_rating / 5.0)
-    effective_trust = np.minimum(review_trust, trust_cap)
-    rating_score = (bayesian_rating / 5.0) * effective_trust
-
-    # Social proof from in-app engagement
-    saved_count = locations.get('saved_count', pd.Series(0, index=locations.index)).fillna(0).astype(float)
-    saves_app = locations.get('saves_count_app', pd.Series(0, index=locations.index)).fillna(0).astype(float)
-    dislikes_app = locations.get('dislikes_count_app', pd.Series(0, index=locations.index)).fillna(0).astype(float)
-    saves_total = np.maximum(saves_app, saved_count)
-
-    social_score = (np.log1p(saves_total) / np.log(100)).clip(upper=1.0)
-    # Penalize high dislike ratio
-    total_engagement = saves_total + dislikes_app
-    has_engagement = total_engagement > 0
-    dislike_penalty = pd.Series(1.0, index=locations.index)
-    dislike_penalty[has_engagement] = 1.0 - dislikes_app[has_engagement] / (total_engagement[has_engagement] + 1)
-    social_score = social_score * dislike_penalty
-
-    # Cold-start discovery bonus
-    age_days = locations.get('location_age_days', pd.Series(365, index=locations.index)).fillna(365).astype(float)
-    cold_start_bonus = pd.Series(0.0, index=locations.index)
-    is_new = (age_days < 30) & (total_app_reviews < 5)
-    cold_start_bonus[is_new] = 0.1 * (1.0 - age_days[is_new] / 30.0)
-
-    quality = (0.6 * rating_score + 0.4 * social_score + cold_start_bonus).clip(upper=1.0)
-    return quality
-
-
 def compute_vibe_score(
     user_id: str,
     location_ids: List[int],
@@ -422,7 +360,13 @@ def build_proximal_recommendations(
 
     vibe_scores = compute_vibe_score(user_id, location_ids, locations)
     dietary_scores = compute_dietary_score(user_id, location_ids, locations)
-    quality_scores = compute_quality_score(nearby)
+    # quality_score is precomputed by the v4 cron and surfaced via the RPC,
+    # so it should already be on the nearby DataFrame. Fall back to 0.0 if a
+    # caller passed in a DataFrame that predates v4 (e.g. demo scripts).
+    if 'quality_score' in nearby.columns:
+        quality_scores = nearby['quality_score'].fillna(0.0)
+    else:
+        quality_scores = pd.Series(0.0, index=nearby.index)
 
     # Compute social and collaborative scores
     from pinit.core.recommendation.social_scoring import compute_social_scores
