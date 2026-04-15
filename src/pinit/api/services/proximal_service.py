@@ -83,9 +83,21 @@ def get_photo_reference(place_id: str, api_key: str) -> Optional[str]:
         return None
 
 
-def download_photo(photo_reference: str, api_key: str) -> Optional[Tuple[bytes, str]]:
-    """Download image bytes and content type from Google Places Photo API."""
-    url = f"https://places.googleapis.com/v1/{photo_reference}/media?maxHeightPx=400&maxWidthPx=400&key={api_key}"
+def download_photo(
+    photo_reference: str,
+    api_key: str,
+    max_height_px: int = 800,
+    max_width_px: int = 800,
+) -> Optional[Tuple[bytes, str]]:
+    """Download image bytes and content type from Google Places Photo API.
+
+    Defaults to 800x800 — large enough for card + expanded-card rendering
+    without pulling a 3MB original. Callers can override for thumbnails.
+    """
+    url = (
+        f"https://places.googleapis.com/v1/{photo_reference}/media"
+        f"?maxHeightPx={max_height_px}&maxWidthPx={max_width_px}&key={api_key}"
+    )
 
     try:
         response = requests.get(url, timeout=10)
@@ -95,6 +107,28 @@ def download_photo(photo_reference: str, api_key: str) -> Optional[Tuple[bytes, 
     except Exception as exc:
         logger.warning("Error downloading photo: %s", exc)
         return None
+
+
+def download_photos_from_names(
+    photo_names: List[str],
+    api_key: str,
+    max_count: int = 10,
+    max_height_px: int = 800,
+    max_width_px: int = 800,
+) -> List[Tuple[bytes, str]]:
+    """Download up to *max_count* photos from a list of Places v1 resource names.
+
+    Failures are skipped silently (None entries dropped), so the returned list
+    is <= len(photo_names) and <= max_count. Preserves ordering.
+    """
+    results: List[Tuple[bytes, str]] = []
+    for name in photo_names[:max_count]:
+        if not name:
+            continue
+        dl = download_photo(name, api_key, max_height_px, max_width_px)
+        if dl is not None:
+            results.append(dl)
+    return results
 
 
 def classify_image_with_openai(image_bytes: bytes) -> Optional[int]:

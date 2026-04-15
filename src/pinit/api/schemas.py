@@ -81,6 +81,15 @@ class LocationRecommendation(BaseModel):
 
     final_score: float
     rank: int
+
+    # Photo metadata surfaced from get_locations_with_quality. `photos` itself
+    # (the resource-name array) is intentionally not returned by the bulk
+    # ranking RPC — a separate endpoint hydrates it on demand. The three
+    # booleans here are enough for the client's cache-hit contract.
+    image_stored: Optional[bool] = Field(None, description="True if a primary photo is uploaded to storage")
+    image_unavailable: Optional[bool] = Field(None, description="True if photo sourcing has been tried and failed")
+    extra_photos_stored: Optional[int] = Field(None, description="Count of extra photos uploaded beyond the primary")
+
     taste_breakdown: Optional[List[TagMatch]] = Field(None, description="Breakdown of taste score by matching tags")
     friend_saves: Optional[List[FriendSave]] = Field(None, description="Friends who saved/visited this location")
     momentum: Optional[MomentumIndicator] = Field(None, description="Trending and discovery indicators")
@@ -190,6 +199,12 @@ class HiddenGemLocation(BaseModel):
     hidden_gem_score: float
     rank: int
 
+    # Photo metadata surfaced from get_locations_with_quality (booleans only;
+    # resource-name array is hydrated by a separate endpoint on demand).
+    image_stored: Optional[bool] = None
+    image_unavailable: Optional[bool] = None
+    extra_photos_stored: Optional[int] = None
+
 
 class HiddenGemsResponse(BaseModel):
     center_lat: float
@@ -289,6 +304,12 @@ class BubbleLocationRecommendation(BaseModel):
         False,
         description="True if this location is already in the bubble's saved list",
     )
+
+    # Photo metadata surfaced from get_locations_with_quality (booleans only;
+    # resource-name array is hydrated by a separate endpoint on demand).
+    image_stored: Optional[bool] = None
+    image_unavailable: Optional[bool] = None
+    extra_photos_stored: Optional[int] = None
 
     # Transparency metrics (optional)
     individual_scores: Optional[List[IndividualScore]] = Field(

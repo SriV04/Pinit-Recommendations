@@ -33,7 +33,6 @@ from pinit.api.schemas import (
 from pinit.config.secrets import GOOGLE_PLACE_API_KEY
 from pinit.api.services.proximal_service import (
     add_location_emoji,
-    classify_location_photo,
     fetch_google_place_details,
     text_search,
 )
@@ -51,6 +50,47 @@ from pinit.integrations.supabase import get_supabase_service
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+
+def _photo_fields(row: Any) -> Dict[str, Any]:
+    """Extract the three photo metadata booleans surfaced by get_locations_with_quality.
+
+    Accepts a dict or a pandas row. Returns None for any field that's missing
+    or NaN so Pydantic's Optional[...] validation is happy. The `photos`
+    resource-name array is intentionally *not* returned by the bulk ranking
+    RPC — a dedicated endpoint hydrates it when the client actually needs it.
+    """
+    def _get(key: str) -> Any:
+        if isinstance(row, dict):
+            return row.get(key)
+        try:
+            return row.get(key) if hasattr(row, "get") else row[key]
+        except (KeyError, IndexError):
+            return None
+
+    def _clean(v: Any) -> Any:
+        if v is None:
+            return None
+        try:
+            if isinstance(v, float) and pd.isna(v):
+                return None
+        except Exception:
+            pass
+        return v
+
+    raw_extra = _clean(_get("extra_photos_stored"))
+    extra: Optional[int] = None
+    if raw_extra is not None:
+        try:
+            extra = int(raw_extra)
+        except (TypeError, ValueError):
+            extra = None
+
+    return {
+        "image_stored": _clean(_get("image_stored")),
+        "image_unavailable": _clean(_get("image_unavailable")),
+        "extra_photos_stored": extra,
+    }
 
 
 VIBE_TAG_ORDER = {
@@ -586,7 +626,7 @@ async def get_hidden_gems(
 
     supabase = get_supabase_service()
     nearby_data = supabase.get_locations_with_quality_scores(
-        latitude, longitude, radius_km, limit=2000
+        latitude, longitude, radius_km, limit=1000
     )
 
     empty_response = HiddenGemsResponse(
@@ -647,6 +687,7 @@ async def get_hidden_gems(
                 quality_score=float(loc.get("quality_score") or 0.0),
                 hidden_gem_score=float(loc["hidden_gem_score"]),
                 rank=rank,
+                **_photo_fields(loc),
             )
         )
 
@@ -814,15 +855,17 @@ async def get_proximal_recommendations(request: ProximalRequest) -> ProximalResp
         )
 
         # Use spatial query to get nearby locations with quality scores pre-computed.
-        # limit=2000 is the nearest-2000 in the 15km radius — more than enough
-        # coverage for any reasonable request radius within central London and
-        # well inside the Supabase statement timeout.
+        # limit=1000 is the nearest-1000 in the 15km radius — enough coverage for
+        # any reasonable request radius in central London. Higher values push
+        # PostgREST serialisation past the statement timeout because the
+        # wide-row payload dominates; 1000 also matches the server-side
+        # db-max-rows cap so there's no point asking for more.
         supabase = get_supabase_service()
         nearby_locations_data = supabase.get_locations_with_quality_scores(
             request.latitude,
             request.longitude,
             cache_radius_km,
-            limit=2000,
+            limit=1000,
         )
 
         if not nearby_locations_data:
@@ -873,6 +916,8 @@ async def get_proximal_recommendations(request: ProximalRequest) -> ProximalResp
                 'lat', 'lng', 'distance_km',
                 'vibe_vector', 'dietary_requirement_vector',  # Need vectors for user-specific scoring
                 'quality_score',  # Pre-computed by database
+                # Photo metadata surfaced by the RPC (v8)
+                'image_stored', 'image_unavailable', 'extra_photos_stored',
             ]
             cache_cols_available = [col for col in cache_cols if col in nearby_locations_df.columns]
             cache_data = nearby_locations_df[cache_cols_available]
@@ -973,6 +1018,7 @@ async def get_proximal_recommendations(request: ProximalRequest) -> ProximalResp
                 final_score=float(row["final_score"]),
                 rank=int(row["rank"]),
                 friend_saves=friend_saves,
+                **_photo_fields(row),
             )
         )
 
@@ -1061,50 +1107,146 @@ async def add_location_by_place_id(request: AddLocationRequest) -> AddLocationRe
         import asyncio
         from pinit.api.services.vibe_tagging import generate_vibe_tags_for_location
 
-        # Background: classify and upload photo
+        # Background: pull up to 10 photos from the Places v1 photo names,
+        # upload them to the location_photos bucket, and atomically record
+        # state via the mark_location_* RPCs so the /get_locations_with_quality
+        # cache-hit contract is upheld (photos jsonb must be written whenever
+        # image_stored flips to true).
         if request.classify_photo:
-            api_key = GOOGLE_PLACE_API_KEY
+            photos_from_details: List[Dict[str, Any]] = place_details.get("photos") or []
 
-            async def _classify_and_upload_photo() -> None:
+            async def _fetch_and_upload_photos() -> None:
+                bg_supabase = get_supabase_service()
                 try:
-                    (
-                        photo_ref,
-                        photo_score,
-                        photo_bytes,
-                        photo_content_type,
-                    ) = classify_location_photo(request.google_place_id, api_key)
+                    from pinit.api.services.proximal_service import download_photo
 
-                    bg_supabase = get_supabase_service()
-
-                    if photo_bytes:
-                        logger.info(
-                            "Attempting to upload photo for location %s (%d bytes, type: %s)",
-                            location_id, len(photo_bytes), photo_content_type,
+                    if not photos_from_details:
+                        logger.warning(
+                            "No photos returned by Places API for location %s — marking image_unavailable",
+                            location_id,
                         )
                         try:
-                            bg_supabase.upload_location_photo(
-                                location_id, photo_bytes, content_type=photo_content_type,
-                            )
-                            logger.info("✅ Successfully uploaded photo for location %s", location_id)
+                            bg_supabase.mark_location_image_unavailable(location_id)
                         except Exception as exc:
-                            logger.error("❌ Failed to upload photo for location %s: %s", location_id, exc)
-                    else:
-                        logger.warning("No photo bytes available to upload for location %s", location_id)
+                            logger.error(
+                                "mark_location_image_unavailable failed for %s: %s",
+                                location_id, exc,
+                            )
+                        return
 
-                    if photo_ref or photo_score:
-                        update_data = {}
-                        if photo_ref:
-                            update_data["photo_reference"] = photo_ref
-                        if photo_score:
-                            update_data["photo_reference_score"] = photo_score
-                        if update_data:
-                            bg_supabase.update_location(location_id, **update_data)
+                    # --- Primary photo ({location_id}.jpg) ---
+                    primary = photos_from_details[0]
+                    primary_name = primary.get("name") if isinstance(primary, dict) else None
+                    if not primary_name:
+                        logger.warning(
+                            "First photo for location %s has no resource name — marking image_unavailable",
+                            location_id,
+                        )
+                        try:
+                            bg_supabase.mark_location_image_unavailable(location_id)
+                        except Exception as exc:
+                            logger.error(
+                                "mark_location_image_unavailable failed for %s: %s",
+                                location_id, exc,
+                            )
+                        return
+
+                    primary_dl = download_photo(primary_name, GOOGLE_PLACE_API_KEY)
+                    if primary_dl is None:
+                        logger.error(
+                            "Primary photo download failed for location %s (name=%s)",
+                            location_id, primary_name,
+                        )
+                        return
+
+                    primary_bytes, primary_ct = primary_dl
+                    try:
+                        bg_supabase.upload_location_photo(
+                            location_id,
+                            primary_bytes,
+                            content_type=primary_ct,
+                            index=None,
+                        )
+                    except Exception as exc:
+                        logger.error(
+                            "Primary photo upload failed for location %s: %s",
+                            location_id, exc,
+                        )
+                        return
+
+                    try:
+                        bg_supabase.mark_location_image_uploaded(
+                            location_id=location_id,
+                            photos=photos_from_details,
+                            photo_reference=primary_name,
+                        )
+                    except Exception as exc:
+                        logger.error(
+                            "mark_location_image_uploaded failed for location %s: %s",
+                            location_id, exc,
+                        )
+                        # Primary is in the bucket, just row state didn't flip —
+                        # don't proceed to extras (the client will still hit
+                        # Google for photos until state is flipped).
+                        return
+
+                    # --- Extras ({location_id}_1.jpg .. _{N}.jpg, up to 9) ---
+                    # Capped at 10 total photos per the product spec.
+                    extras = photos_from_details[1:10]
+                    extras_uploaded = 0
+                    for idx, extra in enumerate(extras, start=1):
+                        extra_name = extra.get("name") if isinstance(extra, dict) else None
+                        if not extra_name:
+                            continue
+                        extra_dl = download_photo(extra_name, GOOGLE_PLACE_API_KEY)
+                        if extra_dl is None:
+                            logger.warning(
+                                "Extra photo %d download failed for location %s",
+                                idx, location_id,
+                            )
+                            continue
+                        extra_bytes, extra_ct = extra_dl
+                        try:
+                            bg_supabase.upload_location_photo(
+                                location_id,
+                                extra_bytes,
+                                content_type=extra_ct,
+                                index=idx,
+                            )
+                            extras_uploaded += 1
+                        except Exception as exc:
+                            logger.error(
+                                "Extra photo %d upload failed for location %s: %s",
+                                idx, location_id, exc,
+                            )
+
+                    if extras_uploaded > 0:
+                        try:
+                            bg_supabase.mark_location_extra_photos_stored(
+                                location_id, extras_uploaded
+                            )
+                        except Exception as exc:
+                            logger.error(
+                                "mark_location_extra_photos_stored failed for %s: %s",
+                                location_id, exc,
+                            )
+
+                    logger.info(
+                        "Photo pipeline complete for location %s: primary + %d extras",
+                        location_id, extras_uploaded,
+                    )
 
                 except Exception as exc:
-                    logger.error("Background photo classification failed for location %s: %s", location_id, exc)
+                    logger.error(
+                        "Background photo pipeline failed for location %s: %s",
+                        location_id, exc, exc_info=True,
+                    )
 
-            asyncio.create_task(_classify_and_upload_photo())
-            logger.info("Kicked off background photo classification for location %s", location_id)
+            asyncio.create_task(_fetch_and_upload_photos())
+            logger.info(
+                "Kicked off background photo pipeline for location %s (%d photo names from Places)",
+                location_id, len(photos_from_details),
+            )
 
         # Background: menu processing + vibe tagging
         website = place_details.get("website")
@@ -1318,6 +1460,7 @@ async def magic_search(request: MagicSearchRequest) -> MagicSearchResponse:
                 final_score=float(candidate["final_score"]),
                 rank=int(candidate["rank"]),
                 friend_saves=friend_saves,
+                **_photo_fields(candidate),
             )
         )
 
@@ -1500,7 +1643,7 @@ async def get_bubble_recommendations(request: BubbleRequest) -> BubbleResponse:
             request.latitude,
             request.longitude,
             cache_radius_km,
-            limit=2000,
+            limit=1000,
         )
         if not nearby_locations_data:
             return BubbleResponse(
@@ -1524,6 +1667,8 @@ async def get_bubble_recommendations(request: BubbleRequest) -> BubbleResponse:
             'lat', 'lng', 'distance_km',
             'vibe_vector', 'dietary_requirement_vector',
             'quality_score',
+            # Photo metadata surfaced by the RPC (v8)
+            'image_stored', 'image_unavailable', 'extra_photos_stored',
         ]
         cache_cols_available = [c for c in cache_cols if c in df.columns]
         candidates = df[cache_cols_available].to_dict("records")
@@ -1637,6 +1782,7 @@ async def get_bubble_recommendations(request: BubbleRequest) -> BubbleResponse:
                 rank=int(c["rank"]),
                 individual_vibe_scores=per_user_vibes,
                 is_in_bubble=bool(c.get("is_in_bubble", False)),
+                **_photo_fields(c),
             )
         )
 

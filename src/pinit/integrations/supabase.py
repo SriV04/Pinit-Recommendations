@@ -150,7 +150,7 @@ class SupabaseService:
         latitude: float,
         longitude: float,
         radius_km: float,
-        limit: int = 2000
+        limit: int = 1000
     ) -> List[Dict[str, Any]]:
         """
         Get locations within a radius with quality scores pre-computed.
@@ -326,8 +326,20 @@ class SupabaseService:
         location_id: int,
         image_bytes: bytes,
         content_type: Optional[str] = None,
+        index: Optional[int] = None,
     ) -> Any:
-        """Upload a location photo to the location_photos bucket."""
+        """Upload a location photo to the location_photos bucket.
+
+        Object naming follows the photo-pipeline contract:
+          * ``index is None`` → primary photo: ``{location_id}.jpg``
+          * ``index >= 1``    → extras:       ``{location_id}_{index}.jpg``
+
+        This function **only** uploads bytes. It does not touch
+        ``image_stored`` / ``photos`` / ``extra_photos_stored`` on the row —
+        callers must use ``mark_location_image_uploaded`` or
+        ``mark_location_extra_photos_stored`` so the cache-hit contract is
+        upheld (primary + ``photos`` jsonb written atomically).
+        """
         import logging
         logger = logging.getLogger(__name__)
 
@@ -336,14 +348,16 @@ class SupabaseService:
             "upsert": "true",
         }
         extension = _extension_for_content_type(content_type)
-        object_name = f"{location_id}{extension}"
+        if index is None:
+            object_name = f"{location_id}{extension}"
+        else:
+            object_name = f"{location_id}_{int(index)}{extension}"
 
         logger.info(
             "Uploading to Supabase storage: bucket='location_photos', object='%s', size=%d bytes",
             object_name,
             len(image_bytes),
         )
-        logger.debug("File options: %s", file_options)
 
         try:
             result = self.client.storage.from_("location_photos").upload(
@@ -352,20 +366,6 @@ class SupabaseService:
                 file_options,
             )
             logger.info("Supabase storage upload response: %s", result)
-
-            # Update the location record saying image is stored
-            try:
-                self.update_location(location_id, image_stored=True)
-                logger.info("Successfully updated image_url for location %s", location_id)
-            except Exception as update_exc:
-                logger.error(
-                    "Failed to update image_url for location %s: %s",
-                    location_id,
-                    update_exc,
-                    exc_info=True,
-                )
-                # Don't raise - photo upload succeeded, URL update is secondary
-
             return result
         except Exception as exc:
             logger.error(
@@ -373,6 +373,98 @@ class SupabaseService:
                 object_name,
                 exc,
                 exc_info=True,
+            )
+            raise
+
+    def mark_location_image_uploaded(
+        self,
+        location_id: int,
+        photos: Optional[List[Dict[str, Any]]],
+        photo_reference: Optional[str],
+    ) -> None:
+        """Atomically flip image_stored=true and persist photos + photo_reference.
+
+        Consolidated replacement for the old 3-call sequence. Calls the
+        ``mark_location_image_uploaded`` SECURITY DEFINER RPC, which COALESCEs
+        on NULL so passing ``None`` for photos or photo_reference preserves
+        the existing value.
+
+        The photos argument is serialised to a JSON string because the
+        supabase-py client otherwise sends ``jsonb`` fields as Python lists
+        wrapped in the HTTP body, and the RPC expects a JSON scalar.
+        """
+        import json as _json
+        import logging
+        logger = logging.getLogger(__name__)
+        try:
+            self.client.rpc(
+                "mark_location_image_uploaded",
+                {
+                    "p_location_id": int(location_id),
+                    "p_photos": photos if photos is not None else None,
+                    "p_photo_reference": photo_reference,
+                },
+            ).execute()
+            logger.info(
+                "mark_location_image_uploaded: location=%s, photos_len=%s, ref=%s",
+                location_id,
+                len(photos) if isinstance(photos, list) else None,
+                photo_reference,
+            )
+        except Exception as exc:
+            logger.error(
+                "mark_location_image_uploaded RPC failed for %s: %s",
+                location_id,
+                exc,
+            )
+            raise
+
+    def mark_location_extra_photos_stored(
+        self, location_id: int, count: int
+    ) -> None:
+        """Bump extra_photos_stored monotonically (GREATEST-safe for parallel uploads)."""
+        import logging
+        logger = logging.getLogger(__name__)
+        try:
+            self.client.rpc(
+                "mark_location_extra_photos_stored",
+                {
+                    "p_location_id": int(location_id),
+                    "p_count": int(count),
+                },
+            ).execute()
+            logger.info(
+                "mark_location_extra_photos_stored: location=%s, count=%s",
+                location_id,
+                count,
+            )
+        except Exception as exc:
+            logger.error(
+                "mark_location_extra_photos_stored RPC failed for %s: %s",
+                location_id,
+                exc,
+            )
+            raise
+
+    def mark_location_image_unavailable(self, location_id: int) -> None:
+        """Negative-cache the photo pipeline: sets image_unavailable=true so
+        the client and any retry loops short-circuit instead of refetching.
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+        try:
+            self.client.rpc(
+                "mark_location_image_unavailable",
+                {"p_location_id": int(location_id)},
+            ).execute()
+            logger.info(
+                "mark_location_image_unavailable: location=%s", location_id
+            )
+        except Exception as exc:
+            logger.error(
+                "mark_location_image_unavailable RPC failed for %s: %s",
+                location_id,
+                exc,
             )
             raise
     
