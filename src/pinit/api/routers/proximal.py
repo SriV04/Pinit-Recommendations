@@ -1083,10 +1083,34 @@ async def add_location_by_place_id(request: AddLocationRequest) -> AddLocationRe
         location_id = existing_location["location_id"]
         updated_vibe = existing_location.get("updated_vibe") or False
 
-        # ── Existing + TikTok: always re-process with video_insights blending ──
-        if source == "tiktok":
+        # ── Existing + TikTok/Instagram: upsert insights then blend ──────────
+        if source in ("tiktok", "instagram"):
             import asyncio
             from pinit.api.services.vibe_tagging import generate_vibe_tags_for_location
+
+            # Upsert video_insights BEFORE kicking off the blend so the
+            # vibe tagging pipeline has data to read.
+            if request.video_insights:
+                vi = request.video_insights
+                try:
+                    supabase.client.table("video_insights").upsert(
+                        {
+                            "source_video_url": vi.source_video_url,
+                            "location_id": location_id,
+                            "key_dishes": vi.key_dishes or [],
+                            "special_offers": vi.special_offers or [],
+                            "creator_notes": vi.creator_notes,
+                            "vibe_signals": vi.vibe_signals or {},
+                            "sentiment": vi.sentiment,
+                            "creator_handle": vi.creator_handle,
+                            "video_description": vi.video_description,
+                            "extraction_model": vi.extraction_model or "gpt-4o-mini",
+                        },
+                        on_conflict="source_video_url,location_id",
+                    ).execute()
+                    logger.info("Upserted video_insights for location %s before blend", location_id)
+                except Exception as exc:
+                    logger.warning("video_insights upsert failed for %s: %s", location_id, exc)
 
             has_summary = existing_location.get("generated_summary")
             num_runs = 5 if has_summary else 1
@@ -1097,9 +1121,9 @@ async def add_location_by_place_id(request: AddLocationRequest) -> AddLocationRe
                 )
             )
             logger.info(
-                "Existing location %s — TikTok source: kicked off vibe tagging "
+                "Existing location %s — %s source: kicked off vibe tagging "
                 "with video_insights blending (num_runs=%d)",
-                location_id, num_runs,
+                location_id, source, num_runs,
             )
 
             return AddLocationResponse(

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -132,6 +132,19 @@ class HealthResponse(BaseModel):
     total_tags: int
 
 
+class VideoInsightsPayload(BaseModel):
+    """Video insights extracted by the TikTok processor, passed inline to /locations/add."""
+    source_video_url: str
+    key_dishes: Optional[List[Any]] = Field(default_factory=list)
+    special_offers: Optional[List[Any]] = Field(default_factory=list)
+    creator_notes: Optional[str] = None
+    vibe_signals: Optional[Dict[str, Any]] = Field(default_factory=dict)
+    sentiment: Optional[str] = None
+    creator_handle: Optional[str] = None
+    video_description: Optional[str] = None
+    extraction_model: Optional[str] = "gpt-4o-mini"
+
+
 class AddLocationRequest(BaseModel):
     google_place_id: str = Field(..., description="Google Place ID for the location")
     source: Optional[str] = Field(
@@ -140,6 +153,10 @@ class AddLocationRequest(BaseModel):
     )
     classify_photo: Optional[bool] = Field(True, description="Whether to classify the location's photo with AI")
     generate_emoji: Optional[bool] = Field(True, description="Whether to generate an emoji for the location")
+    video_insights: Optional[VideoInsightsPayload] = Field(
+        None,
+        description="Video insight data to upsert before triggering TikTok vibe blend",
+    )
 
 
 class AddLocationResponse(BaseModel):

@@ -881,18 +881,6 @@ async def process_menu_for_location(
             update_data["cuisine_primary"] = result.detected_cuisine
             if result.cuisine_scores:
                 update_data["cuisine_scores_json"] = result.cuisine_scores
-                # Set cuisine_secondary to the highest-scoring cuisine that isn't the primary
-                secondary = max(
-                    (
-                        (cuisine, score)
-                        for cuisine, score in result.cuisine_scores.items()
-                        if cuisine != result.detected_cuisine
-                    ),
-                    key=lambda x: x[1],
-                    default=None,
-                )
-                if secondary and secondary[1] > 0.3:
-                    update_data["cuisine_secondary"] = secondary[0]
 
         supabase.update_location(location_id, **update_data)
         logger.info("Updated location %s with menu analysis fields", location_id)
