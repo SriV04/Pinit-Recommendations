@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections import Counter
 from typing import Dict, List, Optional
 
 from openai import AsyncOpenAI
@@ -43,6 +44,10 @@ VIBE_TAGS_ORDERED = [
     "takeout_friendly", "pub", "grocery_store", "brunch", "outdoor_dining",
     "wavy", "bossman",
 ]
+
+# Weight for blending TikTok vibe signals into the LLM-scored vibe vector.
+# 0.4 means: 60% LLM-scored + 40% TikTok-crowdsourced.
+TIKTOK_BLEND_WEIGHT: float = 0.4
 
 # ── Prompts ──────────────────────────────────────────────────────────────────
 # Embedded from login/ai/vibe-tags/*.md prompt files.
@@ -345,11 +350,94 @@ def _scores_to_vibe_vector(scores: Dict[str, float]) -> List[float]:
     return [float(scores.get(tag, 0.0)) for tag in VIBE_TAGS_ORDERED]
 
 
+# ── TikTok Vibe Signal Helpers ───────────────────────────────────────────────
+
+def _aggregate_tiktok_vibes(
+    video_insights: List[Dict],
+) -> Optional[Dict[str, float]]:
+    """Average vibe_signals across all video_insights rows for a location.
+
+    Each row represents a unique video. Returns a dict mapping tag names to
+    averaged scores (0-1 scale as stored in video_insights), or None if no
+    usable signals exist.
+    """
+    if not video_insights:
+        return None
+
+    aggregated: Dict[str, List[float]] = {}
+    for row in video_insights:
+        signals = row.get("vibe_signals")
+        if not signals or not isinstance(signals, dict):
+            continue
+        for tag, score in signals.items():
+            try:
+                aggregated.setdefault(tag, []).append(float(score))
+            except (TypeError, ValueError):
+                continue
+
+    if not aggregated:
+        return None
+
+    return {
+        tag: sum(scores) / len(scores)
+        for tag, scores in aggregated.items()
+    }
+
+
+def _blend_tiktok_into_scores(
+    llm_scores: Dict[str, float],
+    tiktok_vibes: Dict[str, float],
+    weight: float = TIKTOK_BLEND_WEIGHT,
+) -> Dict[str, float]:
+    """Blend TikTok-aggregated vibe signals into LLM scores.
+
+    TikTok signals are in 0-1 scale; LLM scores are 0-100. The TikTok values
+    are scaled to 0-100 before blending.
+    """
+    blended = dict(llm_scores)
+    for tag, tiktok_score in tiktok_vibes.items():
+        if tag in blended:
+            blended[tag] = (
+                (1 - weight) * blended[tag]
+                + weight * (tiktok_score * 100)  # normalize 0-1 → 0-100
+            )
+    return blended
+
+
+def _extract_top_dishes(
+    video_insights: List[Dict],
+    top_n: int = 3,
+) -> Optional[str]:
+    """Extract the top N most commonly mentioned dishes across all videos.
+
+    key_dishes is stored as a JSON array of objects like:
+      [{"name": "Truffle Pasta", "description": "...", "price": "£18"}, ...]
+
+    Returns a comma-separated string of dish names, or None.
+    """
+    dish_counter: Counter = Counter()
+    for row in video_insights:
+        dishes = row.get("key_dishes")
+        if not dishes or not isinstance(dishes, list):
+            continue
+        for dish in dishes:
+            name = dish.get("name") if isinstance(dish, dict) else None
+            if name and isinstance(name, str):
+                dish_counter[name.strip()] += 1
+
+    if not dish_counter:
+        return None
+
+    top = [name for name, _ in dish_counter.most_common(top_n)]
+    return ", ".join(top)
+
+
 # ── Top-Level Public Function ────────────────────────────────────────────────
 
 async def generate_vibe_tags_for_location(
     location_id: int,
     num_runs: int = 1,
+    blend_tiktok: bool = False,
 ) -> Optional[List[float]]:
     """
     Generate vibe tags for a location and update its vibe_vector in Supabase.
@@ -357,10 +445,17 @@ async def generate_vibe_tags_for_location(
     Fetches the full location record (including any menu analysis data),
     runs the 3-stage LLM pipeline, and writes the resulting vibe_vector.
 
+    When blend_tiktok=True, also fetches all video_insights rows for this
+    location, aggregates their vibe_signals, blends them into the LLM scores
+    at TIKTOK_BLEND_WEIGHT, and updates reccomended_dishes with the top 3
+    most commonly mentioned dishes.
+
     Args:
         location_id: The Pinit location ID in Supabase.
         num_runs: Number of analysis runs to average (use >1 for higher
             accuracy on locations with rich data like generated_summary).
+        blend_tiktok: When True, blend TikTok video_insights vibe signals
+            into the final vibe vector and update recommended dishes.
 
     Returns:
         The computed vibe_vector on success, None on fatal error.
@@ -378,7 +473,23 @@ async def generate_vibe_tags_for_location(
         return None
 
     name = restaurant.get("name", "Unknown")
-    logger.info("Starting vibe tag generation for location %s (%s), num_runs=%d", location_id, name, num_runs)
+    logger.info("Starting vibe tag generation for location %s (%s), num_runs=%d, blend_tiktok=%s",
+                location_id, name, num_runs, blend_tiktok)
+
+    # ── Fetch TikTok video insights (if blending) ────────────────────────
+    video_insights: List[Dict] = []
+    tiktok_vibes: Optional[Dict[str, float]] = None
+    if blend_tiktok:
+        video_insights = supabase.get_video_insights_for_location(location_id)
+        if video_insights:
+            tiktok_vibes = _aggregate_tiktok_vibes(video_insights)
+            logger.info(
+                "Found %d video_insights for location %s, aggregated %d vibe tags",
+                len(video_insights), location_id,
+                len(tiktok_vibes) if tiktok_vibes else 0,
+            )
+        else:
+            logger.info("No video_insights found for location %s, skipping TikTok blend", location_id)
 
     client = AsyncOpenAI(api_key=XAI_API_KEY, base_url=XAI_BASE_URL)
 
@@ -404,20 +515,35 @@ async def generate_vibe_tags_for_location(
                 tag_values = [s.get(tag, 0.0) for s in all_scores]
                 mean_scores[tag] = statistics.mean(tag_values)
 
-            vibe_vector = _scores_to_vibe_vector(mean_scores)
+            final_scores = mean_scores
             logger.info("Vibe tagging complete for location %s — averaged %d/%d runs", location_id, len(all_scores), num_runs)
         else:
             # Single run
-            scores = await _analyze_restaurant_vibes(restaurant, client)
-            vibe_vector = _scores_to_vibe_vector(scores)
+            final_scores = await _analyze_restaurant_vibes(restaurant, client)
 
     except Exception as e:
         logger.error("Vibe tag generation failed for location %s: %s", location_id, e, exc_info=True)
         return None
 
-    # Update Supabase
+    # ── Blend TikTok signals ─────────────────────────────────────────────
+    if tiktok_vibes:
+        logger.info("Blending TikTok vibe signals for location %s: %s", location_id, tiktok_vibes)
+        final_scores = _blend_tiktok_into_scores(final_scores, tiktok_vibes)
+
+    vibe_vector = _scores_to_vibe_vector(final_scores)
+
+    # ── Update Supabase ──────────────────────────────────────────────────
     try:
-        supabase.update_location(location_id, vibe_vector=vibe_vector, updated_vibe=True)
+        update_kwargs: Dict = {"vibe_vector": vibe_vector, "updated_vibe": True}
+
+        # Update recommended dishes from TikTok key_dishes
+        if blend_tiktok and video_insights:
+            top_dishes = _extract_top_dishes(video_insights, top_n=3)
+            if top_dishes:
+                update_kwargs["reccomended_dishes"] = top_dishes
+                logger.info("Updating reccomended_dishes for location %s: %s", location_id, top_dishes)
+
+        supabase.update_location(location_id, **update_kwargs)
         logger.info("Updated vibe_vector for location %s: %s", location_id, vibe_vector)
     except Exception as e:
         logger.error("Failed to update vibe_vector for location %s: %s", location_id, e, exc_info=True)

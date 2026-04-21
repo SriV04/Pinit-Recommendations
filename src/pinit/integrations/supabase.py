@@ -895,6 +895,34 @@ class SupabaseService:
                    .execute())
         return response.count if hasattr(response, 'count') and response.count is not None else 0
 
+    # ==================== VIDEO INSIGHTS ====================
+
+    def get_video_insights_for_location(
+        self, location_id: int
+    ) -> List[Dict[str, Any]]:
+        """Fetch all video_insights rows for a location.
+
+        Returns list of dicts with vibe_signals, sentiment, key_dishes,
+        creator_notes for every video associated with this location.
+        Used by the vibe tagging pipeline to blend TikTok signals into
+        the LLM-scored vibe vector.
+        """
+        logger = logging.getLogger(__name__)
+        try:
+            response = (
+                self.client.table("video_insights")
+                .select("vibe_signals, sentiment, key_dishes, creator_notes")
+                .eq("location_id", location_id)
+                .execute()
+            )
+            return response.data or []
+        except Exception as exc:
+            logger.error(
+                "Error fetching video_insights for location %s: %s",
+                location_id, exc,
+            )
+            return []
+
 
 # Singleton instance
 _supabase_service = None

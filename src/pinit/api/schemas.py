@@ -134,6 +134,10 @@ class HealthResponse(BaseModel):
 
 class AddLocationRequest(BaseModel):
     google_place_id: str = Field(..., description="Google Place ID for the location")
+    source: Optional[str] = Field(
+        "in-app",
+        description="Source of the location add: 'in-app', 'tiktok', or 'instagram'",
+    )
     classify_photo: Optional[bool] = Field(True, description="Whether to classify the location's photo with AI")
     generate_emoji: Optional[bool] = Field(True, description="Whether to generate an emoji for the location")
 

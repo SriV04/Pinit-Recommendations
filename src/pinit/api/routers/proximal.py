@@ -1060,31 +1060,96 @@ async def get_proximal_recommendations(request: ProximalRequest) -> ProximalResp
 @router.post("/locations/add", response_model=AddLocationResponse)
 async def add_location_by_place_id(request: AddLocationRequest) -> AddLocationResponse:
     """
-    Add a new location to the database by Google Place ID.
+    Add or process a location by Google Place ID, with source-aware behaviour.
 
-    This endpoint will:
-    1. Check if the location already exists in the database
-    2. If not, fetch details from Google Places API
-    3. Process and tag the location
-    4. Store it in the database
+    Source-aware flow:
+    - **New location** (not in DB): Fetch Google Place Details → create row →
+      run full processing (emoji, photos, menu, vibe tagging). If source is
+      'tiktok', also blend video_insights into the vibe vector.
+    - **Existing + source='tiktok'**: Always re-process vibe tagging with
+      TikTok vibe blending (aggregates ALL video_insights rows for this
+      location). Also updates reccomended_dishes with top 3 key_dishes.
+      Skips Google Places API entirely.
+    - **Existing + source='in-app'/'instagram'**: Re-process vibe tagging
+      ONLY if updated_vibe is False or NULL. Skips Google Places API.
     """
     supabase = get_supabase_service()
+    source = (request.source or "in-app").lower().strip()
 
     # Step 1: Check if location already exists
     existing_location = supabase.get_location_by_google_place_id(request.google_place_id)
 
     if existing_location:
+        location_id = existing_location["location_id"]
+        updated_vibe = existing_location.get("updated_vibe") or False
+
+        # ── Existing + TikTok: always re-process with video_insights blending ──
+        if source == "tiktok":
+            import asyncio
+            from pinit.api.services.vibe_tagging import generate_vibe_tags_for_location
+
+            has_summary = existing_location.get("generated_summary")
+            num_runs = 5 if has_summary else 1
+
+            asyncio.create_task(
+                generate_vibe_tags_for_location(
+                    location_id, num_runs=num_runs, blend_tiktok=True,
+                )
+            )
+            logger.info(
+                "Existing location %s — TikTok source: kicked off vibe tagging "
+                "with video_insights blending (num_runs=%d)",
+                location_id, num_runs,
+            )
+
+            return AddLocationResponse(
+                success=True,
+                message="Location exists; TikTok vibe reprocessing started",
+                location_id=location_id,
+                google_place_id=request.google_place_id,
+                name=existing_location.get("name"),
+                tags_count=None,
+                already_existed=True,
+            )
+
+        # ── Existing + in-app / instagram: re-process only if no vibe yet ──
+        if not updated_vibe:
+            import asyncio
+            from pinit.api.services.vibe_tagging import generate_vibe_tags_for_location
+
+            has_summary = existing_location.get("generated_summary")
+            num_runs = 5 if has_summary else 1
+
+            asyncio.create_task(
+                generate_vibe_tags_for_location(location_id, num_runs=num_runs)
+            )
+            logger.info(
+                "Existing location %s — updated_vibe=%s: kicked off vibe tagging (num_runs=%d)",
+                location_id, updated_vibe, num_runs,
+            )
+
+            return AddLocationResponse(
+                success=True,
+                message="Location exists; vibe reprocessing started (was unprocessed)",
+                location_id=location_id,
+                google_place_id=request.google_place_id,
+                name=existing_location.get("name"),
+                tags_count=None,
+                already_existed=True,
+            )
+
+        # ── Existing + already vibed: nothing to do ──
         return AddLocationResponse(
             success=True,
             message="Location already exists in database",
-            location_id=existing_location["location_id"],
+            location_id=location_id,
             google_place_id=request.google_place_id,
             name=existing_location.get("name"),
             tags_count=None,
             already_existed=True,
         )
 
-    # Step 2: Fetch from Google Places API
+    # ── New location: fetch from Google Places API ──
     place_details = fetch_google_place_details(request.google_place_id)
 
     if not place_details:
@@ -1248,6 +1313,9 @@ async def add_location_by_place_id(request: AddLocationRequest) -> AddLocationRe
                 location_id, len(photos_from_details),
             )
 
+        # Determine whether to blend TikTok signals for new locations too
+        blend_tiktok = source == "tiktok"
+
         # Background: menu processing + vibe tagging
         website = place_details.get("website")
         if website:
@@ -1271,14 +1339,20 @@ async def add_location_by_place_id(request: AddLocationRequest) -> AddLocationRe
                     num_runs = 1
 
                 try:
-                    await generate_vibe_tags_for_location(location_id, num_runs=num_runs)
+                    await generate_vibe_tags_for_location(
+                        location_id, num_runs=num_runs, blend_tiktok=blend_tiktok,
+                    )
                 except Exception as exc:
                     logger.error("Vibe tag generation failed for location %s: %s", location_id, exc)
 
             asyncio.create_task(_menu_then_vibe())
             logger.info("Kicked off background menu processing + vibe tagging for location %s", location_id)
         else:
-            asyncio.create_task(generate_vibe_tags_for_location(location_id, num_runs=1))
+            asyncio.create_task(
+                generate_vibe_tags_for_location(
+                    location_id, num_runs=1, blend_tiktok=blend_tiktok,
+                )
+            )
             logger.info("Kicked off background vibe tagging for location %s (no website)", location_id)
 
         return AddLocationResponse(
