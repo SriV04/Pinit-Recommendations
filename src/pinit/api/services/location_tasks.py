@@ -152,6 +152,13 @@ async def pipeline_task(payload: PipelinePayload, *, dispatcher: LocationTaskDis
     row = await _get_location(payload.location_id)
 
     if payload.created_new:
+        logger.info(
+            "pipeline: dispatch details_enrich (location_id=%s request_id=%s generate_emoji=%s classify_photo=%s)",
+            payload.location_id,
+            payload.request_id,
+            bool(payload.generate_emoji),
+            bool(payload.classify_photo),
+        )
         await dispatcher.dispatch(
             DetailsEnrichPayload(
                 task_type="details_enrich",
@@ -164,6 +171,12 @@ async def pipeline_task(payload: PipelinePayload, *, dispatcher: LocationTaskDis
     source = (payload.source or "in-app").lower().strip()
 
     if source in ("tiktok", "instagram"):
+        logger.info(
+            "pipeline: dispatch vibe_reprocess (force_blend=true) (location_id=%s request_id=%s source=%s)",
+            payload.location_id,
+            payload.request_id,
+            source,
+        )
         await dispatcher.dispatch(
             VibeReprocessPayload(
                 task_type="vibe_reprocess",
@@ -174,6 +187,11 @@ async def pipeline_task(payload: PipelinePayload, *, dispatcher: LocationTaskDis
         return
 
     if not updated_vibe:
+        logger.info(
+            "pipeline: dispatch vibe_reprocess (force_blend=false) (location_id=%s request_id=%s)",
+            payload.location_id,
+            payload.request_id,
+        )
         await dispatcher.dispatch(
             VibeReprocessPayload(
                 task_type="vibe_reprocess",
@@ -196,14 +214,17 @@ async def details_enrich_task(payload: DetailsEnrichPayload, *, dispatcher: Loca
         payload.google_place_id,
     )
     if not place_details:
-        logger.error(
-            "details_enrich failed for location %s (%s)",
-            payload.location_id,
-            payload.google_place_id,
+        # This is a critical dependency for fan-out tasks; fail so Pub/Sub retries.
+        raise RuntimeError(
+            f"details_enrich failed for location {payload.location_id} ({payload.google_place_id})"
         )
-        return
 
     if payload.generate_emoji:
+        logger.info(
+            "details_enrich: dispatch emoji (location_id=%s request_id=%s)",
+            payload.location_id,
+            payload.request_id,
+        )
         await dispatcher.dispatch(
             EmojiPayload(
                 task_type="emoji",
@@ -212,6 +233,11 @@ async def details_enrich_task(payload: DetailsEnrichPayload, *, dispatcher: Loca
         )
 
     if payload.classify_photo:
+        logger.info(
+            "details_enrich: dispatch photos (location_id=%s request_id=%s)",
+            payload.location_id,
+            payload.request_id,
+        )
         await dispatcher.dispatch(
             PhotosPayload(
                 task_type="photos",
@@ -219,6 +245,11 @@ async def details_enrich_task(payload: DetailsEnrichPayload, *, dispatcher: Loca
             )
         )
 
+    logger.info(
+        "details_enrich: dispatch menu_vibe (location_id=%s request_id=%s)",
+        payload.location_id,
+        payload.request_id,
+    )
     await dispatcher.dispatch(
         MenuVibePayload(
             task_type="menu_vibe",
@@ -230,6 +261,7 @@ async def details_enrich_task(payload: DetailsEnrichPayload, *, dispatcher: Loca
 async def emoji_task(payload: EmojiPayload) -> None:
     row = await _get_location(payload.location_id)
     if _truthy(row.get("emoji")):
+        logger.info("emoji: skip (already set) (location_id=%s request_id=%s)", payload.location_id, payload.request_id)
         return
 
     place_details: Dict[str, Any] = {
@@ -244,6 +276,11 @@ async def emoji_task(payload: EmojiPayload) -> None:
 
     emoji = await asyncio.to_thread(add_location_emoji, place_details)
     if not emoji:
+        logger.warning(
+            "emoji: generation returned empty; skipping update (location_id=%s request_id=%s)",
+            payload.location_id,
+            payload.request_id,
+        )
         return
 
     def _update() -> None:
@@ -256,6 +293,11 @@ async def emoji_task(payload: EmojiPayload) -> None:
 async def photos_task(payload: PhotosPayload) -> None:
     row = await _get_location(payload.location_id)
     if _truthy(row.get("image_stored")) or _truthy(row.get("image_unavailable")):
+        logger.info(
+            "photos: skip (image already stored/unavailable) (location_id=%s request_id=%s)",
+            payload.location_id,
+            payload.request_id,
+        )
         return
 
     photos_from_details: List[Dict[str, Any]] = row.get("photos") or []
@@ -289,17 +331,25 @@ async def menu_vibe_task(payload: MenuVibePayload) -> None:
 
     blend_tiktok = (payload.source or "").lower().strip() == "tiktok"
     if updated_vibe and not blend_tiktok:
+        logger.info(
+            "menu_vibe: skip vibe generation (updated_vibe already true) (location_id=%s request_id=%s)",
+            payload.location_id,
+            payload.request_id,
+        )
         return
 
     if not has_summary:
         has_summary = _truthy(updated_after_menu.get("generated_summary"))
     num_runs = 5 if has_summary else 1
 
-    await generate_vibe_tags_for_location(
+    vibe_vector = await generate_vibe_tags_for_location(
         payload.location_id,
         num_runs=num_runs,
         blend_tiktok=blend_tiktok,
     )
+    if vibe_vector is None:
+        # Do not ack silently; Pub/Sub retry helps transient LLM/network failures.
+        raise RuntimeError(f"menu_vibe vibe tagging returned None for location {payload.location_id}")
 
 
 async def vibe_reprocess_task(payload: VibeReprocessPayload) -> None:
@@ -307,16 +357,23 @@ async def vibe_reprocess_task(payload: VibeReprocessPayload) -> None:
     updated_vibe = _truthy(row.get("updated_vibe"))
 
     if updated_vibe and not payload.force_blend:
+        logger.info(
+            "vibe_reprocess: skip (updated_vibe already true and force_blend=false) (location_id=%s request_id=%s)",
+            payload.location_id,
+            payload.request_id,
+        )
         return
 
     has_summary = _truthy(row.get("generated_summary"))
     num_runs = 5 if has_summary else 1
 
-    await generate_vibe_tags_for_location(
+    vibe_vector = await generate_vibe_tags_for_location(
         payload.location_id,
         num_runs=num_runs,
         blend_tiktok=payload.force_blend,
     )
+    if vibe_vector is None:
+        raise RuntimeError(f"vibe_reprocess vibe tagging returned None for location {payload.location_id}")
 
 
 async def run_pipeline_inline(
