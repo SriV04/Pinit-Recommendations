@@ -153,6 +153,10 @@ class AddLocationRequest(BaseModel):
     )
     classify_photo: Optional[bool] = Field(True, description="Whether to classify the location's photo with AI")
     generate_emoji: Optional[bool] = Field(True, description="Whether to generate an emoji for the location")
+    process_synchronously: Optional[bool] = Field(
+        False,
+        description="When true, run the full enrichment pipeline inline before returning",
+    )
     video_insights: Optional[VideoInsightsPayload] = Field(
         None,
         description="Video insight data to upsert before triggering TikTok vibe blend",

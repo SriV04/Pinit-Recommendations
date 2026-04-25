@@ -21,6 +21,66 @@ from pinit.integrations.supabase import get_supabase_service
 
 logger = logging.getLogger(__name__)
 
+PRICE_LEVEL_MAP: Dict[str, int] = {
+    "PRICE_LEVEL_FREE": 0,
+    "PRICE_LEVEL_INEXPENSIVE": 1,
+    "PRICE_LEVEL_MODERATE": 2,
+    "PRICE_LEVEL_EXPENSIVE": 3,
+    "PRICE_LEVEL_VERY_EXPENSIVE": 4,
+}
+
+BASIC_PLACE_DETAILS_FIELD_MASK = ",".join([
+    "id",
+    "displayName",
+    "types",
+    "formattedAddress",
+    "shortFormattedAddress",
+    "location",
+    "businessStatus",
+    "googleMapsUri",
+    "rating",
+    "userRatingCount",
+    "priceLevel",
+    "currentOpeningHours",
+    "websiteUri",
+])
+
+FULL_PLACE_DETAILS_FIELD_MASK = ",".join([
+    "id",
+    "displayName",
+    "types",
+    "formattedAddress",
+    "shortFormattedAddress",
+    "location",
+    "businessStatus",
+    "googleMapsUri",
+    "photos",
+    "rating",
+    "userRatingCount",
+    "priceLevel",
+    "currentOpeningHours",
+    "reviews",
+    "websiteUri",
+    "internationalPhoneNumber",
+    "editorialSummary",
+    "reviewSummary",
+    "goodForChildren",
+    "goodForGroups",
+    "goodForWatchingSports",
+    "liveMusic",
+    "outdoorSeating",
+    "servesBeer",
+    "servesBreakfast",
+    "servesBrunch",
+    "servesCocktails",
+    "servesCoffee",
+    "servesDessert",
+    "servesDinner",
+    "servesLunch",
+    "servesVegetarianFood",
+    "servesWine",
+])
+
 # Load emoji classification prompt from file
 EMOJI_PROMPT_TEMPLATE: Optional[str] = None
 EMOJI_PROMPT_FALLBACK = """Based on the restaurant information below, select a SINGLE emoji that best represents this location. Consider the cuisine type, atmosphere, and overall vibe.
@@ -277,9 +337,25 @@ def add_location_emoji(place_details: Dict[str, Any]) -> Optional[str]:
     # Extract vicinity
     vicinity = place_details.get("vicinity", "")
 
-    # Extract and limit reviews to top 3
-    reviews = place_details.get("reviews", [])
-    if reviews and isinstance(reviews, list):
+    # Extract and limit reviews to top 3 (Supabase/jsonb can come back as a JSON string)
+    raw_reviews = place_details.get("reviews", [])
+    if isinstance(raw_reviews, str):
+        try:
+            raw_reviews = json.loads(raw_reviews)
+        except Exception:
+            raw_reviews = []
+    if isinstance(raw_reviews, dict):
+        raw_reviews = [raw_reviews]
+
+    reviews: list[dict] = []
+    if isinstance(raw_reviews, list):
+        for item in raw_reviews:
+            if isinstance(item, dict):
+                reviews.append(item)
+            elif isinstance(item, str):
+                reviews.append({"text": item})
+
+    if reviews:
         reviews = reviews[:3]
 
     # 3. Build restaurant JSON matching prompt.md expectations
@@ -294,7 +370,7 @@ def add_location_emoji(place_details: Dict[str, Any]) -> Optional[str]:
                 "text": review.get("text", ""),
                 "rating": review.get("rating"),
                 "author": review.get("author_name", ""),
-                "time": review.get("time")
+                "time": review.get("time"),
             }
             for review in reviews
         ] if reviews else [],
@@ -342,6 +418,285 @@ def add_location_emoji(place_details: Dict[str, Any]) -> Optional[str]:
 
 # --------------------------------------------------- GOOGLE PLACES DETAILS FUNCTION ---------------------------------------------------
 
+def _fetch_google_place_payload(
+    google_place_id: str,
+    field_mask: str,
+    *,
+    log_context: str,
+) -> Optional[Dict[str, Any]]:
+    """Fetch a raw Google Places v1 payload for a single place."""
+    logger.info("Fetching %s for Google Place ID: %s", log_context, google_place_id)
+
+    api_key = GOOGLE_PLACE_API_KEY
+    if not api_key:
+        logger.error("GOOGLE_PLACE_API_KEY not found in environment variables")
+        raise ValueError("GOOGLE_PLACE_API_KEY not found in environment variables")
+
+    url = f"https://places.googleapis.com/v1/places/{google_place_id}"
+    headers = {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": api_key,
+        "X-Goog-FieldMask": field_mask,
+    }
+
+    response = requests.get(url, headers=headers, timeout=10)
+    if not response.ok:
+        logger.error(
+            "Google Places API %s error for %s: %s",
+            response.status_code,
+            google_place_id,
+            response.text,
+        )
+    response.raise_for_status()
+    place = response.json()
+
+    if not place.get("id"):
+        logger.warning(
+            "Google Places API v1 returned no id for place ID: %s",
+            google_place_id,
+        )
+        return None
+
+    return place
+
+
+def _normalize_google_place_payload(place: Dict[str, Any]) -> Dict[str, Any]:
+    """Translate a Places v1 payload into the app's legacy-compatible shape."""
+    display_name = place.get("displayName", {})
+    name = (display_name.get("text") or "").strip()
+
+    location = place.get("location", {})
+    types_list = place.get("types", [])
+
+    raw_price = place.get("priceLevel")
+    price_level = PRICE_LEVEL_MAP.get(raw_price) if isinstance(raw_price, str) else raw_price
+
+    current_hours = place.get("currentOpeningHours", {})
+
+    raw_reviews = place.get("reviews", [])
+    legacy_reviews = []
+    if raw_reviews:
+        for review in raw_reviews:
+            legacy_reviews.append({
+                "author_name": review.get("authorAttribution", {}).get("displayName", ""),
+                "text": review.get("text", {}).get("text", ""),
+                "rating": review.get("rating"),
+                "language": review.get("text", {}).get("languageCode", ""),
+                "time": review.get("publishTime"),
+                "relative_time_description": review.get("relativePublishTimeDescription", ""),
+            })
+
+    editorial_summary_obj = place.get("editorialSummary", {})
+    editorial_summary_text = (
+        editorial_summary_obj.get("text", "")
+        if isinstance(editorial_summary_obj, dict)
+        else ""
+    )
+
+    review_summary_obj = place.get("reviewSummary", {})
+    review_summary_text = (
+        review_summary_obj.get("text", {}).get("text")
+        if isinstance(review_summary_obj, dict)
+        else None
+    )
+
+    raw_photos = place.get("photos", [])
+    photos_json = None
+    if raw_photos:
+        photos_json = [
+            {"name": photo.get("name"), "widthPx": photo.get("widthPx"), "heightPx": photo.get("heightPx")}
+            for photo in raw_photos
+            if photo.get("name")
+        ]
+
+    return {
+        "place_id": place.get("id"),
+        "name": name,
+        "types": types_list,
+        "geometry": {"location": {"lat": location.get("latitude"), "lng": location.get("longitude")}},
+        "vicinity": place.get("shortFormattedAddress"),
+        "formatted_address": place.get("formattedAddress"),
+        "rating": place.get("rating"),
+        "user_ratings_total": place.get("userRatingCount"),
+        "price_level": price_level,
+        "business_status": place.get("businessStatus"),
+        "editorial_summary": {"overview": editorial_summary_text} if editorial_summary_text else {},
+        "website": place.get("websiteUri"),
+        "international_phone_number": place.get("internationalPhoneNumber"),
+        "opening_hours": {
+            "weekday_text": current_hours.get("weekdayDescriptions", []),
+            "periods": current_hours.get("periods", []),
+            "open_now": current_hours.get("openNow"),
+        },
+        "reviews": legacy_reviews,
+        "google_maps_uri": place.get("googleMapsUri"),
+        "photos": photos_json,
+        "review_summary": review_summary_text,
+        "good_for_children": place.get("goodForChildren"),
+        "good_for_groups": place.get("goodForGroups"),
+        "good_for_watching_sports": place.get("goodForWatchingSports"),
+        "live_music": place.get("liveMusic"),
+        "outdoor_seating": place.get("outdoorSeating"),
+        "serves_beer": place.get("servesBeer"),
+        "serves_breakfast": place.get("servesBreakfast"),
+        "serves_brunch": place.get("servesBrunch"),
+        "serves_cocktails": place.get("servesCocktails"),
+        "serves_coffee": place.get("servesCoffee"),
+        "serves_dessert": place.get("servesDessert"),
+        "serves_dinner": place.get("servesDinner"),
+        "serves_lunch": place.get("servesLunch"),
+        "serves_vegetarian_food": place.get("servesVegetarianFood"),
+        "serves_wine": place.get("servesWine"),
+    }
+
+
+def _build_location_write_data(place_details: Dict[str, Any]) -> Dict[str, Any]:
+    """Build the locations-table payload from normalized place details."""
+    opening_hours = place_details.get("opening_hours") or {}
+    geometry = (place_details.get("geometry") or {}).get("location") or {}
+    types_list = place_details.get("types") or []
+    reviews = place_details.get("reviews") or []
+    editorial_summary = place_details.get("editorial_summary") or {}
+
+    editorial_summary_text = (
+        editorial_summary.get("overview")
+        if isinstance(editorial_summary, dict)
+        else editorial_summary
+    )
+
+    return {
+        "google_place_id": place_details.get("place_id"),
+        "name": place_details.get("name"),
+        "vicinity": place_details.get("vicinity"),
+        "lat": geometry.get("lat"),
+        "lng": geometry.get("lng"),
+        "types": ",".join(t.lower() for t in types_list) if types_list else None,
+        "business_status": place_details.get("business_status"),
+        "rating": place_details.get("rating"),
+        "user_ratings_total": place_details.get("user_ratings_total"),
+        "price_level": place_details.get("price_level"),
+        "opening_hours_text": opening_hours.get("weekday_text", []),
+        "opening_hours_periods": json.dumps(opening_hours.get("periods", []))
+        if opening_hours.get("periods")
+        else None,
+        "open_now": opening_hours.get("open_now"),
+        "editorial_summary": editorial_summary_text or None,
+        "website": place_details.get("website"),
+        "international_phone_number": place_details.get("international_phone_number"),
+        "google_maps_uri": place_details.get("google_maps_uri"),
+        "photos": place_details.get("photos"),
+        "reviews": json.dumps(reviews) if reviews else None,
+        "review_summary": place_details.get("review_summary"),
+        "good_for_children": place_details.get("good_for_children"),
+        "good_for_groups": place_details.get("good_for_groups"),
+        "good_for_watching_sports": place_details.get("good_for_watching_sports"),
+        "live_music": place_details.get("live_music"),
+        "outdoor_seating": place_details.get("outdoor_seating"),
+        "serves_beer": place_details.get("serves_beer"),
+        "serves_breakfast": place_details.get("serves_breakfast"),
+        "serves_brunch": place_details.get("serves_brunch"),
+        "serves_cocktails": place_details.get("serves_cocktails"),
+        "serves_coffee": place_details.get("serves_coffee"),
+        "serves_dessert": place_details.get("serves_dessert"),
+        "serves_dinner": place_details.get("serves_dinner"),
+        "serves_lunch": place_details.get("serves_lunch"),
+        "serves_vegetarian_food": place_details.get("serves_vegetarian_food"),
+        "serves_wine": place_details.get("serves_wine"),
+    }
+
+
+def create_location_from_place_details(place_details: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Insert a new location row from normalized place details."""
+    supabase = get_supabase_service()
+    created = supabase.create_location(**_build_location_write_data(place_details))
+    if not created:
+        return None
+
+    result = dict(place_details)
+    result["location_id"] = created["location_id"]
+    logger.info(
+        "Created location in DB with ID: %s for place: %s",
+        created["location_id"],
+        place_details.get("name") or "Unknown",
+    )
+    return result
+
+
+def update_location_from_place_details(
+    location_id: int,
+    place_details: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Update an existing location row from normalized place details."""
+    supabase = get_supabase_service()
+    updated = supabase.update_location(location_id, **_build_location_write_data(place_details))
+    if not updated:
+        return None
+
+    result = dict(place_details)
+    result["location_id"] = location_id
+    logger.info(
+        "Updated location in DB with ID: %s for place: %s",
+        location_id,
+        place_details.get("name") or "Unknown",
+    )
+    return result
+
+
+def fetch_google_place_basic_details(google_place_id: str) -> Optional[Dict[str, Any]]:
+    """Fetch the minimum viable Google Places details needed for a fast insert."""
+    try:
+        place = _fetch_google_place_payload(
+            google_place_id,
+            BASIC_PLACE_DETAILS_FIELD_MASK,
+            log_context="basic place details",
+        )
+        if not place:
+            return None
+        result = _normalize_google_place_payload(place)
+        logger.info(
+            "Successfully fetched basic details for place: %s",
+            result.get("name") or "Unknown",
+        )
+        return result
+    except Exception as exc:
+        logger.error(
+            "Error fetching basic Google Place details for %s: %s",
+            google_place_id,
+            exc,
+            exc_info=True,
+        )
+        return None
+
+
+def refresh_location_from_google_place_details(
+    location_id: int,
+    google_place_id: str,
+) -> Optional[Dict[str, Any]]:
+    """Fetch the full Google Places payload and update an existing row."""
+    try:
+        place = _fetch_google_place_payload(
+            google_place_id,
+            FULL_PLACE_DETAILS_FIELD_MASK,
+            log_context="full place details",
+        )
+        if not place:
+            return None
+
+        result = _normalize_google_place_payload(place)
+        logger.info(
+            "Successfully fetched full details for place: %s (v1 API, enterprise tier)",
+            result.get("name") or "Unknown",
+        )
+        return update_location_from_place_details(location_id, result)
+    except Exception as exc:
+        logger.error(
+            "Error refreshing Google Place details for %s: %s",
+            google_place_id,
+            exc,
+            exc_info=True,
+        )
+        return None
+
 def fetch_google_place_details(google_place_id: str) -> Optional[Dict[str, Any]]:
     """Fetch place details from Google Places API v1 (New) with enterprise-tier fields.
 
@@ -354,236 +709,21 @@ def fetch_google_place_details(google_place_id: str) -> Optional[Dict[str, Any]]
     additional enterprise-tier fields included as extra keys.
     """
 
-        # Price level mapping — v1 API returns enum strings, legacy format uses numeric
-    PRICE_LEVEL_MAP: Dict[str, int] = {
-        "PRICE_LEVEL_FREE": 0,
-        "PRICE_LEVEL_INEXPENSIVE": 1,
-        "PRICE_LEVEL_MODERATE": 2,
-        "PRICE_LEVEL_EXPENSIVE": 3,
-        "PRICE_LEVEL_VERY_EXPENSIVE": 4,
-    }
-
-    # Place Details (New) v1 field mask — Enterprise tier
-    # No "places." prefix for single-place lookups
-    PLACE_DETAILS_FIELD_MASK = ",".join([
-        # --- Essentials ---
-        "id",
-        "displayName",
-        "types",
-        "formattedAddress",
-        "shortFormattedAddress",
-        "location",
-        "businessStatus",
-        "googleMapsUri",
-        "photos",
-        # --- Pro-tier ---
-        "rating",
-        "userRatingCount",
-        "priceLevel",
-        "currentOpeningHours",
-        # --- Enterprise-tier ---
-        "reviews",
-        "websiteUri",
-        "internationalPhoneNumber",
-        "editorialSummary",
-        "goodForChildren",
-        "goodForGroups",
-        "goodForWatchingSports",
-        "liveMusic",
-        "outdoorSeating",
-        "servesBeer",
-        "servesBreakfast",
-        "servesBrunch",
-        "servesCocktails",
-        "servesCoffee",
-        "servesDessert",
-        "servesDinner",
-        "servesLunch",
-        "servesVegetarianFood",
-        "servesWine",
-    ])
-    logger.info("Fetching details for Google Place ID: %s", google_place_id)
-
-    api_key = GOOGLE_PLACE_API_KEY
-    if not api_key:
-        logger.error("GOOGLE_PLACE_API_KEY not found in environment variables")
-        raise ValueError("GOOGLE_PLACE_API_KEY not found in environment variables")
-
-    logger.info("Using GOOGLE_PLACE_API_KEY: %s...", api_key[:8] if api_key else "None")
-
-    url = f"https://places.googleapis.com/v1/places/{google_place_id}"
-    headers = {
-        "Content-Type": "application/json",
-        "X-Goog-Api-Key": api_key,
-        "X-Goog-FieldMask": PLACE_DETAILS_FIELD_MASK,
-    }
-
     try:
-        response = requests.get(url, headers=headers, timeout=10)
-        if not response.ok:
-            logger.error(
-                "Google Places API %s error for %s: %s",
-                response.status_code,
-                google_place_id,
-                response.text,
-            )
-        response.raise_for_status()
-        place = response.json()
-
-        if not place.get("id"):
-            logger.warning(
-                "Google Places API v1 returned no id for place ID: %s",
-                google_place_id,
-            )
+        place = _fetch_google_place_payload(
+            google_place_id,
+            FULL_PLACE_DETAILS_FIELD_MASK,
+            log_context="full place details",
+        )
+        if not place:
             return None
 
-        # --- Translate v1 response to legacy-compatible format ---
-        display_name = place.get("displayName", {})
-        name = (display_name.get("text") or "").strip()
-
-        location = place.get("location", {})
-
-        types_list = place.get("types", [])
-
-        # Price level: v1 returns enum string, convert to numeric
-        raw_price = place.get("priceLevel")
-        price_level = PRICE_LEVEL_MAP.get(raw_price) if isinstance(raw_price, str) else raw_price
-
-        # Opening hours
-        current_hours = place.get("currentOpeningHours", {})
-
-        # Reviews: translate v1 format to legacy format
-        raw_reviews = place.get("reviews", [])
-        legacy_reviews = []
-        if raw_reviews:
-            for r in raw_reviews:
-                legacy_reviews.append({
-                    "author_name": r.get("authorAttribution", {}).get("displayName", ""),
-                    "text": r.get("text", {}).get("text", ""),
-                    "rating": r.get("rating"),
-                    "language": r.get("text", {}).get("languageCode", ""),
-                    "time": r.get("publishTime"),
-                    "relative_time_description": r.get("relativePublishTimeDescription", ""),
-                })
-
-        # Editorial summary
-        editorial_summary_obj = place.get("editorialSummary", {})
-        editorial_summary_text = editorial_summary_obj.get("text", "") if isinstance(editorial_summary_obj, dict) else ""
-
-        # Review summary
-        review_summary_obj = place.get("reviewSummary", {})
-        review_summary_text = review_summary_obj.get("text", {}).get("text") if isinstance(review_summary_obj, dict) else None
-
-        # Photos: extract resource names
-        raw_photos = place.get("photos", [])
-        photos_json = None
-        if raw_photos:
-            photos_json = [
-                {"name": p.get("name"), "widthPx": p.get("widthPx"), "heightPx": p.get("heightPx")}
-                for p in raw_photos if p.get("name")
-            ]
-
-        # Build result dict — legacy-compatible keys for existing consumers,
-        # plus enterprise-tier fields matching stage_a's _build_location_row
-        result = {
-            # --- Legacy-compatible keys (used by process_and_tag_location / add_location_emoji) ---
-            "place_id": place.get("id"),
-            "name": name,
-            "types": types_list,
-            "geometry": {"location": {"lat": location.get("latitude"), "lng": location.get("longitude")}},
-            "vicinity": place.get("shortFormattedAddress"),
-            "formatted_address": place.get("formattedAddress"),
-            "rating": place.get("rating"),
-            "user_ratings_total": place.get("userRatingCount"),
-            "price_level": price_level,
-            "business_status": place.get("businessStatus"),
-            "editorial_summary": {"overview": editorial_summary_text} if editorial_summary_text else {},
-            "website": place.get("websiteUri"),
-            "international_phone_number": place.get("internationalPhoneNumber"),
-            "opening_hours": {
-                "weekday_text": current_hours.get("weekdayDescriptions", []),
-                "periods": current_hours.get("periods", []),
-                "open_now": current_hours.get("openNow"),
-            },
-            "reviews": legacy_reviews,
-            "google_maps_uri": place.get("googleMapsUri"),
-            # --- Photos (resource names for later Photo API fetches) ---
-            "photos": photos_json,
-            # --- Review summary ---
-            "review_summary": review_summary_text,
-            # --- Enterprise-tier: vibe / atmosphere booleans ---
-            "good_for_children": place.get("goodForChildren"),
-            "good_for_groups": place.get("goodForGroups"),
-            "good_for_watching_sports": place.get("goodForWatchingSports"),
-            "live_music": place.get("liveMusic"),
-            "outdoor_seating": place.get("outdoorSeating"),
-            # --- Enterprise-tier: serves booleans ---
-            "serves_beer": place.get("servesBeer"),
-            "serves_breakfast": place.get("servesBreakfast"),
-            "serves_brunch": place.get("servesBrunch"),
-            "serves_cocktails": place.get("servesCocktails"),
-            "serves_coffee": place.get("servesCoffee"),
-            "serves_dessert": place.get("servesDessert"),
-            "serves_dinner": place.get("servesDinner"),
-            "serves_lunch": place.get("servesLunch"),
-            "serves_vegetarian_food": place.get("servesVegetarianFood"),
-            "serves_wine": place.get("servesWine"),
-        }
-
+        result = _normalize_google_place_payload(place)
         logger.info(
             "Successfully fetched details for place: %s (v1 API, enterprise tier)",
-            name or "Unknown",
+            result.get("name") or "Unknown",
         )
-
-        # --- Insert into Supabase ---
-        opening_hours = result["opening_hours"]
-        location_data = {
-            "google_place_id": result["place_id"],
-            "name": name,
-            "vicinity": result["vicinity"],
-            "lat": location.get("latitude"),
-            "lng": location.get("longitude"),
-            "types": ",".join(t.lower() for t in types_list) if types_list else None,
-            "business_status": result["business_status"],
-            "rating": result["rating"],
-            "user_ratings_total": result["user_ratings_total"],
-            "price_level": price_level,
-            "opening_hours_text": opening_hours.get("weekday_text", []),
-            "opening_hours_periods": json.dumps(opening_hours.get("periods", []))
-            if opening_hours.get("periods")
-            else None,
-            "open_now": opening_hours.get("open_now"),
-            "editorial_summary": editorial_summary_text or None,
-            "website": result["website"],
-            "international_phone_number": result["international_phone_number"],
-            "google_maps_uri": result["google_maps_uri"],
-            "photos": photos_json,
-            "reviews": json.dumps(legacy_reviews) if legacy_reviews else None,
-            "review_summary": review_summary_text,
-            "good_for_children": result["good_for_children"],
-            "good_for_groups": result["good_for_groups"],
-            "good_for_watching_sports": result["good_for_watching_sports"],
-            "live_music": result["live_music"],
-            "outdoor_seating": result["outdoor_seating"],
-            "serves_beer": result["serves_beer"],
-            "serves_breakfast": result["serves_breakfast"],
-            "serves_brunch": result["serves_brunch"],
-            "serves_cocktails": result["serves_cocktails"],
-            "serves_coffee": result["serves_coffee"],
-            "serves_dessert": result["serves_dessert"],
-            "serves_dinner": result["serves_dinner"],
-            "serves_lunch": result["serves_lunch"],
-            "serves_vegetarian_food": result["serves_vegetarian_food"],
-            "serves_wine": result["serves_wine"],
-        }
-
-        supabase = get_supabase_service()
-        created = supabase.create_location(**location_data)
-        result["location_id"] = created["location_id"]
-        logger.info("Created location in DB with ID: %s for place: %s", created["location_id"], name)
-
-        return result
-
+        return create_location_from_place_details(result)
     except Exception as exc:
         logger.error(
             "Error fetching Google Place details for %s: %s",

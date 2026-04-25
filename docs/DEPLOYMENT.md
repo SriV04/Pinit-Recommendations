@@ -56,6 +56,9 @@ Set these in Secret Manager or as env vars:
 - `SUPABASE_SERVICE_ROLE_KEY`
 - `GOOGLE_MAPS_API_KEY`
 - `GOOGLE_CLOUD_PROJECT`
+- `PUBSUB_ENABLED` (set to `true` in production)
+- `PUBSUB_TOPIC_LOCATION_TASKS` (topic name, e.g. `location-tasks`)
+- `PUBSUB_PROJECT_ID` (optional; defaults to `GOOGLE_CLOUD_PROJECT`)
 
 ### Deploy Script
 ```bash
@@ -111,6 +114,66 @@ gcloud run deploy pinit-recommendations-api \
   --timeout=300 \
   --cpu=1 \
   --memory=512Mi
+```
+
+---
+
+## Location Task Worker (Pub/Sub)
+
+This repo includes a separate Cloud Run worker app that receives Pub/Sub push
+messages and performs async enrichment tasks (details refresh, emoji, photos,
+menu→vibe, vibe reprocessing).
+
+### Worker entrypoint
+- Uvicorn app: `pinit.worker.main:app`
+- Pub/Sub push endpoint: `POST /internal/pubsub/location-tasks`
+
+### Create topic + filtered subscriptions (example)
+```bash
+TOPIC="location-tasks"
+PROJECT="pinit-a97eb"
+REGION="europe-west2"
+
+gcloud pubsub topics create "${TOPIC}" --project "${PROJECT}"
+
+# One subscription per task_type (attribute filter)
+for TASK in pipeline details_enrich emoji photos menu_vibe vibe_reprocess; do
+  gcloud pubsub subscriptions create "location-tasks-${TASK}" \
+    --project "${PROJECT}" \
+    --topic "${TOPIC}" \
+    --message-filter="attributes.task_type=\"${TASK}\"" \
+    --enable-message-ordering
+done
+```
+
+### Deploy worker service (example)
+```bash
+SERVICE_NAME="pinit-location-worker"
+
+gcloud run deploy "${SERVICE_NAME}" \
+  --image "europe-west2-docker.pkg.dev/${PROJECT}/pinit-api/pinit-recommendations-api:latest" \
+  --region "${REGION}" \
+  --service-account "pinit-api-sa@${PROJECT}.iam.gserviceaccount.com" \
+  --set-env-vars=GOOGLE_CLOUD_PROJECT="${PROJECT}",PUBSUB_ENABLED=true,PUBSUB_TOPIC_LOCATION_TASKS="${TOPIC}" \
+  --timeout=900 \
+  --cpu=2 \
+  --memory=1Gi \
+  --no-allow-unauthenticated
+```
+
+### Configure Pub/Sub push to the worker
+Use an authenticated push (OIDC) and point each subscription to the same endpoint:
+`https://<worker-url>/internal/pubsub/location-tasks`
+
+```bash
+WORKER_URL="$(gcloud run services describe "${SERVICE_NAME}" --region "${REGION}" --format='value(status.url)')"
+
+for TASK in pipeline details_enrich emoji photos menu_vibe vibe_reprocess; do
+  gcloud pubsub subscriptions update "location-tasks-${TASK}" \
+    --project "${PROJECT}" \
+    --push-endpoint="${WORKER_URL}/internal/pubsub/location-tasks" \
+    --push-auth-service-account="pinit-api-sa@${PROJECT}.iam.gserviceaccount.com"
+done
 ```
 
 ### Using Secret Manager (recommended for production)

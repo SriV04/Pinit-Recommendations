@@ -1,7 +1,8 @@
 from typing import Optional, List, Dict, Any
 from urllib.parse import urlparse
 import logging
-from supabase import create_client, Client
+import time
+from supabase import create_client, Client, ClientOptions
 from pinit.config.secrets import SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
 
 # Import cache service (with lazy loading to avoid circular imports)
@@ -58,7 +59,11 @@ class SupabaseService:
             raise ValueError("Invalid SUPABASE_URL format")
         logger.debug(f"Initializing SupabaseService for host: {parsed.netloc}")
         
-        self.client: Client = create_client(url, key)
+        options = ClientOptions(
+            auto_refresh_token=False,
+            persist_session=False,
+        )
+        self.client: Client = create_client(url, key, options)
 
         self.vibe_tag_order = {
     "cafe": 0, "casual": 1, "cozy": 2, "coffee_shop": 3, "bar": 4,
@@ -169,40 +174,45 @@ class SupabaseService:
             List of location dictionaries with quality_score field
         """
         logger = logging.getLogger(__name__)
-        try:
-            # PostGIS ST_DWithin uses meters for geography type
-            radius_meters = radius_km * 1000
+        # PostGIS ST_DWithin uses meters for geography type
+        radius_meters = radius_km * 1000
+        params = {
+            'center_lat': latitude,
+            'center_lng': longitude,
+            'radius_meters': radius_meters,
+            'result_limit': limit,
+        }
 
-            # Call the database function that computes quality scores
-            # This returns locations with quality_score already computed
-            response = (
-                self.client.rpc(
-                    'get_locations_with_quality',
-                    {
-                        'center_lat': latitude,
-                        'center_lng': longitude,
-                        'radius_meters': radius_meters,
-                        'result_limit': limit
-                    }
-                ).execute()
-            )
+        last_exc: Exception | None = None
+        for attempt in range(3):
+            if attempt > 0:
+                time.sleep(0.5 * attempt)  # 0.5s, then 1.0s
+                logger.warning(
+                    "Retrying get_locations_with_quality (attempt %d/3) after: %s",
+                    attempt + 1,
+                    last_exc,
+                )
+            try:
+                response = self.client.rpc('get_locations_with_quality', params).execute()
+                logger.info(
+                    "Spatial query returned %d locations within %.1fkm (attempt %d)",
+                    len(response.data),
+                    radius_km,
+                    attempt + 1,
+                )
+                return response.data
+            except Exception as exc:
+                last_exc = exc
 
-            logger.info(
-                f"Spatial query returned {len(response.data)} locations within {radius_km}km "
-                f"with pre-computed quality scores"
-            )
-            return response.data
-
-        except Exception as exc:
-            # Never fall back to SELECT * on the full locations table — that
-            # pulls megabytes of unrelated data per request. Fail loud and
-            # return empty so the caller short-circuits.
-            logger.error(
-                "Spatial RPC get_locations_with_quality failed: %s. "
-                "Returning empty result (no fallback).",
-                exc,
-            )
-            return []
+        # Never fall back to SELECT * on the full locations table — that
+        # pulls megabytes of unrelated data per request. Fail loud and
+        # return empty so the caller short-circuits.
+        logger.error(
+            "Spatial RPC get_locations_with_quality failed after 3 attempts: %s. "
+            "Returning empty result (no fallback).",
+            last_exc,
+        )
+        return []
 
     def get_bubble_added_locations(self, bubble_id: str) -> List[Dict[str, Any]]:
         """

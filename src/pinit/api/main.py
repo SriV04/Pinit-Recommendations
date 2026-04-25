@@ -7,6 +7,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from pinit.api.routers import proximal
+from pinit.api.services.background_jobs import get_background_job_runner
+from pinit.integrations.pubsub_tasks import get_pubsub_config
 
 # Configure logging (respect LOG_LEVEL env)
 log_level_name = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -32,6 +34,19 @@ app.add_middleware(
 )
 
 app.include_router(proximal.router)
+
+
+@app.on_event("startup")
+async def startup_background_workers() -> None:
+    # Only start in-process workers when Pub/Sub is disabled (local fallback).
+    if not get_pubsub_config().enabled:
+        await get_background_job_runner().start()
+
+
+@app.on_event("shutdown")
+async def shutdown_background_workers() -> None:
+    if not get_pubsub_config().enabled:
+        await get_background_job_runner().stop()
 
 
 if __name__ == "__main__":

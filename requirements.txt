@@ -19,6 +19,9 @@ openai>=1.0.0
 redis>=5.0.0
 hiredis>=2.2.0
 
+# Async task queue (GCP Pub/Sub)
+google-cloud-pubsub>=2.0.0
+
 # Menu processing (web crawling & PDF extraction)
 crawl4ai>=0.3.0
 httpx>=0.27.0

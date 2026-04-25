@@ -11,6 +11,10 @@ services:
       - SUPABASE_URL=${SUPABASE_URL}
       - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
       - GOOGLE_PLACE_API_KEY=${GOOGLE_PLACE_API_KEY}
+      # Pub/Sub async task pipeline (optional)
+      - PUBSUB_ENABLED=${PUBSUB_ENABLED:-false}
+      - PUBSUB_PROJECT_ID=${PUBSUB_PROJECT_ID}
+      - PUBSUB_TOPIC_LOCATION_TASKS=${PUBSUB_TOPIC_LOCATION_TASKS}
       # Redis config from .env file (using Upstash)
       - REDIS_HOST=${REDIS_HOST}
       - REDIS_PORT=${REDIS_PORT:-6379}

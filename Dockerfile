@@ -1,5 +1,6 @@
-# Use Python 3.12 slim image for smaller size
-FROM python:3.12-slim
+# Use Python 3.11 slim: the current crawl4ai/litellm dependency chain can
+# resolve tokenizers to a build that has no cp312 Linux wheel.
+FROM python:3.11-slim
 
 # Set working directory
 WORKDIR /app

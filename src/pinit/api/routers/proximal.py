@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime
 import logging
 from typing import Any, Dict, List, Optional
+from uuid import uuid4
 
 import numpy as np
 import pandas as pd
@@ -33,9 +35,15 @@ from pinit.api.schemas import (
 from pinit.config.secrets import GOOGLE_PLACE_API_KEY
 from pinit.api.services.proximal_service import (
     add_location_emoji,
+    create_location_from_place_details,
     fetch_google_place_details,
+    fetch_google_place_basic_details,
+    refresh_location_from_google_place_details,
     text_search,
 )
+from pinit.api.services.background_jobs import get_background_job_runner
+from pinit.api.schemas_location_tasks import PipelinePayload
+from pinit.api.services.location_tasks import InProcessDispatcher, PubSubDispatcher, run_pipeline_inline
 from pinit.api.services.cache_service import get_cache_service
 from pinit.core.recommendation.proximal_recommendation import (
     ProximalConfig,
@@ -46,6 +54,7 @@ from pinit.core.recommendation.bubble_recommendation import (
     BubbleConfig,
     build_bubble_recommendations,
 )
+from pinit.integrations.pubsub_tasks import get_pubsub_config
 from pinit.integrations.supabase import get_supabase_service
 
 router = APIRouter()
@@ -102,6 +111,20 @@ VIBE_TAG_ORDER = {
 }
 
 
+def _safe_optional_str(value: Any) -> Optional[str]:
+    """Convert pandas / numpy null-like values to None before response validation."""
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except TypeError:
+        pass
+
+    text = value if isinstance(value, str) else str(value)
+    return text or None
+
+
 def _filter_candidates_by_tags(
     candidates: List[Dict[str, Any]],
     cuisine_filters: Optional[List[str]],
@@ -143,8 +166,12 @@ def _filter_candidates_by_tags(
     for candidate in candidates:
         # Cuisine filter (OR logic) - cuisine or cuisine_secondary must match
         if cuisine_set:
-            primary = (candidate.get("cuisine") or candidate.get("cuisine_primary") or "").lower()
-            secondary = (candidate.get("cuisine_secondary") or "").lower()
+            primary = (
+                _safe_optional_str(candidate.get("cuisine"))
+                or _safe_optional_str(candidate.get("cuisine_primary"))
+                or ""
+            ).lower()
+            secondary = (_safe_optional_str(candidate.get("cuisine_secondary")) or "").lower()
             if primary not in cuisine_set and secondary not in cuisine_set:
                 continue
 
@@ -614,6 +641,7 @@ async def get_hidden_gems(
     radius_km: float = Query(2.0, gt=0, le=50),
     max_results: int = Query(20, ge=1, le=100),
     min_reviews: int = Query(35, ge=1),
+    min_quality_score: float = 0.6,
 ) -> HiddenGemsResponse:
     """
     Get hidden gem restaurants within a radius.
@@ -654,6 +682,8 @@ async def get_hidden_gems(
             continue
         if (loc.get("user_ratings_total") or 0) < min_reviews:
             continue
+        if float(loc.get("quality_score") or 0.0) < min_quality_score:
+            continue
         eligible.append({**loc, "distance_km": dist})
 
     if not eligible:
@@ -678,8 +708,8 @@ async def get_hidden_gems(
             HiddenGemLocation(
                 location_id=int(loc["location_id"]),
                 name=loc["name"],
-                vicinity=loc.get("vicinity") or None,
-                cuisine_primary=loc.get("cuisine_primary") or None,
+                vicinity=_safe_optional_str(loc.get("vicinity")),
+                cuisine_primary=_safe_optional_str(loc.get("cuisine_primary")),
                 rating=float(loc["rating"]) if loc.get("rating") is not None else None,
                 user_ratings_total=int(loc["user_ratings_total"]) if loc.get("user_ratings_total") is not None else None,
                 price_level=float(loc["price_level"]) if loc.get("price_level") is not None else None,
@@ -1002,8 +1032,8 @@ async def get_proximal_recommendations(request: ProximalRequest) -> ProximalResp
             LocationRecommendation(
                 location_id=int(row["location_id"]),
                 name=row["name"],
-                vicinity=row.get("vicinity") if pd.notna(row.get("vicinity")) else None,
-                cuisine_primary=row.get("cuisine_primary") if pd.notna(row.get("cuisine_primary")) else None,
+                vicinity=_safe_optional_str(row.get("vicinity")),
+                cuisine_primary=_safe_optional_str(row.get("cuisine_primary")),
                 rating=float(row["rating"]) if pd.notna(row.get("rating")) else None,
                 user_ratings_total=int(row["user_ratings_total"])
                 if pd.notna(row.get("user_ratings_total"))
@@ -1057,15 +1087,339 @@ async def get_proximal_recommendations(request: ProximalRequest) -> ProximalResp
     )
 
 
+async def _schedule_or_run_location_job(
+    job_name: str,
+    handler,
+    *,
+    process_synchronously: bool,
+) -> None:
+    if process_synchronously:
+        await handler()
+        return
+
+    # Legacy in-process background queue (still used by older helpers in this module).
+    await get_background_job_runner().enqueue(job_name, handler)
+
+
+async def _upsert_video_insights_for_location(
+    location_id: int,
+    video_insights: Any,
+) -> None:
+    def _upsert() -> None:
+        supabase = get_supabase_service()
+        supabase.client.table("video_insights").upsert(
+            {
+                "source_video_url": video_insights.source_video_url,
+                "location_id": location_id,
+                "key_dishes": video_insights.key_dishes or [],
+                "special_offers": video_insights.special_offers or [],
+                "creator_notes": video_insights.creator_notes,
+                "vibe_signals": video_insights.vibe_signals or {},
+                "sentiment": video_insights.sentiment,
+                "creator_handle": video_insights.creator_handle,
+                "video_description": video_insights.video_description,
+                "extraction_model": video_insights.extraction_model or "gpt-4o-mini",
+            },
+            on_conflict="source_video_url,location_id",
+        ).execute()
+
+    await asyncio.to_thread(_upsert)
+    logger.info("Upserted video_insights for location %s before blend", location_id)
+
+
+async def _run_emoji_generation(location_id: int, place_details: Dict[str, Any]) -> None:
+    emoji = await asyncio.to_thread(add_location_emoji, place_details)
+    if not emoji:
+        return
+
+    def _update_location_emoji() -> None:
+        get_supabase_service().update_location(location_id, emoji=emoji)
+
+    await asyncio.to_thread(_update_location_emoji)
+    logger.info("Added emoji '%s' for location %s", emoji, location_id)
+
+
+async def _run_photo_pipeline(
+    location_id: int,
+    photos_from_details: List[Dict[str, Any]],
+) -> None:
+    from pinit.api.services.proximal_service import download_photo
+
+    bg_supabase = get_supabase_service()
+
+    if not photos_from_details:
+        logger.warning(
+            "No photos returned by Places API for location %s — marking image_unavailable",
+            location_id,
+        )
+        try:
+            await asyncio.to_thread(bg_supabase.mark_location_image_unavailable, location_id)
+        except Exception as exc:
+            logger.error(
+                "mark_location_image_unavailable failed for %s: %s",
+                location_id,
+                exc,
+            )
+        return
+
+    primary = photos_from_details[0]
+    primary_name = primary.get("name") if isinstance(primary, dict) else None
+    if not primary_name:
+        logger.warning(
+            "First photo for location %s has no resource name — marking image_unavailable",
+            location_id,
+        )
+        try:
+            await asyncio.to_thread(bg_supabase.mark_location_image_unavailable, location_id)
+        except Exception as exc:
+            logger.error(
+                "mark_location_image_unavailable failed for %s: %s",
+                location_id,
+                exc,
+            )
+        return
+
+    primary_dl = await asyncio.to_thread(download_photo, primary_name, GOOGLE_PLACE_API_KEY)
+    if primary_dl is None:
+        logger.error(
+            "Primary photo download failed for location %s (name=%s)",
+            location_id,
+            primary_name,
+        )
+        return
+
+    primary_bytes, primary_ct = primary_dl
+    try:
+        await asyncio.to_thread(
+            bg_supabase.upload_location_photo,
+            location_id,
+            primary_bytes,
+            primary_ct,
+            None,
+        )
+    except Exception as exc:
+        logger.error(
+            "Primary photo upload failed for location %s: %s",
+            location_id,
+            exc,
+        )
+        return
+
+    try:
+        await asyncio.to_thread(
+            bg_supabase.mark_location_image_uploaded,
+            location_id,
+            photos_from_details,
+            primary_name,
+        )
+    except Exception as exc:
+        logger.error(
+            "mark_location_image_uploaded failed for location %s: %s",
+            location_id,
+            exc,
+        )
+        return
+
+    extras_uploaded = 0
+    for idx, extra in enumerate(photos_from_details[1:10], start=1):
+        extra_name = extra.get("name") if isinstance(extra, dict) else None
+        if not extra_name:
+            continue
+
+        extra_dl = await asyncio.to_thread(download_photo, extra_name, GOOGLE_PLACE_API_KEY)
+        if extra_dl is None:
+            logger.warning(
+                "Extra photo %d download failed for location %s",
+                idx,
+                location_id,
+            )
+            continue
+
+        extra_bytes, extra_ct = extra_dl
+        try:
+            await asyncio.to_thread(
+                bg_supabase.upload_location_photo,
+                location_id,
+                extra_bytes,
+                extra_ct,
+                idx,
+            )
+            extras_uploaded += 1
+        except Exception as exc:
+            logger.error(
+                "Extra photo %d upload failed for location %s: %s",
+                idx,
+                location_id,
+                exc,
+            )
+
+    if extras_uploaded > 0:
+        try:
+            await asyncio.to_thread(
+                bg_supabase.mark_location_extra_photos_stored,
+                location_id,
+                extras_uploaded,
+            )
+        except Exception as exc:
+            logger.error(
+                "mark_location_extra_photos_stored failed for %s: %s",
+                location_id,
+                exc,
+            )
+
+    logger.info(
+        "Photo pipeline complete for location %s: primary + %d extras",
+        location_id,
+        extras_uploaded,
+    )
+
+
+async def _run_menu_then_vibe(
+    location_id: int,
+    google_place_id: str,
+    place_details: Dict[str, Any],
+    *,
+    blend_tiktok: bool,
+) -> None:
+    from pinit.api.services.menu_processing import process_menu_for_location
+    from pinit.api.services.vibe_tagging import generate_vibe_tags_for_location
+
+    website = place_details.get("website")
+    if website:
+        cuisine_value = place_details.get("cuisine_primary", "") or ""
+        try:
+            result = await process_menu_for_location(
+                location_id=location_id,
+                google_place_id=google_place_id,
+                website=website,
+                restaurant_name=place_details.get("name", ""),
+                cuisine_hint=cuisine_value,
+                detect_cuisine=not cuisine_value,
+            )
+            has_summary = bool(result and result.restaurant_description)
+            num_runs = 5 if has_summary else 1
+        except Exception as exc:
+            logger.error("Menu processing failed for location %s: %s", location_id, exc)
+            num_runs = 1
+    else:
+        num_runs = 1
+
+    try:
+        await generate_vibe_tags_for_location(
+            location_id,
+            num_runs=num_runs,
+            blend_tiktok=blend_tiktok,
+        )
+    except Exception as exc:
+        logger.error("Vibe tag generation failed for location %s: %s", location_id, exc)
+
+
+async def _run_post_create_processing(
+    location_id: int,
+    google_place_id: str,
+    place_details: Dict[str, Any],
+    *,
+    generate_emoji: bool,
+    classify_photo: bool,
+    source: str,
+    process_synchronously: bool,
+) -> None:
+    blend_tiktok = source == "tiktok"
+
+    if generate_emoji:
+        async def _emoji_job(place_snapshot: Dict[str, Any] = place_details) -> None:
+            await _run_emoji_generation(location_id, place_snapshot)
+
+        await _schedule_or_run_location_job(
+            f"location:{location_id}:emoji",
+            _emoji_job,
+            process_synchronously=process_synchronously,
+        )
+
+    if classify_photo:
+        photos_from_details: List[Dict[str, Any]] = place_details.get("photos") or []
+
+        async def _photo_job(photo_snapshot: List[Dict[str, Any]] = photos_from_details) -> None:
+            await _run_photo_pipeline(location_id, photo_snapshot)
+
+        await _schedule_or_run_location_job(
+            f"location:{location_id}:photos",
+            _photo_job,
+            process_synchronously=process_synchronously,
+        )
+
+    async def _menu_vibe_job(place_snapshot: Dict[str, Any] = place_details) -> None:
+        await _run_menu_then_vibe(
+            location_id,
+            google_place_id,
+            place_snapshot,
+            blend_tiktok=blend_tiktok,
+        )
+
+    await _schedule_or_run_location_job(
+        f"location:{location_id}:menu-vibe",
+        _menu_vibe_job,
+        process_synchronously=process_synchronously,
+    )
+
+
+async def _run_new_location_enrichment(
+    location_id: int,
+    google_place_id: str,
+    *,
+    generate_emoji: bool,
+    classify_photo: bool,
+    source: str,
+) -> None:
+    place_details = await asyncio.to_thread(
+        refresh_location_from_google_place_details,
+        location_id,
+        google_place_id,
+    )
+    if not place_details:
+        logger.error(
+            "Full details enrichment failed for location %s (%s)",
+            location_id,
+            google_place_id,
+        )
+        return
+
+    await _run_post_create_processing(
+        location_id,
+        google_place_id,
+        place_details,
+        generate_emoji=generate_emoji,
+        classify_photo=classify_photo,
+        source=source,
+        process_synchronously=False,
+    )
+
+
+async def _run_vibe_reprocessing(
+    location_id: int,
+    *,
+    num_runs: int,
+    blend_tiktok: bool,
+) -> None:
+    from pinit.api.services.vibe_tagging import generate_vibe_tags_for_location
+
+    await generate_vibe_tags_for_location(
+        location_id,
+        num_runs=num_runs,
+        blend_tiktok=blend_tiktok,
+    )
+
+
 @router.post("/locations/add", response_model=AddLocationResponse)
 async def add_location_by_place_id(request: AddLocationRequest) -> AddLocationResponse:
     """
     Add or process a location by Google Place ID, with source-aware behaviour.
 
     Source-aware flow:
-    - **New location** (not in DB): Fetch Google Place Details → create row →
-      run full processing (emoji, photos, menu, vibe tagging). If source is
-      'tiktok', also blend video_insights into the vibe vector.
+    - **New location** (not in DB): Default path fetches basic Google Place
+      details, creates a row quickly, then queues the heavy enrichment work on
+      background workers. If ``process_synchronously=true``, it instead runs the
+      full enrichment pipeline inline before returning.
     - **Existing + source='tiktok'**: Always re-process vibe tagging with
       TikTok vibe blending (aggregates ALL video_insights rows for this
       location). Also updates reccomended_dishes with top 3 key_dishes.
@@ -1075,324 +1429,105 @@ async def add_location_by_place_id(request: AddLocationRequest) -> AddLocationRe
     """
     supabase = get_supabase_service()
     source = (request.source or "in-app").lower().strip()
+    process_synchronously = bool(request.process_synchronously)
+    request_id = str(uuid4())
 
-    # Step 1: Check if location already exists
-    existing_location = supabase.get_location_by_google_place_id(request.google_place_id)
+    existing_location = await asyncio.to_thread(
+        supabase.get_location_by_google_place_id,
+        request.google_place_id,
+    )
 
+    created_new = False
     if existing_location:
         location_id = existing_location["location_id"]
-        updated_vibe = existing_location.get("updated_vibe") or False
-
-        # ── Existing + TikTok/Instagram: upsert insights then blend ──────────
-        if source in ("tiktok", "instagram"):
-            import asyncio
-            from pinit.api.services.vibe_tagging import generate_vibe_tags_for_location
-
-            # Upsert video_insights BEFORE kicking off the blend so the
-            # vibe tagging pipeline has data to read.
-            if request.video_insights:
-                vi = request.video_insights
-                try:
-                    supabase.client.table("video_insights").upsert(
-                        {
-                            "source_video_url": vi.source_video_url,
-                            "location_id": location_id,
-                            "key_dishes": vi.key_dishes or [],
-                            "special_offers": vi.special_offers or [],
-                            "creator_notes": vi.creator_notes,
-                            "vibe_signals": vi.vibe_signals or {},
-                            "sentiment": vi.sentiment,
-                            "creator_handle": vi.creator_handle,
-                            "video_description": vi.video_description,
-                            "extraction_model": vi.extraction_model or "gpt-4o-mini",
-                        },
-                        on_conflict="source_video_url,location_id",
-                    ).execute()
-                    logger.info("Upserted video_insights for location %s before blend", location_id)
-                except Exception as exc:
-                    logger.warning("video_insights upsert failed for %s: %s", location_id, exc)
-
-            has_summary = existing_location.get("generated_summary")
-            num_runs = 5 if has_summary else 1
-
-            asyncio.create_task(
-                generate_vibe_tags_for_location(
-                    location_id, num_runs=num_runs, blend_tiktok=True,
-                )
-            )
-            logger.info(
-                "Existing location %s — %s source: kicked off vibe tagging "
-                "with video_insights blending (num_runs=%d)",
-                location_id, source, num_runs,
+        already_existed = True
+        updated_vibe = bool(existing_location.get("updated_vibe") or False)
+        existing_name = existing_location.get("name")
+    else:
+        already_existed = False
+        updated_vibe = False
+        existing_name = None
+        basic_place_details = await asyncio.to_thread(
+            fetch_google_place_basic_details,
+            request.google_place_id,
+        )
+        if not basic_place_details:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Could not fetch basic details for Google Place ID: {request.google_place_id}",
             )
 
-            return AddLocationResponse(
-                success=True,
-                message="Location exists; TikTok vibe reprocessing started",
-                location_id=location_id,
-                google_place_id=request.google_place_id,
-                name=existing_location.get("name"),
-                tags_count=None,
-                already_existed=True,
+        created_location = await asyncio.to_thread(
+            create_location_from_place_details,
+            basic_place_details,
+        )
+        if not created_location:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Could not create location for Google Place ID: {request.google_place_id}",
             )
 
-        # ── Existing + in-app / instagram: re-process only if no vibe yet ──
-        if not updated_vibe:
-            import asyncio
-            from pinit.api.services.vibe_tagging import generate_vibe_tags_for_location
+        created_new = True
+        location_id = created_location["location_id"]
+        existing_name = basic_place_details.get("name")
 
-            has_summary = existing_location.get("generated_summary")
-            num_runs = 5 if has_summary else 1
+    # Keep video_insights synchronous (no Pub/Sub task).
+    if request.video_insights and source in ("tiktok", "instagram"):
+        try:
+            await _upsert_video_insights_for_location(location_id, request.video_insights)
+        except Exception as exc:
+            logger.warning("video_insights upsert failed for %s: %s", location_id, exc)
 
-            asyncio.create_task(
-                generate_vibe_tags_for_location(location_id, num_runs=num_runs)
-            )
-            logger.info(
-                "Existing location %s — updated_vibe=%s: kicked off vibe tagging (num_runs=%d)",
-                location_id, updated_vibe, num_runs,
-            )
+    pipeline_payload = PipelinePayload(
+        task_type="pipeline",
+        request_id=request_id,
+        location_id=location_id,
+        google_place_id=request.google_place_id,
+        source=source,
+        generate_emoji=bool(request.generate_emoji),
+        classify_photo=bool(request.classify_photo),
+        created_new=created_new,
+    )
 
-            return AddLocationResponse(
-                success=True,
-                message="Location exists; vibe reprocessing started (was unprocessed)",
-                location_id=location_id,
-                google_place_id=request.google_place_id,
-                name=existing_location.get("name"),
-                tags_count=None,
-                already_existed=True,
-            )
-
-        # ── Existing + already vibed: nothing to do ──
+    if process_synchronously:
+        await run_pipeline_inline(pipeline_payload)
+        updated_location = await asyncio.to_thread(supabase.get_location, location_id) or {}
         return AddLocationResponse(
             success=True,
-            message="Location already exists in database",
+            message="Location processed synchronously",
             location_id=location_id,
             google_place_id=request.google_place_id,
-            name=existing_location.get("name"),
-            tags_count=None,
-            already_existed=True,
-        )
-
-    # ── New location: fetch from Google Places API ──
-    place_details = fetch_google_place_details(request.google_place_id)
-
-    if not place_details:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Could not fetch details for Google Place ID: {request.google_place_id}",
-        )
-
-    location_id = place_details["location_id"]
-    try:
-        # Step 4: Generate emoji if requested
-        emoji = None
-        if request.generate_emoji:
-            emoji = add_location_emoji(place_details)
-            if emoji:
-                supabase.update_location(location_id, emoji=emoji)
-                logger.info("Added emoji '%s' for location %s", emoji, location_id)
-
-        # Step 5: Kick off background tasks (photo classification, menu processing, vibe tagging)
-        import asyncio
-        from pinit.api.services.vibe_tagging import generate_vibe_tags_for_location
-
-        # Background: pull up to 10 photos from the Places v1 photo names,
-        # upload them to the location_photos bucket, and atomically record
-        # state via the mark_location_* RPCs so the /get_locations_with_quality
-        # cache-hit contract is upheld (photos jsonb must be written whenever
-        # image_stored flips to true).
-        if request.classify_photo:
-            photos_from_details: List[Dict[str, Any]] = place_details.get("photos") or []
-
-            async def _fetch_and_upload_photos() -> None:
-                bg_supabase = get_supabase_service()
-                try:
-                    from pinit.api.services.proximal_service import download_photo
-
-                    if not photos_from_details:
-                        logger.warning(
-                            "No photos returned by Places API for location %s — marking image_unavailable",
-                            location_id,
-                        )
-                        try:
-                            bg_supabase.mark_location_image_unavailable(location_id)
-                        except Exception as exc:
-                            logger.error(
-                                "mark_location_image_unavailable failed for %s: %s",
-                                location_id, exc,
-                            )
-                        return
-
-                    # --- Primary photo ({location_id}.jpg) ---
-                    primary = photos_from_details[0]
-                    primary_name = primary.get("name") if isinstance(primary, dict) else None
-                    if not primary_name:
-                        logger.warning(
-                            "First photo for location %s has no resource name — marking image_unavailable",
-                            location_id,
-                        )
-                        try:
-                            bg_supabase.mark_location_image_unavailable(location_id)
-                        except Exception as exc:
-                            logger.error(
-                                "mark_location_image_unavailable failed for %s: %s",
-                                location_id, exc,
-                            )
-                        return
-
-                    primary_dl = download_photo(primary_name, GOOGLE_PLACE_API_KEY)
-                    if primary_dl is None:
-                        logger.error(
-                            "Primary photo download failed for location %s (name=%s)",
-                            location_id, primary_name,
-                        )
-                        return
-
-                    primary_bytes, primary_ct = primary_dl
-                    try:
-                        bg_supabase.upload_location_photo(
-                            location_id,
-                            primary_bytes,
-                            content_type=primary_ct,
-                            index=None,
-                        )
-                    except Exception as exc:
-                        logger.error(
-                            "Primary photo upload failed for location %s: %s",
-                            location_id, exc,
-                        )
-                        return
-
-                    try:
-                        bg_supabase.mark_location_image_uploaded(
-                            location_id=location_id,
-                            photos=photos_from_details,
-                            photo_reference=primary_name,
-                        )
-                    except Exception as exc:
-                        logger.error(
-                            "mark_location_image_uploaded failed for location %s: %s",
-                            location_id, exc,
-                        )
-                        # Primary is in the bucket, just row state didn't flip —
-                        # don't proceed to extras (the client will still hit
-                        # Google for photos until state is flipped).
-                        return
-
-                    # --- Extras ({location_id}_1.jpg .. _{N}.jpg, up to 9) ---
-                    # Capped at 10 total photos per the product spec.
-                    extras = photos_from_details[1:10]
-                    extras_uploaded = 0
-                    for idx, extra in enumerate(extras, start=1):
-                        extra_name = extra.get("name") if isinstance(extra, dict) else None
-                        if not extra_name:
-                            continue
-                        extra_dl = download_photo(extra_name, GOOGLE_PLACE_API_KEY)
-                        if extra_dl is None:
-                            logger.warning(
-                                "Extra photo %d download failed for location %s",
-                                idx, location_id,
-                            )
-                            continue
-                        extra_bytes, extra_ct = extra_dl
-                        try:
-                            bg_supabase.upload_location_photo(
-                                location_id,
-                                extra_bytes,
-                                content_type=extra_ct,
-                                index=idx,
-                            )
-                            extras_uploaded += 1
-                        except Exception as exc:
-                            logger.error(
-                                "Extra photo %d upload failed for location %s: %s",
-                                idx, location_id, exc,
-                            )
-
-                    if extras_uploaded > 0:
-                        try:
-                            bg_supabase.mark_location_extra_photos_stored(
-                                location_id, extras_uploaded
-                            )
-                        except Exception as exc:
-                            logger.error(
-                                "mark_location_extra_photos_stored failed for %s: %s",
-                                location_id, exc,
-                            )
-
-                    logger.info(
-                        "Photo pipeline complete for location %s: primary + %d extras",
-                        location_id, extras_uploaded,
-                    )
-
-                except Exception as exc:
-                    logger.error(
-                        "Background photo pipeline failed for location %s: %s",
-                        location_id, exc, exc_info=True,
-                    )
-
-            asyncio.create_task(_fetch_and_upload_photos())
-            logger.info(
-                "Kicked off background photo pipeline for location %s (%d photo names from Places)",
-                location_id, len(photos_from_details),
-            )
-
-        # Determine whether to blend TikTok signals for new locations too
-        blend_tiktok = source == "tiktok"
-
-        # Background: menu processing + vibe tagging
-        website = place_details.get("website")
-        if website:
-            from pinit.api.services.menu_processing import process_menu_for_location
-            cuisine_value = place_details.get("cuisine_primary", "") or ""
-
-            async def _menu_then_vibe() -> None:
-                try:
-                    result = await process_menu_for_location(
-                        location_id=location_id,
-                        google_place_id=request.google_place_id,
-                        website=website,
-                        restaurant_name=place_details.get("name", ""),
-                        cuisine_hint=cuisine_value,
-                        detect_cuisine=not cuisine_value,
-                    )
-                    has_summary = result and result.restaurant_description
-                    num_runs = 5 if has_summary else 1
-                except Exception as exc:
-                    logger.error("Menu processing failed for location %s: %s", location_id, exc)
-                    num_runs = 1
-
-                try:
-                    await generate_vibe_tags_for_location(
-                        location_id, num_runs=num_runs, blend_tiktok=blend_tiktok,
-                    )
-                except Exception as exc:
-                    logger.error("Vibe tag generation failed for location %s: %s", location_id, exc)
-
-            asyncio.create_task(_menu_then_vibe())
-            logger.info("Kicked off background menu processing + vibe tagging for location %s", location_id)
-        else:
-            asyncio.create_task(
-                generate_vibe_tags_for_location(
-                    location_id, num_runs=1, blend_tiktok=blend_tiktok,
-                )
-            )
-            logger.info("Kicked off background vibe tagging for location %s (no website)", location_id)
-
-        return AddLocationResponse(
-            success=True,
-            message="Location successfully added",
-            location_id=location_id,
-            google_place_id=request.google_place_id,
-            name=place_details.get("name"),
+            name=updated_location.get("name") or existing_name,
             tags_count=0,
-            already_existed=False,
-            emoji=emoji,
+            already_existed=already_existed,
+            emoji=updated_location.get("emoji"),
         )
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Error processing location: {exc}") from exc
+
+    # Async mode: publish to Pub/Sub (or fallback to in-process worker for local dev).
+    dispatcher = PubSubDispatcher() if get_pubsub_config().enabled else InProcessDispatcher()
+    await dispatcher.dispatch(pipeline_payload)
+
+    if created_new:
+        message = "Location successfully added; enrichment queued"
+    elif source in ("tiktok", "instagram"):
+        message = "Location exists; vibe reprocessing queued"
+    elif not updated_vibe:
+        message = "Location exists; vibe reprocessing queued"
+    else:
+        message = "Location already exists in database"
+
+    return AddLocationResponse(
+        success=True,
+        message=message,
+        location_id=location_id,
+        google_place_id=request.google_place_id,
+        name=existing_name,
+        tags_count=None,
+        already_existed=already_existed,
+        emoji=None,
+    )
+
+    # Note: errors above are raised as HTTPException to surface to clients.
 
 
 @router.post("/locations/magic-search", response_model=MagicSearchResponse)
@@ -1540,8 +1675,8 @@ async def magic_search(request: MagicSearchRequest) -> MagicSearchResponse:
             LocationRecommendation(
                 location_id=int(candidate["location_id"]),
                 name=candidate["name"],
-                vicinity=candidate.get("vicinity"),
-                cuisine_primary=candidate.get("cuisine_primary"),
+                vicinity=_safe_optional_str(candidate.get("vicinity")),
+                cuisine_primary=_safe_optional_str(candidate.get("cuisine_primary")),
                 rating=float(candidate["rating"]) if candidate.get("rating") is not None else None,
                 user_ratings_total=int(candidate["user_ratings_total"])
                 if candidate.get("user_ratings_total") is not None
@@ -1867,8 +2002,8 @@ async def get_bubble_recommendations(request: BubbleRequest) -> BubbleResponse:
             BubbleLocationRecommendation(
                 location_id=int(c["location_id"]),
                 name=c["name"],
-                vicinity=c.get("vicinity") if c.get("vicinity") is not None else None,
-                cuisine_primary=c.get("cuisine_primary"),
+                vicinity=_safe_optional_str(c.get("vicinity")),
+                cuisine_primary=_safe_optional_str(c.get("cuisine_primary")),
                 rating=_safe_optional_float(c.get("rating")),
                 user_ratings_total=_safe_optional_int(c.get("user_ratings_total")),
                 price_level=_safe_optional_float(c.get("price_level")),

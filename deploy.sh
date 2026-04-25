@@ -49,46 +49,59 @@ else
   exit 1
 fi
 
-# Build environment variables string (NON-SENSITIVE values only).
-# Sensitive values (service role key, API keys, redis password) come from
-# Secret Manager via --set-secrets below.
-ENV_VARS="SUPABASE_URL=${SUPABASE_URL}"
-
-# Redis configuration (optional - will use defaults if not set)
-if [ -n "$REDIS_HOST" ]; then
-  ENV_VARS+=",REDIS_HOST=${REDIS_HOST}"
+if [ -z "$SUPABASE_URL" ]; then
+  echo "❌ Error: SUPABASE_URL is not set in .env"
+  exit 1
 fi
 
-if [ -n "$REDIS_PORT" ]; then
-  ENV_VARS+=",REDIS_PORT=${REDIS_PORT}"
-fi
+build_env_vars_from_dotenv() {
+  local out=""
+  while IFS= read -r line || [ -n "$line" ]; do
+    # Skip comments/empty lines
+    case "$line" in
+      ""|\#*) continue ;;
+    esac
 
-if [ -n "$REDIS_DB" ]; then
-  ENV_VARS+=",REDIS_DB=${REDIS_DB}"
-fi
+    # Support "export KEY=VALUE"
+    line="${line#export }"
 
-if [ -n "$REDIS_SSL" ]; then
-  ENV_VARS+=",REDIS_SSL=${REDIS_SSL}"
-fi
+    if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)= ]]; then
+      local key="${BASH_REMATCH[1]}"
+      case "$key" in
+        # Bound via --set-secrets below (avoid duplicates)
+        SUPABASE_SERVICE_ROLE_KEY|GOOGLE_PLACE_API_KEY|REDIS_PASSWORD)
+          continue
+          ;;
+        # These are set explicitly per deploy (avoid duplicates)
+        GOOGLE_CLOUD_PROJECT|PUBSUB_ENABLED|PUBSUB_TOPIC_LOCATION_TASKS|PUBSUB_PROJECT_ID)
+          continue
+          ;;
+      esac
 
-if [ -n "$CACHING_ENABLED" ]; then
-  ENV_VARS+=",CACHING_ENABLED=${CACHING_ENABLED}"
-fi
+      local value="${!key}"
+      # Escape backslashes and commas for gcloud --set-env-vars
+      value="${value//\\/\\\\}"
+      value="${value//,/\\,}"
 
-if [ -n "$CACHE_LARGE_RADIUS_KM" ]; then
-  ENV_VARS+=",CACHE_LARGE_RADIUS_KM=${CACHE_LARGE_RADIUS_KM}"
-fi
+      out+="${out:+,}${key}=${value}"
+    fi
+  done < .env
+  echo "$out"
+}
 
-if [ -n "$CACHE_UNFILTERED_TTL" ]; then
-  ENV_VARS+=",CACHE_UNFILTERED_TTL=${CACHE_UNFILTERED_TTL}"
-fi
+# Pass all .env vars (except those set via --set-secrets and a few computed keys).
+ENV_VARS="$(build_env_vars_from_dotenv)"
 
-if [ -n "$CACHE_COORDINATE_PRECISION" ]; then
-  ENV_VARS+=",CACHE_COORDINATE_PRECISION=${CACHE_COORDINATE_PRECISION}"
+# Ensure Pub/Sub + project vars are always set explicitly (even if not in .env)
+ENV_VARS+="${ENV_VARS:+,}GOOGLE_CLOUD_PROJECT=${PROJECT_ID}"
+if [ -n "$PUBSUB_ENABLED" ]; then
+  ENV_VARS+=",PUBSUB_ENABLED=${PUBSUB_ENABLED}"
 fi
-
-if [ -n "$XAI_API_KEY" ]; then
-  ENV_VARS+=",XAI_API_KEY=${XAI_API_KEY}"
+if [ -n "$PUBSUB_TOPIC_LOCATION_TASKS" ]; then
+  ENV_VARS+=",PUBSUB_TOPIC_LOCATION_TASKS=${PUBSUB_TOPIC_LOCATION_TASKS}"
+fi
+if [ -n "$PUBSUB_PROJECT_ID" ]; then
+  ENV_VARS+=",PUBSUB_PROJECT_ID=${PUBSUB_PROJECT_ID}"
 fi
 
 # Secret Manager bindings: ENV_VAR=secret-name:version
