@@ -79,9 +79,10 @@ gcloud run deploy "${WORKER_SERVICE}" \
   --service-account "${RUN_SA}" \
   --no-allow-unauthenticated \
   --timeout 900 \
-  --cpu 2 \
-  --memory 2Gi \
-  --concurrency 1 \
+  --cpu 4 \
+  --memory 4Gi \
+  --concurrency 4 \
+  --max-instances 30 \
   --set-env-vars "${WORKER_ENV_VARS}" \
   --set-secrets "${SECRETS}" \
   --command uvicorn \

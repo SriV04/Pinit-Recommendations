@@ -564,12 +564,16 @@ def _build_location_write_data(place_details: Dict[str, Any]) -> Dict[str, Any]:
         else editorial_summary
     )
 
+    lat = geometry.get("lat")
+    lng = geometry.get("lng")
+
     return {
         "google_place_id": place_details.get("place_id"),
         "name": place_details.get("name"),
         "vicinity": place_details.get("vicinity"),
-        "lat": geometry.get("lat"),
-        "lng": geometry.get("lng"),
+        "lat": lat,
+        "lng": lng,
+        "geog": f"SRID=4326;POINT({lng} {lat})" if lat is not None and lng is not None else None,
         "types": ",".join(t.lower() for t in types_list) if types_list else None,
         "business_status": place_details.get("business_status"),
         "rating": place_details.get("rating"),
