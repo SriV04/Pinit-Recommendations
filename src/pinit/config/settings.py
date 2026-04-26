@@ -52,13 +52,54 @@ class ReviewTagConfig:
 
 @dataclass
 class RecommendationWeights:
-    """Base weights used when blending the different scoring components."""
+    """Base weights used when blending the different scoring components.
 
-    quality: float = 0.30
-    vibe: float = 0.25
-    dietary: float = 0.10
-    social: float = 0.20
-    collaborative: float = 0.15
+    The blend is split into two pillars:
+
+    APP signal (~0.80)              CATALOG signal (~0.20)
+      app_engagement   0.30           google_baseline  0.05
+      social           0.18           vibe             0.07
+      collaborative    0.12           dietary          0.08
+      video_insight    0.10
+      ────────                        ────────
+      0.70                            0.20
+
+    Plus an extra 0.10 buffer absorbed by share_boost (a *post*-blend
+    multiplier, not a weight in this sum). Weights are normalised to 1.0 at
+    use-time, so it's safe to bump any one without rebalancing the rest.
+
+    Keep these conservative — `share_boost` and `dietary_penalty` are the
+    teeth of the new system. The weights only allocate the smooth signal.
+    """
+
+    # APP-signal pillars
+    app_engagement: float = 0.30   # location_popularity_app saves/dislikes/been_to
+    social: float = 0.18           # friend graph
+    collaborative: float = 0.12    # item-item co-save similarity
+    video_insight: float = 0.10    # video_insights count + sentiment + creators
+
+    # CATALOG-signal pillars
+    google_baseline: float = 0.05  # Bayesian rating × log(reviews)
+    vibe: float = 0.07             # vibe_vector cosine
+    dietary: float = 0.08          # dietary_vector match (penalty applied separately)
+
+    # ── Backwards-compat fields ─────────────────────────────────────────
+    # Legacy callers passed a single `quality` weight. When supplied it's
+    # split 5:1 into app_engagement + google_baseline in __post_init__.
+    # After init `quality` always equals the SUM so reads keep working.
+    quality: Optional[float] = None
+    # Older taste/trend pipeline keys that some callers still pass via
+    # asdict() — accepted and ignored, kept on the instance so any code
+    # still reading them sees a 0.0 default.
+    trend_app: float = 0.0
+    hidden_gems: float = 0.0
+    taste: float = 0.0
+
+    def __post_init__(self) -> None:
+        if self.quality is not None:
+            self.app_engagement = self.quality * (5.0 / 6.0)
+            self.google_baseline = self.quality * (1.0 / 6.0)
+        self.quality = self.app_engagement + self.google_baseline
 
 
 @dataclass

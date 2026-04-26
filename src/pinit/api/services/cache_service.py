@@ -246,25 +246,39 @@ class ProximalCacheService:
                         cached_lat, cached_lng
                     )
 
-                    # Get cached radius
-                    cached_radius_km = data.get("cached_radius_km", 15.0)
+                    # Use the EFFECTIVE coverage radius (distance to the
+                    # farthest actually-cached candidate). The configured
+                    # search radius (`cached_radius_km`) is only an upper
+                    # bound — `LIMIT N nearest` truncates the result set
+                    # well before that in dense areas. Falling back to the
+                    # configured radius here would let a Notting-Hill cache
+                    # serve a Shoreditch request and return zero candidates
+                    # after the user-radius filter.
+                    configured_radius_km = data.get("cached_radius_km", 15.0)
+                    effective_radius_km = data.get("effective_radius_km")
+                    coverage_radius_km = (
+                        effective_radius_km
+                        if effective_radius_km is not None
+                        else configured_radius_km
+                    )
 
-                    # Cache hit if request area is fully covered by cached area
-                    # Formula: distance + request_radius <= cached_radius
-                    # This ensures all locations within request radius are in cache
-                    max_allowed_distance = cached_radius_km - request_radius_km
+                    # Cache hit only if request area is fully inside the
+                    # effective coverage of the cached payload.
+                    max_allowed_distance = coverage_radius_km - request_radius_km
 
                     if distance_to_cache <= max_allowed_distance:
                         num_candidates = data.get("total_count", 0)
                         logger.info(
                             "✅ CACHE HIT at (%.4f, %.4f), "
                             "using cached data from (%.4f, %.4f) [%.2f km away], "
-                            "request_radius=%.1f km, cached_radius=%.1f km, max_allowed_distance=%.1f km",
+                            "request_radius=%.1f km, effective_coverage=%.1f km "
+                            "(configured=%.1f km), max_allowed_distance=%.1f km",
                             center_lat, center_lng,
                             cached_lat, cached_lng,
                             distance_to_cache,
                             request_radius_km,
-                            cached_radius_km,
+                            coverage_radius_km,
+                            configured_radius_km,
                             max_allowed_distance,
                         )
                         logger.info("📦 Retrieved from cache: %d candidates (user-agnostic)", num_candidates)
@@ -329,11 +343,35 @@ class ProximalCacheService:
             # Build cache key (user-agnostic)
             cache_key = self._build_cache_key(center_lat, center_lng)
 
+            # Compute the EFFECTIVE coverage radius: the distance to the
+            # farthest cached candidate. The SQL fetch is `LIMIT N nearest`,
+            # so in dense areas the actual coverage is much smaller than the
+            # configured `large_radius_km`. Using the effective radius for
+            # hit checks prevents us serving a Notting-Hill-centred payload
+            # to a Shoreditch request just because both are within 15 km.
+            effective_radius_km: float = 0.0
+            if candidates:
+                distances = [
+                    float(c["distance_km"])
+                    for c in candidates
+                    if isinstance(c.get("distance_km"), (int, float))
+                ]
+                if distances:
+                    effective_radius_km = max(distances)
+
+            # Cap at the configured search radius (we never claim more
+            # coverage than we asked the DB for).
+            effective_radius_km = min(
+                effective_radius_km or self.config.large_radius_km,
+                self.config.large_radius_km,
+            )
+
             # Prepare cache value (store EXACT coordinates for distance-based lookup)
             cache_value = {
                 "center_lat": center_lat,      # Store exact, not snapped
                 "center_lng": center_lng,      # Store exact, not snapped
                 "cached_radius_km": self.config.large_radius_km,
+                "effective_radius_km": effective_radius_km,
                 "candidates": candidates,
                 "total_count": len(candidates),
                 "cached_at": datetime.utcnow().isoformat(),

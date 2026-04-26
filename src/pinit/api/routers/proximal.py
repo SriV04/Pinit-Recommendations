@@ -304,9 +304,18 @@ def _rank_cached_candidates(
     cuisine_filters: Optional[List[str]] = None,
     vibe_filters: Optional[List[str]] = None,
     user_id: Optional[str] = None,
-    social_weight: float = 0.20,
-    collaborative_weight: float = 0.15,
+    social_weight: float = 0.18,
+    collaborative_weight: float = 0.12,
     group_context: Optional[Dict[str, Any]] = None,
+    *,
+    # New v4 pillar weights — keyword-only so existing callers keep working
+    # by treating the legacy `quality_weight` as the SUM of these two.
+    app_engagement_weight: Optional[float] = None,
+    google_baseline_weight: Optional[float] = None,
+    video_insight_weight: float = 0.10,
+    cuisine_diversity_lambda: float = 0.7,
+    enable_seen_decay: bool = True,
+    enable_rank_jitter: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     Apply filtering and ranking to cached candidates using 5-component scoring.
@@ -336,6 +345,19 @@ def _rank_cached_candidates(
     from pinit.core.recommendation.vector_utils import centered_cosine_similarity, dot_product
     from pinit.core.recommendation.social_scoring import compute_social_scores
     from pinit.core.recommendation.collaborative_scoring import compute_collaborative_scores
+    from pinit.core.recommendation.dietary_scoring import (
+        compute_dietary_match,
+        compute_dietary_penalty,
+    )
+    from pinit.core.recommendation.share_boost import compute_share_boost
+    from pinit.core.recommendation.diversity import diversify
+
+    # Resolve v4 pillar weights from the legacy single quality_weight if the
+    # caller hasn't supplied the split values explicitly.
+    if app_engagement_weight is None:
+        app_engagement_weight = quality_weight * (5.0 / 6.0)
+    if google_baseline_weight is None:
+        google_baseline_weight = quality_weight * (1.0 / 6.0)
 
     supabase = get_supabase_service()
 
@@ -451,14 +473,18 @@ def _rank_cached_candidates(
     weights = compute_adaptive_weights(
         has_friends=has_friends,
         action_count=action_count,
-        quality_w=quality_weight,
+        app_engagement_w=app_engagement_weight,
+        google_baseline_w=google_baseline_weight,
+        video_insight_w=video_insight_weight,
         vibe_w=vibe_weight,
         dietary_w=dietary_weight,
         social_w=effective_social_w,
         collaborative_w=effective_collab_w,
     )
 
-    w_quality = weights["quality"]
+    w_app_engagement = weights["app_engagement"]
+    w_google_baseline = weights["google_baseline"]
+    w_video_insight = weights["video_insight"]
     w_vibe = weights["vibe"]
     w_dietary = weights["dietary"]
     w_social = weights["social"]
@@ -490,10 +516,25 @@ def _rank_cached_candidates(
         loc_vibe_vec = candidate.get("vibe_vector")
         loc_dietary_vec = candidate.get("dietary_requirement_vector")
 
-        quality_score = candidate.get("quality_score", 0.0)
+        # Pillar scores precomputed by v4 SQL. Old caches that predate v4
+        # still have a `quality_score` — split it 5:1 across the two
+        # replacement pillars so blending stays sensible.
+        app_engagement = candidate.get("app_engagement_score")
+        google_baseline = candidate.get("google_baseline_score")
+        video_insight = float(candidate.get("video_insight_score") or 0.0)
+        share_count = int(candidate.get("share_count") or 0)
+
+        if app_engagement is None and google_baseline is None:
+            legacy_quality = float(candidate.get("quality_score") or 0.0)
+            app_engagement = legacy_quality * (5.0 / 6.0)
+            google_baseline = legacy_quality * (1.0 / 6.0)
+        else:
+            app_engagement = float(app_engagement or 0.0)
+            google_baseline = float(google_baseline or 0.0)
 
         vibe_score = 0.0
         dietary_score = 0.0
+        dietary_penalty = 1.0
         individual_vibe_scores: List[Dict[str, Any]] = []
 
         if is_group_mode:
@@ -503,14 +544,20 @@ def _rank_cached_candidates(
                     list(group_vibe_vec_local), loc_vibe_vec
                 )
 
-            # ── group dietary: MAX of per-user dot products
+            # ── group dietary: MAX match, MIN penalty across users.
+            # MIN penalty: if any group member would be hard-mismatched,
+            # the place is penalised for the whole group.
             if user_dietary_vectors and loc_dietary_vec:
-                per_user = []
+                per_user_match = []
+                per_user_penalty = []
                 for uid, uvec in user_dietary_vectors.items():
                     if uvec:
-                        per_user.append(dot_product(uvec, loc_dietary_vec))
-                if per_user:
-                    dietary_score = max(per_user)
+                        per_user_match.append(compute_dietary_match(uvec, loc_dietary_vec))
+                        per_user_penalty.append(compute_dietary_penalty(uvec, loc_dietary_vec))
+                if per_user_match:
+                    dietary_score = max(per_user_match)
+                if per_user_penalty:
+                    dietary_penalty = min(per_user_penalty)
 
             # ── per-user vibe breakdown using each user's effective vector
             if loc_vibe_vec:
@@ -522,36 +569,56 @@ def _rank_cached_candidates(
                         ),
                     })
         else:
-            # Original proximal flow — single user
+            # Single-user proximal flow
             if user_id:
                 if user_vibe_vec and loc_vibe_vec:
                     vibe_score = centered_cosine_similarity(user_vibe_vec, loc_vibe_vec)
                 if user_dietary_vec and loc_dietary_vec:
-                    dietary_score = dot_product(user_dietary_vec, loc_dietary_vec)
+                    dietary_score = compute_dietary_match(user_dietary_vec, loc_dietary_vec)
+                    dietary_penalty = compute_dietary_penalty(user_dietary_vec, loc_dietary_vec)
 
         social_score = social_scores.get(loc_id, 0.0)
         collaborative_score = collab_scores.get(loc_id, 0.0)
 
-        final_score = (
-            w_quality * quality_score +
-            w_vibe * vibe_score +
-            w_dietary * dietary_score +
-            w_social * social_score +
-            w_collab * collaborative_score
+        blended = (
+            w_app_engagement  * app_engagement +
+            w_google_baseline * google_baseline +
+            w_video_insight   * video_insight +
+            w_vibe            * vibe_score +
+            w_dietary         * dietary_score +
+            w_social          * social_score +
+            w_collab          * collaborative_score
         )
+        share_boost = compute_share_boost(share_count, video_insight)
+
+        # Fill-set demotion: locations without a `location_popularity_app`
+        # entry have no real engagement signal yet. They're included as
+        # geographic fill but should rank below known places at parity.
+        # 0.6 multiplier keeps them visible (so genuinely better fills can
+        # still surface) but pushes them out of the top slots when known
+        # places are competitive.
+        has_app_signal = bool(candidate.get("has_app_signal", True))
+        fill_factor = 1.0 if has_app_signal else 0.6
+        final_score = blended * dietary_penalty * share_boost * fill_factor
 
         scored_candidates.append({
             **candidate,
             "vibe_score": vibe_score,
             "dietary_score": dietary_score,
-            "quality_score": quality_score,
+            "dietary_penalty": dietary_penalty,
+            "app_engagement_score": app_engagement,
+            "google_baseline_score": google_baseline,
+            "video_insight_score": video_insight,
+            "share_count": share_count,
+            "share_boost": share_boost,
+            "has_app_signal": has_app_signal,
+            "fill_factor": fill_factor,
+            "quality_score": app_engagement + google_baseline,  # legacy
             "social_score": social_score,
             "collaborative_score": collaborative_score,
             "final_score": final_score,
             "friend_saves": friend_attributions.get(loc_id),
             "weights_used": weights,
-            # Group-mode-only fields (always present so the bubble endpoint
-            # can read them; empty list and False for proximal).
             "individual_vibe_scores": individual_vibe_scores,
             "is_in_bubble": loc_id in bubble_location_ids,
         })
@@ -584,6 +651,31 @@ def _rank_cached_candidates(
                 c["final_score"] = c.get("final_score", 0.0) + bubble_boost
         diverse_candidates.sort(
             key=lambda x: x.get("final_score", 0.0), reverse=True
+        )
+
+    # Step 7c: Per-user diversity — recently-seen decay + cuisine MMR.
+    # Skipped in group mode (the group already diversifies via top-tags
+    # and a bubble may legitimately want repeat picks).
+    if not is_group_mode and user_id:
+        seen_history: Dict[int, Any] = {}
+        if enable_seen_decay:
+            try:
+                seen_history = supabase.get_recent_recommendation_timestamps(
+                    user_id, [c.get("location_id") for c in diverse_candidates]
+                )
+            except AttributeError:
+                # Helper not yet implemented on SupabaseService.
+                seen_history = {}
+            except Exception:
+                logger.exception("Failed to fetch seen_history; skipping decay")
+                seen_history = {}
+
+        diverse_candidates = diversify(
+            diverse_candidates,
+            seen_history=seen_history,
+            user_id=user_id,
+            cuisine_lambda=cuisine_diversity_lambda,
+            enable_jitter=enable_rank_jitter,
         )
 
     # Step 8: Assign ranks
