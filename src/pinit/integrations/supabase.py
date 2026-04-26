@@ -214,6 +214,77 @@ class SupabaseService:
         )
         return []
 
+    def fetch_lpa_snapshot_rows(self) -> List[Dict[str, Any]]:
+        """
+        Bulk-fetch every `location_popularity_app` row joined to the slim
+        `locations` columns the ranker needs.
+
+        With LPA <1000 rows this is one egress per snapshot refresh, then
+        every request reads from Redis. Returns empty list on error so the
+        snapshot job can retry; callers fall back to per-request DB lookups.
+        """
+        logger = logging.getLogger(__name__)
+        try:
+            # Single embedded-select query: PostgREST joins lp → locations.
+            response = (
+                self.client.table("location_popularity_app")
+                .select(
+                    "location_id,saves_count,dislikes_count,been_to_count,"
+                    "share_count,app_engagement_score,google_baseline_score,"
+                    "video_insight_score,"
+                    "locations(name,vicinity,lat,lng,cuisine,cuisine_primary,"
+                    "rating,user_ratings_total,price_level,types,emoji,"
+                    "vibe_vector,dietary_requirement_vector,google_place_id)"
+                )
+                .execute()
+            )
+            rows = response.data or []
+            flat: List[Dict[str, Any]] = []
+            for row in rows:
+                loc = row.pop("locations", None) or {}
+                merged = {**row, **loc}
+                # has_app_signal=True for everything in this snapshot by definition
+                merged["has_app_signal"] = True
+                flat.append(merged)
+            logger.info("LPA snapshot fetch: %d rows", len(flat))
+            return flat
+        except Exception as exc:
+            logger.error("Error fetching LPA snapshot rows: %s", exc)
+            return []
+
+    def get_fill_locations(
+        self,
+        latitude: float,
+        longitude: float,
+        radius_km: float,
+        limit: int = 1000,
+    ) -> List[Dict[str, Any]]:
+        """
+        Spatial query for `locations` rows that are NOT in `location_popularity_app`.
+
+        Used as the fill_set when the LPA snapshot covers the primary set.
+        Calls a thin RPC that does the same `NOT EXISTS` filter as
+        `get_locations_with_pillars` but skips the engaged-places branch.
+        """
+        logger = logging.getLogger(__name__)
+        radius_meters = radius_km * 1000
+        params = {
+            "center_lat": latitude,
+            "center_lng": longitude,
+            "radius_meters": radius_meters,
+            "result_limit": limit,
+        }
+        try:
+            response = self.client.rpc("get_fill_locations", params).execute()
+            return response.data or []
+        except Exception as exc:
+            logger.warning(
+                "get_fill_locations RPC unavailable (%s); falling back to "
+                "get_locations_with_pillars and discarding the primary set",
+                exc,
+            )
+            return []
+
     def get_bubble_added_locations(self, bubble_id: str) -> List[Dict[str, Any]]:
         """
         Fetch every location added to a bubble along with the user who added

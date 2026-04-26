@@ -643,6 +643,218 @@ class ProximalCacheService:
             logger.error("Unexpected error getting cache stats: %s", exc)
             return {"status": "error", "error": str(exc)}
 
+    # ============================================================================
+    # LPA snapshot — global cache of all `location_popularity_app` rows joined
+    # to slim `locations` columns. <1000 rows fits in ~50 KB compressed; one
+    # global key replaces per-cell PostGIS queries for the engaged-places set.
+    # ============================================================================
+
+    LPA_SNAPSHOT_KEY = "lpa:snapshot:v1"
+    LPA_SNAPSHOT_TTL = 600  # 10 min — reader falls back to DB if expired
+
+    def get_lpa_snapshot(self) -> Optional[List[Dict[str, Any]]]:
+        """Read the global engaged-places snapshot. Returns None on miss."""
+        if not self.is_available:
+            return None
+        try:
+            raw = self._redis_client.get(self.LPA_SNAPSHOT_KEY)
+            if raw is None:
+                return None
+            data = self._decompress_data(raw)
+            candidates = data.get("candidates") if isinstance(data, dict) else None
+            if not candidates:
+                return None
+            logger.info(
+                "📦 LPA snapshot hit: %d engaged places (cached_at=%s)",
+                len(candidates),
+                data.get("cached_at"),
+            )
+            return candidates
+        except RedisError as exc:
+            logger.warning("Redis error reading LPA snapshot: %s", exc)
+            return None
+        except Exception as exc:
+            logger.warning("Unexpected error reading LPA snapshot: %s", exc)
+            return None
+
+    def set_lpa_snapshot(self, candidates: List[Dict[str, Any]]) -> bool:
+        """Write the global engaged-places snapshot."""
+        if not self.is_available:
+            return False
+        try:
+            payload = {
+                "candidates": candidates,
+                "total_count": len(candidates),
+                "cached_at": datetime.utcnow().isoformat(),
+            }
+            self._redis_client.setex(
+                self.LPA_SNAPSHOT_KEY,
+                self.LPA_SNAPSHOT_TTL,
+                self._compress_data(payload),
+            )
+            logger.info(
+                "✅ LPA snapshot cached: %d engaged places, ttl=%ds",
+                len(candidates),
+                self.LPA_SNAPSHOT_TTL,
+            )
+            return True
+        except RedisError as exc:
+            logger.error("Redis error writing LPA snapshot: %s", exc)
+            return False
+        except Exception as exc:
+            logger.error("Unexpected error writing LPA snapshot: %s", exc)
+            return False
+
+    def filter_lpa_snapshot_by_radius(
+        self,
+        candidates: List[Dict[str, Any]],
+        center_lat: float,
+        center_lng: float,
+        radius_km: float,
+    ) -> List[Dict[str, Any]]:
+        """
+        In-memory haversine filter over the LPA snapshot.
+
+        With <1000 rows, this is a microsecond-level Python loop — no need
+        for spatial indexes. Returns a list of dicts with `distance_km`
+        annotated, sorted by distance ascending.
+        """
+        if not candidates:
+            return []
+        out: List[Dict[str, Any]] = []
+        for c in candidates:
+            lat = c.get("lat")
+            lng = c.get("lng")
+            if lat is None or lng is None:
+                continue
+            try:
+                d = self._haversine_distance(center_lat, center_lng, float(lat), float(lng))
+            except (TypeError, ValueError):
+                continue
+            if d <= radius_km:
+                row = dict(c)
+                row["distance_km"] = d
+                out.append(row)
+        out.sort(key=lambda r: r["distance_km"])
+        return out
+
+    def invalidate_lpa_snapshot(self) -> bool:
+        """Drop the LPA snapshot — call after an action insert or LPA write."""
+        if not self.is_available:
+            return False
+        try:
+            self._redis_client.delete(self.LPA_SNAPSHOT_KEY)
+            return True
+        except RedisError:
+            return False
+
+    # ============================================================================
+    # User profile cache — bundles vibe/dietary vectors, friend graph, and
+    # action count into one Redis key. Saves ~4 Supabase round-trips per
+    # request on the warm-cache path.
+    # ============================================================================
+
+    USER_PROFILE_TTL = 600  # 10 min
+
+    def _user_profile_key(self, user_id: str) -> str:
+        return f"user:profile:v1:{user_id}"
+
+    def get_user_profile(self, user_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Returns the bundled profile dict or None on miss.
+
+        Shape: {
+            "user_id": str,
+            "vibe_vector": List[int] | None,
+            "dietary_vector": List[int] | None,
+            "action_count": int,
+            "friends": [{"friend_id": ..., "influence": ...}, ...],
+        }
+        """
+        if not self.is_available:
+            return None
+        try:
+            raw = self._redis_client.get(self._user_profile_key(user_id))
+            if raw is None:
+                return None
+            return self._decompress_data(raw)
+        except RedisError as exc:
+            logger.warning("Redis error reading user profile %s: %s", user_id, exc)
+            return None
+        except Exception as exc:
+            logger.warning("Unexpected error reading user profile %s: %s", user_id, exc)
+            return None
+
+    def set_user_profile(self, user_id: str, profile: Dict[str, Any]) -> bool:
+        """Write the bundled profile to Redis."""
+        if not self.is_available:
+            return False
+        try:
+            self._redis_client.setex(
+                self._user_profile_key(user_id),
+                self.USER_PROFILE_TTL,
+                self._compress_data(profile),
+            )
+            return True
+        except RedisError as exc:
+            logger.error("Redis error writing user profile %s: %s", user_id, exc)
+            return False
+        except Exception as exc:
+            logger.error("Unexpected error writing user profile %s: %s", user_id, exc)
+            return False
+
+    def invalidate_user_profile(self, user_id: str) -> bool:
+        """Drop the user profile cache — call after profile/friend edits."""
+        if not self.is_available:
+            return False
+        try:
+            self._redis_client.delete(self._user_profile_key(user_id))
+            return True
+        except RedisError:
+            return False
+
+    def get_or_build_user_profile(
+        self, user_id: str, supabase: Any
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Return the cached user profile if hot, otherwise build it from
+        Supabase and cache. Single entry-point for the request path.
+
+        Bundles four queries that previously ran on every request:
+          - users (full row, for existence check + vectors)
+          - users (slim, for vectors)
+          - user_friends (ids + influence)
+          - user_location_actions (count)
+        """
+        cached = self.get_user_profile(user_id)
+        if cached is not None:
+            return cached
+
+        user_data = supabase.get_user(user_id)
+        if not user_data:
+            return None
+
+        try:
+            friends = supabase.get_user_friends(user_id) or []
+        except Exception:
+            friends = []
+
+        try:
+            action_count = supabase.get_user_action_count(user_id)
+        except Exception:
+            action_count = 0
+
+        profile = {
+            "user_id": user_id,
+            "vibe_vector": user_data.get("vibe_tag_affinity"),
+            "dietary_vector": user_data.get("dietary_requirement_tag_affinity"),
+            "action_count": action_count,
+            "friends": friends,
+            "exists": True,
+        }
+        self.set_user_profile(user_id, profile)
+        return profile
+
 
 # Singleton instance
 _cache_service: Optional[ProximalCacheService] = None

@@ -316,6 +316,9 @@ def _rank_cached_candidates(
     cuisine_diversity_lambda: float = 0.7,
     enable_seen_decay: bool = True,
     enable_rank_jitter: bool = False,
+    # Bundled user profile from cache_service. Avoids per-request
+    # round-trips for vectors / friends / action_count.
+    user_profile: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Apply filtering and ranking to cached candidates using 5-component scoring.
@@ -380,15 +383,20 @@ def _rank_cached_candidates(
     #   }
     is_group_mode = group_context is not None
 
-    # Fetch user vectors if user_id is provided (slim query - only vector columns)
+    # User vectors come from the bundled profile when available; fall back
+    # to a slim DB query for legacy callers (group mode, batch endpoint).
     user_vibe_vec = None
     user_dietary_vec = None
     vibe_tag_order = supabase.vibe_tag_order  # used by diversification in both modes
     if user_id and not is_group_mode:
-        user_data = supabase.get_user_vectors(user_id)
-        if user_data:
-            user_vibe_vec = user_data.get("vibe_tag_affinity")
-            user_dietary_vec = user_data.get("dietary_requirement_tag_affinity")
+        if user_profile is not None:
+            user_vibe_vec = user_profile.get("vibe_vector")
+            user_dietary_vec = user_profile.get("dietary_vector")
+        else:
+            user_data = supabase.get_user_vectors(user_id)
+            if user_data:
+                user_vibe_vec = user_data.get("vibe_tag_affinity")
+                user_dietary_vec = user_data.get("dietary_requirement_tag_affinity")
 
     # Step 1: Filter by cuisine and vibe tags if specified
     filtered_candidates = _filter_candidates_by_tags(
@@ -458,8 +466,11 @@ def _rank_cached_candidates(
             user_id, candidate_location_ids, supabase
         )
 
-        # Get action count for adaptive weights
-        action_count = supabase.get_user_action_count(user_id)
+        # Get action count for adaptive weights — prefer the bundled profile
+        if user_profile is not None and "action_count" in user_profile:
+            action_count = int(user_profile.get("action_count") or 0)
+        else:
+            action_count = supabase.get_user_action_count(user_id)
 
     # Step 4: Compute adaptive weights. In group mode, force social/collab to 0
     # so the request weights are renormalised across just quality / vibe / dietary.
@@ -835,10 +846,15 @@ async def get_proximal_recommendations(request: ProximalRequest) -> ProximalResp
     - Location quality (ratings)
     """
     supabase = get_supabase_service()
+    cache_service = get_cache_service()
 
-    # Validate user exists
-    user_data = supabase.get_user(request.user_id)
-    if not user_data:
+    # Validate user exists — single bundled fetch (cached) replaces the
+    # legacy get_user + get_user_vectors + get_user_friends + action_count
+    # round-trips on the warm-cache path.
+    user_profile = cache_service.get_or_build_user_profile(
+        request.user_id, supabase
+    )
+    if user_profile is None:
         raise HTTPException(
             status_code=404,
             detail=f"User '{request.user_id}' not found."
@@ -891,8 +907,9 @@ async def get_proximal_recommendations(request: ProximalRequest) -> ProximalResp
         collaborative_weight=request.collaborative_weight,
     )
 
-    # Try cache first (user-agnostic - shared across all users)
-    cache_service = get_cache_service()
+    # Try cache first (user-agnostic - shared across all users).
+    # cache_service was already initialised above for the user-profile
+    # fetch; reuse it here.
     cached_data = cache_service.get_cached_recommendations(
         request.latitude, request.longitude, request.radius_km
     )
@@ -936,6 +953,7 @@ async def get_proximal_recommendations(request: ProximalRequest) -> ProximalResp
             user_id=request.user_id,
             social_weight=request.social_weight,
             collaborative_weight=request.collaborative_weight,
+            user_profile=user_profile,
         )
 
         logger.info(
@@ -976,19 +994,39 @@ async def get_proximal_recommendations(request: ProximalRequest) -> ProximalResp
             cache_radius_km
         )
 
-        # Use spatial query to get nearby locations with quality scores pre-computed.
-        # limit=1000 is the nearest-1000 in the 15km radius — enough coverage for
-        # any reasonable request radius in central London. Higher values push
-        # PostgREST serialisation past the statement timeout because the
-        # wide-row payload dominates; 1000 also matches the server-side
-        # db-max-rows cap so there's no point asking for more.
         supabase = get_supabase_service()
-        nearby_locations_data = supabase.get_locations_with_quality_scores(
-            request.latitude,
-            request.longitude,
-            cache_radius_km,
-            limit=1000,
-        )
+
+        # ── Try the LPA snapshot first (engaged places, 1 small Redis read).
+        # If present, the SQL fetch only needs to return the fill_set —
+        # locations not in LPA — which is a much smaller payload.
+        nearby_locations_data: List[Dict[str, Any]] = []
+        lpa_snapshot = cache_service.get_lpa_snapshot()
+        if lpa_snapshot:
+            primary_set = cache_service.filter_lpa_snapshot_by_radius(
+                lpa_snapshot, request.latitude, request.longitude, cache_radius_km
+            )
+            fill_set = supabase.get_fill_locations(
+                request.latitude,
+                request.longitude,
+                cache_radius_km,
+                limit=max(1000 - len(primary_set), 0),
+            )
+            nearby_locations_data = primary_set + fill_set
+            logger.info(
+                "🧩 LPA snapshot path: %d engaged + %d fill = %d total",
+                len(primary_set),
+                len(fill_set),
+                len(nearby_locations_data),
+            )
+
+        # Fallback: snapshot missing or fill RPC unavailable → legacy bulk RPC.
+        if not nearby_locations_data:
+            nearby_locations_data = supabase.get_locations_with_quality_scores(
+                request.latitude,
+                request.longitude,
+                cache_radius_km,
+                limit=1000,
+            )
 
         if not nearby_locations_data:
             logger.warning("No locations found within %s km, returning empty results", cache_radius_km)
@@ -1068,6 +1106,7 @@ async def get_proximal_recommendations(request: ProximalRequest) -> ProximalResp
                 user_id=request.user_id,
                 social_weight=request.social_weight,
                 collaborative_weight=request.collaborative_weight,
+                user_profile=user_profile,
             )
 
             logger.info(
