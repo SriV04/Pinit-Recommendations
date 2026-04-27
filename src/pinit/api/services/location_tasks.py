@@ -309,17 +309,34 @@ async def menu_vibe_task(payload: MenuVibePayload) -> None:
     website = row.get("website")
 
     if website:
+        # Idempotency guard: Pub/Sub may retry (5xx) and we don't want to re-run the crawler/LLM
+        # menu analysis if it already succeeded once.
+        menu_analysis_confidence = row.get("menu_analysis_confidence")
+        dietary_vector = row.get("dietary_requirement_vector")
+        has_menu_outputs = bool(row.get("menu") or row.get("generated_summary"))
+        has_dietary_vector = isinstance(dietary_vector, list) and len(dietary_vector) > 0
+        has_prior_menu_analysis = bool(menu_analysis_confidence) and (has_menu_outputs or has_dietary_vector)
+
         cuisine_value = row.get("cuisine_primary", "") or ""
         try:
-            menu_result = await process_menu_for_location(
-                location_id=payload.location_id,
-                google_place_id=payload.google_place_id,
-                website=website,
-                restaurant_name=row.get("name") or "",
-                cuisine_hint=cuisine_value,
-                detect_cuisine=not bool(cuisine_value),
-            )
-            has_summary = bool(menu_result and menu_result.restaurant_description)
+            if has_prior_menu_analysis:
+                logger.info(
+                    "menu_vibe: skip menu analysis (already populated) (location_id=%s request_id=%s confidence=%r)",
+                    payload.location_id,
+                    payload.request_id,
+                    menu_analysis_confidence,
+                )
+                has_summary = bool(row.get("generated_summary"))
+            else:
+                menu_result = await process_menu_for_location(
+                    location_id=payload.location_id,
+                    google_place_id=payload.google_place_id,
+                    website=website,
+                    restaurant_name=row.get("name") or "",
+                    cuisine_hint=cuisine_value,
+                    detect_cuisine=not bool(cuisine_value),
+                )
+                has_summary = bool(menu_result and menu_result.restaurant_description)
         except Exception as exc:
             logger.error("menu_vibe: menu processing failed for %s: %s", payload.location_id, exc)
             has_summary = False

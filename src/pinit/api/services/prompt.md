@@ -78,6 +78,15 @@ You will receive a JSON object with the following fields:
 - 🇲🇾 Malaysian
 - 🇸🇬 Singaporean
 - 🇵🇪 Peruvian
+
+# Response Rules
+
+- Respond with **only** the single best emoji from the approved list.
+- Do not include any other text, punctuation, or explanation.
+
+# Restaurant Data
+
+{restaurant_json}
 - 🇧🇷 Brazilian
 - 🇦🇷 Argentinian
 - 🇬🇧 British
