@@ -275,29 +275,120 @@ Do not include markdown fences, explanation text, or anything outside the JSON o
 
 # ── LLM Helper ───────────────────────────────────────────────────────────────
 
+def _extract_json_object_candidate(text: str) -> str:
+    """Best-effort extraction of a JSON object substring from an LLM response."""
+    stripped = text.strip()
+    stripped = re.sub(r"^```(?:json)?\s*", "", stripped)
+    stripped = re.sub(r"\s*```$", "", stripped)
+
+    start = stripped.find("{")
+    end = stripped.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return stripped
+    return stripped[start : end + 1]
+
+
+def _escape_newlines_in_json_strings(candidate: str) -> str:
+    """Convert literal newlines inside JSON strings into escaped sequences."""
+    out: List[str] = []
+    in_string = False
+    escaping = False
+
+    for ch in candidate:
+        if in_string:
+            if escaping:
+                out.append(ch)
+                escaping = False
+                continue
+
+            if ch == "\\":
+                out.append(ch)
+                escaping = True
+                continue
+
+            if ch == '"':
+                out.append(ch)
+                in_string = False
+                continue
+
+            if ch == "\n":
+                out.append("\\n")
+                continue
+
+            if ch == "\r":
+                out.append("\\r")
+                continue
+
+            out.append(ch)
+            continue
+
+        # Outside strings
+        if ch == '"':
+            in_string = True
+        out.append(ch)
+
+    return "".join(out)
+
+
+def _parse_llm_json_object(raw: str) -> dict:
+    candidate = _extract_json_object_candidate(raw)
+    candidate = _escape_newlines_in_json_strings(candidate)
+    return json.loads(candidate)
+
+
 async def _call_llm(client: AsyncOpenAI, prompt: str, data: dict) -> dict:
     """Call xAI Grok with a prompt and structured data, return parsed JSON."""
     full_prompt = f"{prompt}\n\n# Input Data\n\n```json\n{json.dumps(data, indent=2, default=str)}\n```"
 
-    response = await client.chat.completions.create(
-        model=MODEL,
-        max_tokens=2000,
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": "You are a restaurant analysis assistant. Always respond with valid JSON."},
-            {"role": "user", "content": full_prompt},
-        ],
-    )
-
-    raw = response.choices[0].message.content.strip()
-    raw = re.sub(r"^```(?:json)?\s*", "", raw)
-    raw = re.sub(r"\s*```$", "", raw)
-
     try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        logger.error("Failed to parse vibe tag LLM response: %s", raw[:200])
-        raise
+        response = await client.chat.completions.create(
+            model=MODEL,
+            max_tokens=2000,
+            temperature=0,
+            response_format={"type": "json_object"},
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a restaurant analysis assistant. "
+                        "Always respond with a single valid JSON object only (no markdown). "
+                        "Do not include literal newlines inside JSON strings."
+                    ),
+                },
+                {"role": "user", "content": full_prompt},
+            ],
+        )
+        raw = (response.choices[0].message.content or "").strip()
+        return _parse_llm_json_object(raw)
+    except json.JSONDecodeError as exc:
+        # Retry once with a stronger formatting reminder. This avoids Pub/Sub retry storms
+        # when the model occasionally emits invalid JSON.
+        logger.error("Failed to parse vibe tag LLM response (will retry once): %s", str(exc))
+
+        response = await client.chat.completions.create(
+            model=MODEL,
+            max_tokens=2000,
+            temperature=0,
+            response_format={"type": "json_object"},
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Return ONLY valid JSON (object). "
+                        "All keys must be in double quotes. "
+                        "All string values must be on one line (no literal newlines). "
+                        "No markdown fences, no extra text."
+                    ),
+                },
+                {"role": "user", "content": full_prompt},
+            ],
+        )
+        raw = (response.choices[0].message.content or "").strip()
+        try:
+            return _parse_llm_json_object(raw)
+        except json.JSONDecodeError:
+            logger.error("Failed to parse vibe tag LLM response after retry: %s", raw[:400])
+            raise
 
 
 # ── 3-Stage Analysis Pipeline ────────────────────────────────────────────────

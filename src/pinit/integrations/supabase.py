@@ -1,9 +1,12 @@
 from typing import Optional, List, Dict, Any
 from urllib.parse import urlparse
 import logging
+import os
 import time
+import base64
+import json
 from supabase import create_client, Client, ClientOptions
-from pinit.config.secrets import SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
+from pinit.config.secrets import SUPABASE_URL, SUPABASE_SERVICE_KEY
 
 # Import cache service (with lazy loading to avoid circular imports)
 _cache_service = None
@@ -34,6 +37,20 @@ def _extension_for_content_type(content_type: Optional[str]) -> str:
     normalized = content_type.split(";", 1)[0].strip().lower()
     return _CONTENT_TYPE_EXTENSIONS.get(normalized, "")
 
+def _decode_supabase_key_role(key: str) -> Optional[str]:
+    """Best-effort decode of Supabase API key JWT payload, returning the `role` claim."""
+    try:
+        parts = key.split(".")
+        if len(parts) < 2:
+            return None
+        payload_b64 = parts[1]
+        payload_b64 += "=" * (-len(payload_b64) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64.encode("utf-8")).decode("utf-8"))
+        role = payload.get("role")
+        return str(role) if role is not None else None
+    except Exception:
+        return None
+
 
 class SupabaseService:
     """Basic Supabase service for CRUD operations"""
@@ -42,10 +59,10 @@ class SupabaseService:
         logger = logging.getLogger(__name__)
         url = (SUPABASE_URL or "").strip()
         # Use service role key for full access
-        key = (SUPABASE_SERVICE_ROLE_KEY or "").strip()
+        key = (SUPABASE_SERVICE_KEY or "").strip()
         
         if not url or not key:
-            raise ValueError("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set in environment or Secret Manager")
+            raise ValueError("SUPABASE_URL and SUPABASE_SERVICE_KEY must be set in environment or Secret Manager")
         
         # Ensure URL has trailing slash for storage endpoints
         if not url.endswith("/"):
@@ -58,6 +75,29 @@ class SupabaseService:
             logger.error(f"Invalid SUPABASE_URL format: '{masked}'. Expected like 'https://<ref>.supabase.co'")
             raise ValueError("Invalid SUPABASE_URL format")
         logger.debug(f"Initializing SupabaseService for host: {parsed.netloc}")
+
+        # Safe sanity check: decode JWT payload and log only the "role" claim (never the token).
+        # Helps catch accidental anon keys / wrong secrets which trigger 403 RLS failures (notably Storage).
+        # Default behavior is fail-fast unless explicitly overridden.
+        self.key_role = _decode_supabase_key_role(key)
+        allow_non_service = str(os.getenv("SUPABASE_ALLOW_NON_SERVICE_ROLE", "")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+        if self.key_role != "service_role":
+            logger.error(
+                "Supabase API key role=%r; expected 'service_role'. Storage/table writes may fail with 403 (RLS).",
+                self.key_role,
+            )
+            if not allow_non_service:
+                raise ValueError(
+                    "SUPABASE_SERVICE_KEY is not a service_role key. "
+                    "Set it to your Supabase project's service_role API key (Settings → API) "
+                    "or set SUPABASE_ALLOW_NON_SERVICE_ROLE=true to bypass this check."
+                )
+        else:
+            logger.info("Supabase API key role=service_role (expected for worker/API).")
         
         options = ClientOptions(
             auto_refresh_token=False,
@@ -490,8 +530,9 @@ class SupabaseService:
             return result
         except Exception as exc:
             logger.error(
-                "Supabase storage upload failed for object '%s': %s",
+                "Supabase storage upload failed for object '%s' (supabase_key_role=%r): %s",
                 object_name,
+                getattr(self, "key_role", None),
                 exc,
                 exc_info=True,
             )

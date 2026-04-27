@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 import os
+import base64
+import json
 
 from dotenv import load_dotenv
 
@@ -61,18 +63,52 @@ def get_secret(secret_id: str) -> str:
     logger.warning("Secret '%s' not found in environment or Secret Manager", secret_id)
     return ""
 
+def _decode_supabase_key_role(key: str) -> str:
+    """Best-effort decode of Supabase API key JWT payload `role` claim."""
+    try:
+        parts = (key or "").strip().split(".")
+        if len(parts) < 2:
+            return ""
+        payload_b64 = parts[1]
+        payload_b64 += "=" * (-len(payload_b64) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64.encode("utf-8")).decode("utf-8"))
+        role = payload.get("role")
+        return str(role) if role is not None else ""
+    except Exception:
+        return ""
+
 
 # Load all secrets
 SUPABASE_URL = get_secret("supabase-url")
 
-# Be permissive with service role key naming:
-# - ENV: SUPABASE_SERVICE_ROLE_KEY (common)
-# - Secret IDs: supabase-service-role-key or supabase-service-key (legacy)
-SUPABASE_SERVICE_ROLE_KEY = (
-    get_secret("supabase-service-role-key")
-    or get_secret("supabase-service-key")
-    or os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
-)
+# Be permissive with Supabase service key naming:
+# - ENV: SUPABASE_SERVICE_KEY (preferred), SUPABASE_SERVICE_ROLE_KEY (common)
+# - Secret IDs: supabase-service-key (preferred), supabase-service-role-key (legacy)
+# NOTE: Do not use the Supabase "JWT secret" here; it is NOT a valid API key for PostgREST/Storage.
+_primary_service_key = get_secret("supabase-service-key") or os.getenv("SUPABASE_SERVICE_KEY", "")
+_primary_role = _decode_supabase_key_role(_primary_service_key)
+
+_legacy_service_key = ""
+_legacy_role = ""
+if _primary_role != "service_role":
+    _legacy_service_key = get_secret("supabase-service-role-key") or os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+    _legacy_role = _decode_supabase_key_role(_legacy_service_key)
+
+if _primary_role == "service_role":
+    SUPABASE_SERVICE_KEY = _primary_service_key
+elif _legacy_role == "service_role":
+    SUPABASE_SERVICE_KEY = _legacy_service_key
+else:
+    SUPABASE_SERVICE_KEY = _primary_service_key or _legacy_service_key
+    if SUPABASE_SERVICE_KEY:
+        logger.error(
+            "Loaded Supabase service key but role=%r (expected 'service_role'). "
+            "Set SUPABASE_SERVICE_KEY/SUPABASE_SERVICE_ROLE_KEY to the service_role API key.",
+            _decode_supabase_key_role(SUPABASE_SERVICE_KEY) or None,
+        )
+
+# Backwards-compatible alias (many modules still reference this name).
+SUPABASE_SERVICE_ROLE_KEY = SUPABASE_SERVICE_KEY
 
 SUPABASE_ANON_KEY = get_secret("supabase-anon-key")
 GEMINI_API_KEY = get_secret("gemini-api-key")

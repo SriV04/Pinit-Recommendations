@@ -2,11 +2,16 @@
 set -e
 
 # Configuration
-PROJECT_ID="project-add4b0f5-0080-47ef-80f"
+PROJECT_ID="pinit-494520"
 IMAGE_NAME="pinit-recommendations"
 REGION="europe-west2"
 SERVICE_NAME="pinit-recommendations-api"
 AR_REPO="cloud-run-source-deploy"  # Artifact Registry repository
+
+# Cloud Run sizing knobs (override via env)
+API_CPU="${API_CPU:-2}"
+API_MEMORY="${API_MEMORY:-2Gi}"
+API_MAX_INSTANCES="${API_MAX_INSTANCES:-10}"
 
 # Redis Configuration Options:
 # 1. Google Cloud Memorystore (Recommended for production)
@@ -69,7 +74,7 @@ build_env_vars_from_dotenv() {
       local key="${BASH_REMATCH[1]}"
       case "$key" in
         # Bound via --set-secrets below (avoid duplicates)
-        SUPABASE_SERVICE_ROLE_KEY|GOOGLE_PLACE_API_KEY|REDIS_PASSWORD)
+        SUPABASE_SERVICE_KEY|SUPABASE_SERVICE_ROLE_KEY|SUPABASE_SECRET_KEY|GOOGLE_PLACE_API_KEY|REDIS_PASSWORD)
           continue
           ;;
         # These are set explicitly per deploy (avoid duplicates)
@@ -107,7 +112,36 @@ fi
 # Secret Manager bindings: ENV_VAR=secret-name:version
 # Requires: secrets created in Secret Manager AND the Cloud Run service
 # account granted roles/secretmanager.secretAccessor on each.
-SECRETS="SUPABASE_SERVICE_ROLE_KEY=supabase-service-role-key:latest"
+has_enabled_secret_version() {
+  local secret_name="$1"
+  gcloud secrets versions list "${secret_name}" \
+    --project "${PROJECT_ID}" \
+    --filter='state:ENABLED' \
+    --format='value(name)' \
+    --limit=1 >/dev/null 2>&1
+}
+
+if gcloud secrets describe "supabase-service-key" --project "${PROJECT_ID}" >/dev/null 2>&1 && has_enabled_secret_version "supabase-service-key"; then
+  SUPABASE_SERVICE_SECRET_NAME="supabase-service-key"
+elif gcloud secrets describe "supabase-service-role-key" --project "${PROJECT_ID}" >/dev/null 2>&1 && has_enabled_secret_version "supabase-service-role-key"; then
+  SUPABASE_SERVICE_SECRET_NAME="supabase-service-role-key"
+elif gcloud secrets describe "supabase-service-key" --project "${PROJECT_ID}" >/dev/null 2>&1; then
+  echo "❌ Error: Secret 'supabase-service-key' exists but has no ENABLED versions."
+  echo "   Add a version, e.g.:"
+  echo "     printf \"<SUPABASE_SERVICE_KEY>\" | gcloud secrets versions add supabase-service-key --data-file=- --project \"${PROJECT_ID}\""
+  exit 1
+elif gcloud secrets describe "supabase-service-role-key" --project "${PROJECT_ID}" >/dev/null 2>&1; then
+  echo "❌ Error: Secret 'supabase-service-role-key' exists but has no ENABLED versions."
+  echo "   Add a version, e.g.:"
+  echo "     printf \"<SUPABASE_SERVICE_ROLE_KEY>\" | gcloud secrets versions add supabase-service-role-key --data-file=- --project \"${PROJECT_ID}\""
+  exit 1
+else
+  echo "❌ Error: Could not find a Supabase service key secret with an ENABLED version in project '${PROJECT_ID}'."
+  echo "   Expected either 'supabase-service-key' (preferred) or 'supabase-service-role-key' (legacy)."
+  exit 1
+fi
+
+SECRETS="SUPABASE_SERVICE_KEY=${SUPABASE_SERVICE_SECRET_NAME}:latest"
 SECRETS+=",GOOGLE_PLACE_API_KEY=google-place-api-key:latest"
 SECRETS+=",REDIS_PASSWORD=redis-password:latest"
 
@@ -118,11 +152,11 @@ gcloud run deploy $SERVICE_NAME \
   --allow-unauthenticated \
   --set-env-vars "$ENV_VARS" \
   --set-secrets "$SECRETS" \
-  --memory 2Gi \
+  --memory "${API_MEMORY}" \
   --timeout 540 \
-  --max-instances 10 \
+  --max-instances "${API_MAX_INSTANCES}" \
   --min-instances 0 \
-  --cpu 2
+  --cpu "${API_CPU}"
 
 echo "✅ Deployment complete!"
 echo "📍 Service URL:"
@@ -133,4 +167,12 @@ if [ -n "$REDIS_HOST" ]; then
   echo "   Redis Host: ${REDIS_HOST}"
 else
   echo "   ⚠️  No REDIS_HOST set - caching will be disabled"
+fi
+
+if [ "${DEPLOY_PUBSUB:-false}" = "true" ]; then
+  echo ""
+  echo "🔧 DEPLOY_PUBSUB=true: deploying Pub/Sub workers + subscription push config..."
+  export PUBSUB_ENABLED="true"
+  export PUBSUB_TOPIC_LOCATION_TASKS="location-tasks"
+  ./pubsub.sh
 fi
