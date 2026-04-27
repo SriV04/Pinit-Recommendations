@@ -527,21 +527,29 @@ def _rank_cached_candidates(
         loc_vibe_vec = candidate.get("vibe_vector")
         loc_dietary_vec = candidate.get("dietary_requirement_vector")
 
-        # Pillar scores precomputed by v4 SQL. Old caches that predate v4
-        # still have a `quality_score` — split it 5:1 across the two
-        # replacement pillars so blending stays sensible.
-        app_engagement = candidate.get("app_engagement_score")
-        google_baseline = candidate.get("google_baseline_score")
+        # Pillar scores precomputed by the v6 cron. If we're handed a legacy
+        # cache row with only `quality_score`, mirror it into both
+        # replacement pillars so the split weights preserve the old overall
+        # contribution.
+        app_engagement = float(candidate.get("app_engagement_score") or 0.0)
+        google_baseline = float(candidate.get("google_baseline_score") or 0.0)
         video_insight = float(candidate.get("video_insight_score") or 0.0)
         share_count = int(candidate.get("share_count") or 0)
 
-        if app_engagement is None and google_baseline is None:
+        if (
+            candidate.get("app_engagement_score") is None
+            and candidate.get("google_baseline_score") is None
+            and candidate.get("quality_score") is not None
+        ):
             legacy_quality = float(candidate.get("quality_score") or 0.0)
-            app_engagement = legacy_quality * (5.0 / 6.0)
-            google_baseline = legacy_quality * (1.0 / 6.0)
-        else:
-            app_engagement = float(app_engagement or 0.0)
-            google_baseline = float(google_baseline or 0.0)
+            app_engagement = legacy_quality
+            google_baseline = legacy_quality
+
+        # Manual additive bias — set by hand on location_popularity_app.
+        # Range [-0.15, +0.15]. Applied AFTER the weighted blend and all
+        # multipliers so a manual nudge always reaches the final score
+        # regardless of dietary penalty / share boost / fill factor.
+        quality_bias = float(candidate.get("quality_bias") or 0.0)
 
         vibe_score = 0.0
         dietary_score = 0.0
@@ -610,7 +618,12 @@ def _rank_cached_candidates(
         # places are competitive.
         has_app_signal = bool(candidate.get("has_app_signal", True))
         fill_factor = 1.0 if has_app_signal else 0.6
-        final_score = blended * dietary_penalty * share_boost * fill_factor
+        # quality_bias is purely additive — applied AFTER all multipliers
+        # so a manual nudge can't be cancelled out by dietary penalty etc.
+        final_score = (
+            blended * dietary_penalty * share_boost * fill_factor
+            + quality_bias
+        )
 
         scored_candidates.append({
             **candidate,
@@ -624,7 +637,7 @@ def _rank_cached_candidates(
             "share_boost": share_boost,
             "has_app_signal": has_app_signal,
             "fill_factor": fill_factor,
-            "quality_score": app_engagement + google_baseline,  # legacy
+            "quality_bias": quality_bias,
             "social_score": social_score,
             "collaborative_score": collaborative_score,
             "final_score": final_score,
@@ -916,7 +929,8 @@ async def get_proximal_recommendations(request: ProximalRequest) -> ProximalResp
 
     if cached_data is not None:
         # Cache hit - use shared filtering logic
-        # Cached candidates have quality_score pre-computed, compute user-specific scores
+        # Cached candidates include the v6 pillar payload plus a legacy
+        # `quality_score` alias for diagnostics / response compatibility.
         candidates = cached_data.get("candidates", [])
 
         # Diagnostics on cached quality scores — if the cache was populated
@@ -1040,7 +1054,8 @@ async def get_proximal_recommendations(request: ProximalRequest) -> ProximalResp
                 timestamp=datetime.utcnow().isoformat(),
             )
 
-        # Convert to DataFrame - quality_score, vibe_vector, dietary_requirement_vector already included
+        # Convert to DataFrame - vectors, pillar scores, quality_score alias,
+        # and quality_bias are already included.
         nearby_locations_df = pd.DataFrame(nearby_locations_data)
 
         # Diagnostics: how many of the spatial results actually have a
@@ -1075,7 +1090,10 @@ async def get_proximal_recommendations(request: ProximalRequest) -> ProximalResp
                 'rating', 'user_ratings_total', 'price_level',
                 'lat', 'lng', 'distance_km',
                 'vibe_vector', 'dietary_requirement_vector',  # Need vectors for user-specific scoring
-                'quality_score',  # Pre-computed by database
+                'app_engagement_score', 'google_baseline_score',
+                'video_insight_score', 'share_count',
+                'has_app_signal',
+                'quality_score', 'quality_bias',
                 # Photo metadata surfaced by the RPC (v8)
                 'image_stored', 'image_unavailable', 'extra_photos_stored',
             ]

@@ -428,8 +428,10 @@ def build_proximal_recommendations(
     vibe_scores = compute_vibe_score(user_id, location_ids, locations)
     dietary_match, dietary_penalty = compute_dietary_score(user_id, location_ids, locations)
 
-    # Pillar scores precomputed by v4 SQL (get_locations_with_pillars). Fall
-    # back to 0 / blended quality_score for callers still on the old RPC.
+    # Pillar scores precomputed by the v6 SQL RPC. Older callers may still
+    # provide only a legacy blended `quality_score`; when that happens,
+    # mirror it into both replacement pillars so the split weights preserve
+    # the old contribution exactly.
     def _series(col: str, default: float = 0.0) -> pd.Series:
         if col in nearby.columns:
             return nearby[col].fillna(default)
@@ -440,12 +442,21 @@ def build_proximal_recommendations(
     video_insight_scores = _series('video_insight_score')
     share_counts = _series('share_count', default=0).astype(int)
 
-    # If only the legacy `quality_score` is present, split it 5:1 across the
-    # two replacement pillars so something sensible still ranks.
-    if 'app_engagement_score' not in nearby.columns and 'quality_score' in nearby.columns:
-        legacy = nearby['quality_score'].fillna(0.0)
-        app_engagement_scores = legacy * (5.0 / 6.0)
-        google_baseline_scores = legacy * (1.0 / 6.0)
+    if (
+        'app_engagement_score' not in nearby.columns
+        and 'google_baseline_score' not in nearby.columns
+        and 'quality_score' in nearby.columns
+    ):
+        legacy_quality = nearby['quality_score'].fillna(0.0)
+        app_engagement_scores = legacy_quality
+        google_baseline_scores = legacy_quality
+
+    # Manual additive bias from location_popularity_app.quality_score
+    # (range [-0.15, +0.15]). Surfaced explicitly as `quality_bias` by v6.
+    if 'quality_bias' in nearby.columns:
+        quality_bias_series = nearby['quality_bias'].fillna(0.0)
+    else:
+        quality_bias_series = pd.Series(0.0, index=nearby.index)
 
     # Compute social and collaborative scores
     from pinit.core.recommendation.social_scoring import compute_social_scores
@@ -484,10 +495,11 @@ def build_proximal_recommendations(
     nearby_copy['share_count'] = share_counts.values
     nearby_copy['social_score'] = nearby_copy['location_id'].map(social_scores_dict).fillna(0.0)
     nearby_copy['collaborative_score'] = nearby_copy['location_id'].map(collab_scores_dict).fillna(0.0)
-    # Legacy column for downstream consumers
     nearby_copy['quality_score'] = (
-        nearby_copy['app_engagement_score'] + nearby_copy['google_baseline_score']
+        nearby_copy['app_engagement_score'] * (5.0 / 6.0)
+        + nearby_copy['google_baseline_score'] * (1.0 / 6.0)
     )
+    nearby_copy['quality_bias'] = quality_bias_series.values
 
     # Weighted blend across all seven pillars
     blended = (
@@ -524,9 +536,12 @@ def build_proximal_recommendations(
         fill_factor = pd.Series(1.0, index=nearby_copy.index)
     nearby_copy['fill_factor'] = fill_factor
 
+    # quality_bias is purely additive — applied AFTER all multipliers so a
+    # manual nudge always reaches the final score.
     nearby_copy['final_score'] = (
         blended * nearby_copy['dietary_penalty']
         * share_boost_series * fill_factor
+        + nearby_copy['quality_bias']
     )
 
     # Sort by final score
@@ -623,8 +638,10 @@ def build_proximal_recommendations(
         'vibe_score', 'dietary_score', 'dietary_penalty',
         'app_engagement_score', 'google_baseline_score', 'video_insight_score',
         'social_score', 'collaborative_score',
-        # Legacy aggregate
+        # Legacy aggregate for response models / older callers
         'quality_score',
+        # Manual additive bias
+        'quality_bias',
         # Provenance + boosts + final
         'has_app_signal', 'fill_factor',
         'share_count', 'share_boost', 'recently_seen_factor',

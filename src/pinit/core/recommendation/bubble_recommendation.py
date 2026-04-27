@@ -433,23 +433,55 @@ def build_bubble_recommendations(
     # 7. Aggregate dietary (MAX pool)
     group_dietary = aggregate_dietary_scores_max(individual_dietary)
 
-    # 8. Quality scores — precomputed by v4 cron, surfaced via the RPC
-    if 'quality_score' in nearby.columns:
-        quality_scores = nearby['quality_score'].fillna(0.0)
+    # 8. Pillar scores precomputed by the v6 cron + manual quality_bias.
+    # The pillar columns drive the weighted blend; quality_bias is applied
+    # additively at the end so manual nudges can't be cancelled out.
+    def _series(col: str, default: float = 0.0) -> pd.Series:
+        if col in nearby.columns:
+            return nearby[col].fillna(default)
+        return pd.Series(default, index=nearby.index)
+
+    app_engagement = _series('app_engagement_score')
+    google_baseline = _series('google_baseline_score')
+
+    if (
+        'app_engagement_score' not in nearby.columns
+        and 'google_baseline_score' not in nearby.columns
+        and 'quality_score' in nearby.columns
+    ):
+        legacy_quality = nearby['quality_score'].fillna(0.0)
+        app_engagement = legacy_quality
+        google_baseline = legacy_quality
+
+    # quality_bias is explicit in the v6 contract. Legacy callers without
+    # that field simply rank with no manual additive adjustment.
+    if 'quality_bias' in nearby.columns:
+        quality_bias = nearby['quality_bias'].fillna(0.0)
     else:
-        quality_scores = pd.Series(0.0, index=nearby.index)
+        quality_bias = pd.Series(0.0, index=nearby.index)
 
     # 9. Merge
     result = nearby.copy()
     result = result.merge(group_vibe, on='location_id', how='left')
     result = result.merge(group_dietary, on='location_id', how='left')
-    result['quality_score'] = quality_scores.values
+    result['app_engagement_score'] = app_engagement.values
+    result['google_baseline_score'] = google_baseline.values
+    result['quality_bias'] = quality_bias.values
 
     # 10. Final score
+    # Bubble blend uses the same APP/CATALOG split as proximal:
+    # `quality_weight` allocates across the two replacement pillars (5:1
+    # split — see ProximalConfig) so old config defaults still rank well.
+    quality_blend = (
+        result['app_engagement_score'] * (5.0 / 6.0)
+        + result['google_baseline_score'] * (1.0 / 6.0)
+    )
+    result['quality_score'] = quality_blend
     result['final_score'] = (
-        config.vibe_weight * result['group_vibe_score'].fillna(0) +
-        config.dietary_weight * result['group_dietary_score'].fillna(0) +
-        config.quality_weight * result['quality_score']
+        config.vibe_weight    * result['group_vibe_score'].fillna(0)
+        + config.dietary_weight * result['group_dietary_score'].fillna(0)
+        + config.quality_weight * quality_blend
+        + result['quality_bias']
     )
 
     # 11. Sort and rank
@@ -493,7 +525,9 @@ def build_bubble_recommendations(
         'location_id', 'name', 'vicinity', 'cuisine_primary',
         'rating', 'user_ratings_total', 'price_level',
         'distance_km', 'group_vibe_score', 'group_dietary_score',
-        'quality_score', 'final_score', 'rank',
+        'app_engagement_score', 'google_baseline_score',
+        'quality_score', 'quality_bias',
+        'final_score', 'rank',
         'individual_scores', 'min_individual_score',
         'max_individual_score', 'score_variance',
         'locations_before_filtering', 'locations_after_filtering'

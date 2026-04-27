@@ -149,6 +149,39 @@ class SupabaseService:
             query = query.eq(key, value)
         response = query.execute()
         return response.data
+
+    @staticmethod
+    def _normalise_pillar_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Normalise v6 RPC rows into a stable Python-side contract.
+
+        The SQL layer now exposes split pillar columns plus `quality_bias`.
+        Older callers still read `quality_score`, so derive a legacy
+        aggregate alias from the two replacement pillars. If an older RPC
+        already surfaced `quality_score`, preserve it and default
+        `quality_bias` to 0.0.
+        """
+        normalised: List[Dict[str, Any]] = []
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+
+            item = dict(row)
+            app_engagement = float(item.get("app_engagement_score") or 0.0)
+            google_baseline = float(item.get("google_baseline_score") or 0.0)
+
+            if item.get("quality_score") is None:
+                item["quality_score"] = (
+                    app_engagement * (5.0 / 6.0)
+                    + google_baseline * (1.0 / 6.0)
+                )
+
+            if item.get("quality_bias") is None:
+                item["quality_bias"] = 0.0
+
+            normalised.append(item)
+
+        return normalised
     
     def get_locations_with_quality_scores(
         self,
@@ -158,11 +191,17 @@ class SupabaseService:
         limit: int = 1000
     ) -> List[Dict[str, Any]]:
         """
-        Get locations within a radius with quality scores pre-computed.
+        Get locations within a radius with all v6 pillar columns pre-computed.
 
-        Uses PostGIS geography column for efficient spatial filtering and
-        computes quality scores in the database. Results are user-agnostic
-        and can be cached by lat/lng for all users.
+        Hard-deprecation of the v4 `get_locations_with_quality` RPC (dropped
+        by v6_quality_score_bias.sql). All callers now hit
+        `get_locations_with_pillars`, which surfaces:
+            - app_engagement_score, google_baseline_score, video_insight_score
+            - share_count, has_app_signal
+            - quality_bias  (manual additive bias in [-0.15, +0.15])
+
+        The function name is kept for back-compat but the underlying RPC and
+        column shape are the v6 ones.
 
         Args:
             latitude: Center point latitude
@@ -171,10 +210,9 @@ class SupabaseService:
             limit: Maximum number of results
 
         Returns:
-            List of location dictionaries with quality_score field
+            List of location dictionaries with v6 pillar fields.
         """
         logger = logging.getLogger(__name__)
-        # PostGIS ST_DWithin uses meters for geography type
         radius_meters = radius_km * 1000
         params = {
             'center_lat': latitude,
@@ -188,19 +226,20 @@ class SupabaseService:
             if attempt > 0:
                 time.sleep(0.5 * attempt)  # 0.5s, then 1.0s
                 logger.warning(
-                    "Retrying get_locations_with_quality (attempt %d/3) after: %s",
+                    "Retrying get_locations_with_pillars (attempt %d/3) after: %s",
                     attempt + 1,
                     last_exc,
                 )
             try:
-                response = self.client.rpc('get_locations_with_quality', params).execute()
+                response = self.client.rpc('get_locations_with_pillars', params).execute()
+                rows = self._normalise_pillar_rows(response.data or [])
                 logger.info(
                     "Spatial query returned %d locations within %.1fkm (attempt %d)",
-                    len(response.data),
+                    len(rows),
                     radius_km,
                     attempt + 1,
                 )
-                return response.data
+                return rows
             except Exception as exc:
                 last_exc = exc
 
@@ -208,7 +247,7 @@ class SupabaseService:
         # pulls megabytes of unrelated data per request. Fail loud and
         # return empty so the caller short-circuits.
         logger.error(
-            "Spatial RPC get_locations_with_quality failed after 3 attempts: %s. "
+            "Spatial RPC get_locations_with_pillars failed after 3 attempts: %s. "
             "Returning empty result (no fallback).",
             last_exc,
         )
@@ -231,7 +270,7 @@ class SupabaseService:
                 .select(
                     "location_id,saves_count,dislikes_count,been_to_count,"
                     "share_count,app_engagement_score,google_baseline_score,"
-                    "video_insight_score,"
+                    "video_insight_score,quality_bias:quality_score,"
                     "locations(name,vicinity,lat,lng,cuisine,cuisine_primary,"
                     "rating,user_ratings_total,price_level,types,emoji,"
                     "vibe_vector,dietary_requirement_vector,google_place_id)"
@@ -246,6 +285,7 @@ class SupabaseService:
                 # has_app_signal=True for everything in this snapshot by definition
                 merged["has_app_signal"] = True
                 flat.append(merged)
+            flat = self._normalise_pillar_rows(flat)
             logger.info("LPA snapshot fetch: %d rows", len(flat))
             return flat
         except Exception as exc:
@@ -276,7 +316,7 @@ class SupabaseService:
         }
         try:
             response = self.client.rpc("get_fill_locations", params).execute()
-            return response.data or []
+            return self._normalise_pillar_rows(response.data or [])
         except Exception as exc:
             logger.warning(
                 "get_fill_locations RPC unavailable (%s); falling back to "

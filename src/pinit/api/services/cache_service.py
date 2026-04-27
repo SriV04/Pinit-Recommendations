@@ -162,8 +162,14 @@ class ProximalCacheService:
         lat_snapped, lng_snapped = self._snap_coordinates(center_lat, center_lng)
         radius = radius_km or self.config.large_radius_km
 
-        # User-agnostic key - shared across all users at this location
-        key = f"proximal:geo:g_{lat_snapped}_{lng_snapped}:r{int(radius)}"
+        # User-agnostic key - shared across all users at this location.
+        # The `:v7` suffix is the schema version of the cached candidate
+        # payload; bump it whenever the on-disk shape changes (v7 = full
+        # pillar payload + quality_score compatibility alias +
+        # quality_bias). Existing
+        # entries with no version (or older versions) are simply skipped
+        # by the lookup and the cache rebuilds on the next miss.
+        key = f"proximal:geo:g_{lat_snapped}_{lng_snapped}:r{int(radius)}:v7"
         return key
 
     def _compress_data(self, data: Dict[str, Any]) -> bytes:
@@ -649,7 +655,8 @@ class ProximalCacheService:
     # global key replaces per-cell PostGIS queries for the engaged-places set.
     # ============================================================================
 
-    LPA_SNAPSHOT_KEY = "lpa:snapshot:v1"
+    LPA_SNAPSHOT_KEY = "lpa:snapshot:v3"  # v3 = quality_bias + legacy quality_score alias
+    LEGACY_LPA_SNAPSHOT_KEYS = ("lpa:snapshot:v2",)
     LPA_SNAPSHOT_TTL = 600  # 10 min — reader falls back to DB if expired
 
     def get_lpa_snapshot(self) -> Optional[List[Dict[str, Any]]]:
@@ -657,19 +664,22 @@ class ProximalCacheService:
         if not self.is_available:
             return None
         try:
-            raw = self._redis_client.get(self.LPA_SNAPSHOT_KEY)
-            if raw is None:
-                return None
-            data = self._decompress_data(raw)
-            candidates = data.get("candidates") if isinstance(data, dict) else None
-            if not candidates:
-                return None
-            logger.info(
-                "📦 LPA snapshot hit: %d engaged places (cached_at=%s)",
-                len(candidates),
-                data.get("cached_at"),
-            )
-            return candidates
+            for snapshot_key in (self.LPA_SNAPSHOT_KEY, *self.LEGACY_LPA_SNAPSHOT_KEYS):
+                raw = self._redis_client.get(snapshot_key)
+                if raw is None:
+                    continue
+                data = self._decompress_data(raw)
+                candidates = data.get("candidates") if isinstance(data, dict) else None
+                if not candidates:
+                    continue
+                logger.info(
+                    "📦 LPA snapshot hit: %d engaged places (cached_at=%s, key=%s)",
+                    len(candidates),
+                    data.get("cached_at"),
+                    snapshot_key,
+                )
+                return candidates
+            return None
         except RedisError as exc:
             logger.warning("Redis error reading LPA snapshot: %s", exc)
             return None
