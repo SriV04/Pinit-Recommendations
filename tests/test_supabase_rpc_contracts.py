@@ -6,11 +6,16 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
+from tests import install_optional_dependency_stubs
+
+install_optional_dependency_stubs()
+
 from pinit.api.services.cache_service import ProximalCacheService
 from pinit.config.settings import CacheConfig
 
 V6_MIGRATION = REPO_ROOT / "supabase/migrations/20260427000000_v6_quality_score_bias.sql"
 KNN_FIX_MIGRATION = REPO_ROOT / "supabase/migrations/20260427002000_optimize_get_locations_with_pillars_knn.sql"
+FILL_LOCATIONS_MIGRATION = REPO_ROOT / "supabase/migrations/20260501170000_add_get_fill_locations_rpc.sql"
 PROXIMAL_ROUTER = REPO_ROOT / "src/pinit/api/routers/proximal.py"
 
 
@@ -43,6 +48,18 @@ class SupabaseRpcContractTests(unittest.TestCase):
             sql = path.read_text()
             self.assertNotIn("LIMIT GREATEST(result_limit - pc.count, 0)", sql)
             self.assertIn("ROW_NUMBER() OVER", sql)
+
+    def test_fill_locations_rpc_matches_cache_warming_contract(self) -> None:
+        sql = FILL_LOCATIONS_MIGRATION.read_text()
+        self.assertIn("CREATE OR REPLACE FUNCTION public.get_fill_locations", sql)
+        self.assertIn("result_limit INT DEFAULT 1000", sql)
+        self.assertIn("vibe_vector REAL[]", sql)
+        self.assertIn("quality_bias NUMERIC", sql)
+        self.assertIn("NOT EXISTS", sql)
+        self.assertIn("ROW_NUMBER() OVER", sql)
+        self.assertIn("ORDER BY l.geog <-> center.g", sql)
+        self.assertIn("FALSE AS has_app_signal", sql)
+        self.assertIn("TO authenticated, anon, service_role", sql)
 
     def test_proximal_cache_payload_preserves_quality_bias(self) -> None:
         source = PROXIMAL_ROUTER.read_text()

@@ -1,12 +1,12 @@
 #!/bin/bash
 set -e
 
-PROJECT="pinit-494520"
-REGION="europe-west2"
-API_SERVICE="pinit-recommendations-api"
-WORKER_FAST_SERVICE="pinit-location-worker"
-WORKER_MENU_SERVICE="pinit-location-worker-menu"
-TOPIC="location-tasks"
+PROJECT="${PROJECT:-pinit-494520}"
+REGION="${REGION:-europe-west2}"
+API_SERVICE="${API_SERVICE:-pinit-recommendations-api}"
+WORKER_FAST_SERVICE="${WORKER_FAST_SERVICE:-pinit-location-worker}"
+WORKER_MENU_SERVICE="${WORKER_MENU_SERVICE:-pinit-location-worker-menu}"
+TOPIC="${PUBSUB_TOPIC_LOCATION_TASKS:-location-tasks}"
 
 # Cloud Run sizing knobs (defaults chosen to fit common regional quotas; override via env)
 FAST_CPU="${FAST_CPU:-1}"
@@ -87,8 +87,23 @@ build_env_vars_from_dotenv() {
   echo "$out"
 }
 
+: "${WARM_CACHE_ENABLED:=true}"
+: "${WARM_CACHE_INTERVAL_SECONDS:=900}"
+: "${WARM_CACHE_ZONE_SET:=london}"
+: "${WARM_CACHE_START_HOUR:=9}"
+: "${WARM_CACHE_END_HOUR:=21}"
+: "${WARM_CACHE_TIMEZONE:=Europe/London}"
+: "${CACHE_UNFILTERED_TTL:=3600}"
+
 ENV_VARS="$(build_env_vars_from_dotenv)"
 ENV_VARS+="${ENV_VARS:+,}GOOGLE_CLOUD_PROJECT=${PROJECT},PUBSUB_ENABLED=true,PUBSUB_TOPIC_LOCATION_TASKS=${TOPIC}"
+ENV_VARS+=",WARM_CACHE_ENABLED=${WARM_CACHE_ENABLED}"
+ENV_VARS+=",WARM_CACHE_INTERVAL_SECONDS=${WARM_CACHE_INTERVAL_SECONDS}"
+ENV_VARS+=",WARM_CACHE_ZONE_SET=${WARM_CACHE_ZONE_SET}"
+ENV_VARS+=",WARM_CACHE_START_HOUR=${WARM_CACHE_START_HOUR}"
+ENV_VARS+=",WARM_CACHE_END_HOUR=${WARM_CACHE_END_HOUR}"
+ENV_VARS+=",WARM_CACHE_TIMEZONE=${WARM_CACHE_TIMEZONE}"
+ENV_VARS+=",CACHE_UNFILTERED_TTL=${CACHE_UNFILTERED_TTL}"
 
 gcloud run services update "${API_SERVICE}" \
   --project "${PROJECT}" \
@@ -224,3 +239,8 @@ gcloud pubsub subscriptions update "${TOPIC}-menu_vibe" \
   --ack-deadline 600 \
   --push-endpoint "${MENU_WORKER_URL}/internal/pubsub/location-tasks" \
   --push-auth-service-account "${PUSH_SA}"
+
+echo "✅ Pub/Sub deployment complete."
+echo "   Topic: ${TOPIC}"
+echo "   Fast worker: ${FAST_WORKER_URL}"
+echo "   Menu worker: ${MENU_WORKER_URL}"

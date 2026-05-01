@@ -141,7 +141,7 @@ class CacheConfig:
     coordinate_precision: int = field(default_factory=lambda: int(os.getenv("CACHE_COORDINATE_PRECISION", "1")))
 
     # TTLs (seconds)
-    unfiltered_cache_ttl: int = field(default_factory=lambda: int(os.getenv("CACHE_UNFILTERED_TTL", "7200")))  # 2 hours
+    unfiltered_cache_ttl: int = field(default_factory=lambda: int(os.getenv("CACHE_UNFILTERED_TTL", "3600")))  # 60 minutes
     taste_score_cache_ttl: int = 3600  # 1 hour
 
     # Memory limits

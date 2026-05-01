@@ -6,6 +6,10 @@ from unittest.mock import patch
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
+from tests import install_optional_dependency_stubs
+
+install_optional_dependency_stubs()
+
 from pinit.api.routers import proximal
 from pinit.integrations.supabase import SupabaseService
 

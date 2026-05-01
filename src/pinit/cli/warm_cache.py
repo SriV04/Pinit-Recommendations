@@ -25,16 +25,26 @@ Exit codes: 0 on success, 1 if any job failed (snapshot or zone fetch).
 from __future__ import annotations
 
 import argparse
+import asyncio
+from datetime import datetime
 import logging
+import os
 import sys
 import time
-from typing import Dict, List, Tuple
+from typing import Awaitable, Callable, Dict, List, Tuple
+from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from pinit.api.services.cache_service import get_cache_service
 from pinit.integrations.supabase import get_supabase_service
 
 
 logger = logging.getLogger("pinit.warm_cache")
+
+DEFAULT_WARM_INTERVAL_SECONDS = 900
+DEFAULT_WARM_WINDOW_START_HOUR = 9
+DEFAULT_WARM_WINDOW_END_HOUR = 21
+DEFAULT_WARM_TIMEZONE = "Europe/London"
 
 
 # Hot-zone catalogue. Centre coords for the proximal cache key, plus a
@@ -139,6 +149,72 @@ def warm_zones(zone_set: str, radius_km: float = 15.0) -> int:
     return successes
 
 
+def is_within_warm_cache_window(
+    now: datetime,
+    *,
+    start_hour: int = DEFAULT_WARM_WINDOW_START_HOUR,
+    end_hour: int = DEFAULT_WARM_WINDOW_END_HOUR,
+) -> bool:
+    """Return true during the configured cost window: start inclusive, end exclusive."""
+    return start_hour <= now.hour < end_hour
+
+
+def acquire_warm_cache_lock(ttl_s: int = 840) -> bool:
+    """Acquire a Redis lock so only one API instance runs each warm pass."""
+    cache = get_cache_service()
+    if not cache.is_available or cache._redis_client is None:
+        logger.warning("Warm cache lock unavailable because Redis is unavailable")
+        return False
+    return bool(cache._redis_client.set("warm:lock", str(uuid4()), nx=True, ex=ttl_s))
+
+
+def run_warm_cache_pass(zone_set: str = "london", radius_km: float = 15.0) -> bool:
+    """Run one locked warm-cache pass: LPA snapshot first, then hot zones."""
+    if not acquire_warm_cache_lock():
+        logger.info("Warm cache pass skipped because warm:lock is held")
+        return False
+
+    snapshot_ok = refresh_lpa_snapshot()
+    warmed = warm_zones(zone_set, radius_km=radius_km)
+    return bool(snapshot_ok and warmed > 0)
+
+
+async def warm_cache_loop(
+    *,
+    zone_set: str = "london",
+    radius_km: float = 15.0,
+    interval_seconds: int = DEFAULT_WARM_INTERVAL_SECONDS,
+    start_hour: int = DEFAULT_WARM_WINDOW_START_HOUR,
+    end_hour: int = DEFAULT_WARM_WINDOW_END_HOUR,
+    timezone_name: str = DEFAULT_WARM_TIMEZONE,
+    sleep_fn: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    now_fn: Callable[[], datetime] | None = None,
+    warm_pass_fn: Callable[[str, float], bool] = run_warm_cache_pass,
+    max_passes: int | None = None,
+) -> None:
+    """Continuously refresh warm cache entries during the configured cost window."""
+    passes = 0
+    tz = ZoneInfo(timezone_name)
+
+    while max_passes is None or passes < max_passes:
+        now = now_fn() if now_fn is not None else datetime.now(tz)
+        if is_within_warm_cache_window(now, start_hour=start_hour, end_hour=end_hour):
+            try:
+                await asyncio.to_thread(warm_pass_fn, zone_set, radius_km)
+            except Exception as exc:
+                logger.exception("Warm cache loop pass failed: %s", exc)
+        else:
+            logger.info(
+                "Warm cache pass skipped outside cost window (%02d:00-%02d:00 %s)",
+                start_hour,
+                end_hour,
+                timezone_name,
+            )
+
+        passes += 1
+        await sleep_fn(interval_seconds)
+
+
 def main(argv: List[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Pre-warm the proximal cache.")
     parser.add_argument(
@@ -189,6 +265,30 @@ def main(argv: List[str] | None = None) -> int:
             failures += 1
 
     return 0 if failures == 0 else 1
+
+
+def warm_cache_enabled_from_env() -> bool:
+    return os.getenv("WARM_CACHE_ENABLED", "false").lower() == "true"
+
+
+def warm_cache_interval_from_env() -> int:
+    return int(os.getenv("WARM_CACHE_INTERVAL_SECONDS", str(DEFAULT_WARM_INTERVAL_SECONDS)))
+
+
+def warm_cache_zone_set_from_env() -> str:
+    return os.getenv("WARM_CACHE_ZONE_SET", "london")
+
+
+def warm_cache_start_hour_from_env() -> int:
+    return int(os.getenv("WARM_CACHE_START_HOUR", str(DEFAULT_WARM_WINDOW_START_HOUR)))
+
+
+def warm_cache_end_hour_from_env() -> int:
+    return int(os.getenv("WARM_CACHE_END_HOUR", str(DEFAULT_WARM_WINDOW_END_HOUR)))
+
+
+def warm_cache_timezone_from_env() -> str:
+    return os.getenv("WARM_CACHE_TIMEZONE", DEFAULT_WARM_TIMEZONE)
 
 
 if __name__ == "__main__":
