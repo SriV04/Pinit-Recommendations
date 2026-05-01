@@ -38,6 +38,13 @@ class InProcessDispatcher(LocationTaskDispatcher):
     """Fallback dispatcher for local dev (uses in-process BackgroundJobRunner)."""
 
     async def dispatch(self, payload: LocationTaskPayload) -> None:
+        logger.info(
+            "Dispatch (in-process): %s (location_id=%s request_id=%s)",
+            payload.task_type,
+            payload.location_id,
+            payload.request_id,
+        )
+
         async def _handler() -> None:
             await handle_location_task(payload, dispatcher=self)
 
@@ -51,6 +58,12 @@ class PubSubDispatcher(LocationTaskDispatcher):
     async def dispatch(self, payload: LocationTaskPayload) -> None:
         from pinit.integrations.pubsub_tasks import publish_location_task
 
+        logger.info(
+            "Dispatch (pubsub): %s (location_id=%s request_id=%s)",
+            payload.task_type,
+            payload.location_id,
+            payload.request_id,
+        )
         await asyncio.to_thread(
             publish_location_task,
             payload,

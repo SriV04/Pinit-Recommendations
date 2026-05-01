@@ -1663,7 +1663,19 @@ async def add_location_by_place_id(request: AddLocationRequest) -> AddLocationRe
         )
 
     # Async mode: publish to Pub/Sub (or fallback to in-process worker for local dev).
-    dispatcher = PubSubDispatcher() if get_pubsub_config().enabled else InProcessDispatcher()
+    pubsub_cfg = get_pubsub_config()
+    dispatcher = PubSubDispatcher() if pubsub_cfg.enabled else InProcessDispatcher()
+    logger.info(
+        "locations/add: dispatch %s via %s (pubsub_enabled=%s project_id=%s topic=%s) (location_id=%s request_id=%s source=%s)",
+        pipeline_payload.task_type,
+        dispatcher.__class__.__name__,
+        pubsub_cfg.enabled,
+        pubsub_cfg.project_id,
+        pubsub_cfg.topic,
+        location_id,
+        request_id,
+        source,
+    )
     await dispatcher.dispatch(pipeline_payload)
 
     if created_new:

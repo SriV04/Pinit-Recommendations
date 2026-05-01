@@ -97,14 +97,14 @@ build_env_vars_from_dotenv() {
 # Pass all .env vars (except those set via --set-secrets and a few computed keys).
 ENV_VARS="$(build_env_vars_from_dotenv)"
 
+# Defaults for production Cloud Run deploys (override by exporting before running deploy.sh).
+: "${PUBSUB_ENABLED:=true}"
+: "${PUBSUB_TOPIC_LOCATION_TASKS:=location-tasks}"
+
 # Ensure Pub/Sub + project vars are always set explicitly (even if not in .env)
 ENV_VARS+="${ENV_VARS:+,}GOOGLE_CLOUD_PROJECT=${PROJECT_ID}"
-if [ -n "$PUBSUB_ENABLED" ]; then
-  ENV_VARS+=",PUBSUB_ENABLED=${PUBSUB_ENABLED}"
-fi
-if [ -n "$PUBSUB_TOPIC_LOCATION_TASKS" ]; then
-  ENV_VARS+=",PUBSUB_TOPIC_LOCATION_TASKS=${PUBSUB_TOPIC_LOCATION_TASKS}"
-fi
+ENV_VARS+=",PUBSUB_ENABLED=${PUBSUB_ENABLED}"
+ENV_VARS+=",PUBSUB_TOPIC_LOCATION_TASKS=${PUBSUB_TOPIC_LOCATION_TASKS}"
 if [ -n "$PUBSUB_PROJECT_ID" ]; then
   ENV_VARS+=",PUBSUB_PROJECT_ID=${PUBSUB_PROJECT_ID}"
 fi

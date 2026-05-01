@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from typing import Any, Dict
 
@@ -11,6 +12,13 @@ from pinit.api.services.location_tasks import PubSubDispatcher, handle_location_
 from pinit.integrations.pubsub_tasks import PubSubPushRequest, decode_push_payload
 
 logger = logging.getLogger(__name__)
+
+log_level_name = os.getenv("LOG_LEVEL", "INFO").upper()
+log_level = getattr(logging, log_level_name, logging.INFO)
+logging.basicConfig(
+    level=log_level,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
 
 app = FastAPI(
     title="Pinit Location Task Worker",
