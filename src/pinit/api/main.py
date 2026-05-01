@@ -38,8 +38,17 @@ app.include_router(proximal.router)
 
 @app.on_event("startup")
 async def startup_background_workers() -> None:
+    cfg = get_pubsub_config()
+    if cfg.enabled:
+        logger.info("Pub/Sub enabled (project_id=%s topic=%s)", cfg.project_id, cfg.topic)
+    else:
+        logger.warning(
+            "Pub/Sub disabled (PUBSUB_ENABLED=false); using in-process background workers. "
+            "Set PUBSUB_ENABLED=true and PUBSUB_TOPIC_LOCATION_TASKS=<topic> to enable Pub/Sub."
+        )
+
     # Only start in-process workers when Pub/Sub is disabled (local fallback).
-    if not get_pubsub_config().enabled:
+    if not cfg.enabled:
         await get_background_job_runner().start()
 
 
