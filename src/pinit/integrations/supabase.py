@@ -446,11 +446,41 @@ class SupabaseService:
             return []
         response = (
             self.client.table("locations")
-            .select("*")
+            .select(
+                "*,location_popularity_app("
+                "app_engagement_score,google_baseline_score,"
+                "video_insight_score,share_count,quality_bias:quality_score"
+                ")"
+            )
             .in_("location_id", list(location_ids))
             .execute()
         )
-        return response.data or []
+        rows = response.data or []
+        flat: List[Dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            lpa_rows = item.get("location_popularity_app") or []
+            if isinstance(lpa_rows, list):
+                lpa = lpa_rows[0] if lpa_rows else {}
+            elif isinstance(lpa_rows, dict):
+                lpa = lpa_rows
+            else:
+                lpa = {}
+
+            if isinstance(lpa, dict):
+                for key in (
+                    "app_engagement_score",
+                    "google_baseline_score",
+                    "video_insight_score",
+                    "share_count",
+                    "quality_bias",
+                ):
+                    if item.get(key) is None and lpa.get(key) is not None:
+                        item[key] = lpa[key]
+
+            flat.append(item)
+
+        return self._normalise_pillar_rows(flat)
 
     def get_location_without_emoji(self) -> List[Dict[str, Any]]:
         """Get locations without an emoji assigned"""

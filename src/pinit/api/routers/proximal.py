@@ -545,6 +545,15 @@ def _rank_cached_candidates(
             app_engagement = legacy_quality
             google_baseline = legacy_quality
 
+        quality_score = candidate.get("quality_score")
+        if quality_score is None:
+            quality_score = (
+                app_engagement * (5.0 / 6.0)
+                + google_baseline * (1.0 / 6.0)
+            )
+        else:
+            quality_score = float(quality_score or 0.0)
+
         # Manual additive bias — set by hand on location_popularity_app.
         # Range [-0.15, +0.15]. Applied AFTER the weighted blend and all
         # multipliers so a manual nudge always reaches the final score
@@ -633,6 +642,7 @@ def _rank_cached_candidates(
             "app_engagement_score": app_engagement,
             "google_baseline_score": google_baseline,
             "video_insight_score": video_insight,
+            "quality_score": quality_score,
             "share_count": share_count,
             "share_boost": share_boost,
             "has_app_signal": has_app_signal,
