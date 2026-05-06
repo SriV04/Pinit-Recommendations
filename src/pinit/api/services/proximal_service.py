@@ -822,6 +822,8 @@ def text_search(
         "places.reviews",
         "places.websiteUri",
         "places.reviewSummary",
+        "places.editorialSummary",
+        "places.internationalPhoneNumber",
         "places.goodForChildren",
         "places.goodForGroups",
         "places.goodForWatchingSports",

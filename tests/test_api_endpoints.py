@@ -24,6 +24,7 @@ from fastapi.testclient import TestClient
 
 from pinit.api.proximal_api import app as api_app
 from pinit.api.routers import proximal
+from pinit.api.services.magic_google_service import MagicGoogleSearchResult
 from pinit.worker import main as worker_main
 
 
@@ -82,6 +83,18 @@ class _FakeCacheService:
     def __init__(self) -> None:
         self.profile_requests: list[str] = []
         self.cached_queries: list[tuple[float, float, float]] = []
+        self.magic_intents: dict[str, dict] = {}
+
+    def get_user_profile(self, user_id: str) -> dict | None:
+        if user_id == "missing-user":
+            return None
+        return {
+            "user_id": user_id,
+            "vibe_vector": _vibe_vector(0),
+            "dietary_vector": _dietary_vector(),
+            "action_count": 10,
+            "exists": True,
+        }
 
     def get_or_build_user_profile(self, user_id: str, supabase) -> dict | None:
         self.profile_requests.append(user_id)
@@ -112,6 +125,13 @@ class _FakeCacheService:
 
     def set_cached_recommendations(self, *args, **kwargs) -> None:
         return None
+
+    def get_magic_intent(self, normalised_prompt: str) -> dict | None:
+        return self.magic_intents.get(normalised_prompt)
+
+    def set_magic_intent(self, normalised_prompt: str, payload: dict) -> bool:
+        self.magic_intents[normalised_prompt] = payload
+        return True
 
 
 class _FakeSupabase:
@@ -182,7 +202,19 @@ class _FakeSupabase:
 
     def get_locations_by_ids(self, location_ids: list[int]) -> list[dict]:
         return [
-            _candidate(4001, "Magic Known Place", 51.5095, -0.1490, cuisine="japanese", quality_score=0.88)
+            {
+                **_candidate(
+                    4001,
+                    "Magic Known Place",
+                    51.5095,
+                    -0.1490,
+                    cuisine="japanese",
+                    quality_score=0.88,
+                ),
+                "google_place_id": "known-place-id",
+                "saves_count": 10,
+                "dislikes_count": 0,
+            }
             for location_id in location_ids
             if location_id == 4001
         ]
@@ -372,22 +404,26 @@ class ProximalApiEndpointTests(unittest.TestCase):
         self.assertEqual(_FakeDispatcher.dispatched[0].location_id, 3001)
 
     def test_magic_search_ranks_food_places(self) -> None:
+        google_result = MagicGoogleSearchResult(
+            places=[
+                {
+                    "id": "known-place-id",
+                    "types": ["restaurant"],
+                },
+                {
+                    "id": "retail-place-id",
+                    "types": ["store"],
+                },
+            ],
+            total_google_calls=1,
+            total_candidates_before_dedupe=2,
+            total_candidates_after_dedupe=2,
+            google_queries=["sushi restaurant"],
+        )
         with self._patched_integrations(), patch.object(
             proximal,
-            "text_search",
-            return_value=(
-                [
-                    {
-                        "id": "known-place-id",
-                        "types": ["restaurant"],
-                    },
-                    {
-                        "id": "retail-place-id",
-                        "types": ["store"],
-                    },
-                ],
-                1,
-            ),
+            "get_or_fetch_google_candidates",
+            new=AsyncMock(return_value=google_result),
         ):
             response = self.client.post(
                 "/locations/magic-search",
@@ -407,6 +443,209 @@ class ProximalApiEndpointTests(unittest.TestCase):
         self.assertEqual(body["total_candidates"], 2)
         self.assertEqual(body["total_ranked"], 1)
         self.assertEqual(body["recommendations"][0]["name"], "Magic Known Place")
+        self.assertIn("source", body["recommendations"][0])
+        self.assertIn("match_reasons", body["recommendations"][0])
+        self.assertIn("intent_matches", body["recommendations"][0])
+        self.assertIn("confidence", body["recommendations"][0])
+        self.assertGreaterEqual(len(body["sections"]), 1)
+        self.assertEqual(body["sections"][0]["title"], "Best matches")
+        self.assertEqual(body["debug"]["total_google_calls"], 1)
+        self.assertEqual(body["debug"]["total_candidates_before_dedupe"], 2)
+        self.assertEqual(body["debug"]["total_candidates_after_dedupe"], 2)
+        self.assertEqual(body["debug"]["total_ranked"], 1)
+        self.assertTrue(body["debug"]["cache_hit_user_profile"])
+
+    def test_magic_search_returns_unknown_places_without_inserting_them(self) -> None:
+        places = [
+            {
+                "id": "known-place-id",
+                "displayName": {"text": "Known Google Name"},
+                "formattedAddress": "Known Street, London",
+                "types": ["restaurant"],
+                "location": {"latitude": 51.5095, "longitude": -0.1490},
+                "rating": 4.5,
+                "userRatingCount": 200,
+                "websiteUri": "https://knownplace.example",
+                "googleMapsUri": "https://maps.google.com/?cid=88",
+                "editorialSummary": {"text": "Known place summary."},
+                "reviewSummary": {"text": {"text": "Known review summary."}},
+            },
+            {
+                "id": "new-place-id",
+                "displayName": {"text": "New Google Place"},
+                "shortFormattedAddress": "New Street",
+                "formattedAddress": "1 New Street, London",
+                "types": ["restaurant"],
+                "location": {"latitude": 51.5100, "longitude": -0.1485},
+                "rating": 4.8,
+                "userRatingCount": 500,
+                "priceLevel": "PRICE_LEVEL_MODERATE",
+                "currentOpeningHours": {
+                    "openNow": True,
+                    "weekdayDescriptions": [
+                        "Monday: 9 AM – 11 PM",
+                        "Tuesday: 9 AM – 11 PM",
+                    ],
+                },
+                "websiteUri": "https://newplace.example",
+                "googleMapsUri": "https://maps.google.com/?cid=99",
+                "internationalPhoneNumber": "+44 20 7946 0958",
+                "businessStatus": "OPERATIONAL",
+                "editorialSummary": {"text": "Cosy neighbourhood spot."},
+                "reviewSummary": {"text": {"text": "Loved by locals."}},
+                "goodForChildren": True,
+                "outdoorSeating": True,
+                "servesCocktails": True,
+                "servesBreakfast": False,
+                "liveMusic": False,
+                "photos": [
+                    {
+                        "name": "places/new-place-id/photos/photo-1",
+                        "widthPx": 1200,
+                        "heightPx": 800,
+                    }
+                ],
+            },
+        ]
+        google_result = MagicGoogleSearchResult(
+            places=places,
+            total_google_calls=1,
+            total_candidates_before_dedupe=2,
+            total_candidates_after_dedupe=2,
+            google_queries=["sushi restaurant"],
+        )
+        with (
+            self._patched_integrations(),
+            patch.object(
+                proximal,
+                "get_or_fetch_google_candidates",
+                new=AsyncMock(return_value=google_result),
+            ),
+            patch.object(
+                proximal,
+                "fetch_google_place_basic_details",
+            ) as basic_details,
+            patch.object(
+                proximal,
+                "refresh_location_from_google_place_details",
+            ) as full_details,
+            patch.object(
+                proximal,
+                "create_location_from_place_details",
+            ) as create_location,
+        ):
+            response = self.client.post(
+                "/locations/magic-search",
+                json={
+                    "user_id": USER_ID,
+                    "latitude": 51.5095,
+                    "longitude": -0.1490,
+                    "prompt": "date night sushi nearby",
+                    "radius_km": 1.5,
+                    "max_results": 5,
+                },
+            )
+
+        body = response.json()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(body["total_candidates"], 2)
+        self.assertEqual(body["total_ranked"], 2)
+        recommendations = body["recommendations"]
+        self.assertEqual(
+            {item["google_place_id"] for item in recommendations},
+            {"known-place-id", "new-place-id"},
+        )
+        known = next(item for item in recommendations if item["google_place_id"] == "known-place-id")
+        self.assertTrue(known["is_known_location"])
+        self.assertEqual(known["website"], "https://knownplace.example")
+        self.assertEqual(known["google_maps_uri"], "https://maps.google.com/?cid=88")
+        self.assertEqual(known["editorial_summary"], "Known place summary.")
+        self.assertEqual(known["review_summary"], "Known review summary.")
+
+        unknown = next(item for item in recommendations if item["google_place_id"] == "new-place-id")
+        self.assertLess(unknown["location_id"], 0)
+        self.assertFalse(unknown["is_known_location"])
+        self.assertEqual(unknown["name"], "New Google Place")
+        self.assertEqual(unknown["photo_reference"], "places/new-place-id/photos/photo-1")
+        self.assertAlmostEqual(unknown["lat"], 51.5100)
+        self.assertAlmostEqual(unknown["lng"], -0.1485)
+        self.assertEqual(unknown["website"], "https://newplace.example")
+        self.assertEqual(unknown["google_maps_uri"], "https://maps.google.com/?cid=99")
+        self.assertEqual(unknown["editorial_summary"], "Cosy neighbourhood spot.")
+        self.assertEqual(unknown["review_summary"], "Loved by locals.")
+        self.assertEqual(unknown["international_phone_number"], "+44 20 7946 0958")
+        self.assertEqual(unknown["business_status"], "OPERATIONAL")
+        self.assertEqual(unknown["formatted_address"], "1 New Street, London")
+        self.assertEqual(
+            unknown["opening_hours_text"],
+            ["Monday: 9 AM – 11 PM", "Tuesday: 9 AM – 11 PM"],
+        )
+        self.assertTrue(unknown["good_for_children"])
+        self.assertTrue(unknown["outdoor_seating"])
+        self.assertTrue(unknown["serves_cocktails"])
+        self.assertFalse(unknown["serves_breakfast"])
+        self.assertFalse(unknown["live_music"])
+        self.assertIn("Google", unknown["source"])
+        self.assertGreaterEqual(len(unknown["match_reasons"]), 1)
+        self.assertGreaterEqual(len(body["sections"]), 1)
+        basic_details.assert_not_called()
+        full_details.assert_not_called()
+        create_location.assert_not_called()
+
+    def test_magic_search_explicit_location_survives_user_coordinate_radius(self) -> None:
+        google_result = MagicGoogleSearchResult(
+            places=[
+                {
+                    "id": "known-place-id",
+                    "displayName": {"text": "Hammersmith Formal"},
+                    "types": ["restaurant"],
+                    "location": {"latitude": 51.4927, "longitude": -0.2237},
+                },
+            ],
+            total_google_calls=1,
+            total_candidates_before_dedupe=1,
+            total_candidates_after_dedupe=1,
+            google_queries=["formal dinner restaurant in hammersmith river"],
+        )
+        hammersmith_candidate = {
+            **_candidate(
+                4001,
+                "Hammersmith Formal",
+                51.4927,
+                -0.2237,
+                cuisine="british",
+                quality_score=0.88,
+            ),
+            "google_place_id": "known-place-id",
+            "saves_count": 0,
+            "dislikes_count": 0,
+        }
+
+        with self._patched_integrations(), patch.object(
+            proximal,
+            "get_or_fetch_google_candidates",
+            new=AsyncMock(return_value=google_result),
+        ), patch.object(
+            self.supabase,
+            "get_locations_by_ids",
+            return_value=[hammersmith_candidate],
+        ):
+            response = self.client.post(
+                "/locations/magic-search",
+                json={
+                    "user_id": USER_ID,
+                    "latitude": 51.5095,
+                    "longitude": -0.1490,
+                    "prompt": "formal dinner in hammersmith river",
+                    "radius_km": 2,
+                    "max_results": 10,
+                },
+            )
+
+        body = response.json()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(body["total_ranked"], 1)
+        self.assertEqual(body["recommendations"][0]["name"], "Hammersmith Formal")
 
     def test_bubble_recommendations_return_group_results(self) -> None:
         with self._patched_integrations():

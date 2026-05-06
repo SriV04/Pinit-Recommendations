@@ -180,6 +180,22 @@ async def pipeline_task(payload: PipelinePayload, *, dispatcher: LocationTaskDis
         )
         return
 
+    if (payload.source or "").lower().strip() == "magic-search-open":
+        logger.info(
+            "pipeline: dispatch details_enrich for magic-search-open (location_id=%s request_id=%s generate_emoji=%s classify_photo=%s)",
+            payload.location_id,
+            payload.request_id,
+            bool(payload.generate_emoji),
+            bool(payload.classify_photo),
+        )
+        await dispatcher.dispatch(
+            DetailsEnrichPayload(
+                task_type="details_enrich",
+                **payload.model_dump(exclude={"task_type"}),
+            )
+        )
+        return
+
     updated_vibe = _truthy(row.get("updated_vibe"))
     source = (payload.source or "in-app").lower().strip()
 

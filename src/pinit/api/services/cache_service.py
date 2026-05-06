@@ -14,11 +14,12 @@ The cache allows a single entry to serve multiple request variations by:
 from __future__ import annotations
 
 import gzip
+import hashlib
 import json
 import logging
 import math
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import pandas as pd
 import redis
@@ -205,6 +206,126 @@ class ProximalCacheService:
         except Exception as exc:
             logger.error("Failed to decompress cache data: %s", exc)
             raise
+
+    # ============================================================================
+    # Magic Search cache helpers
+    # ============================================================================
+
+    MAGIC_INTENT_TTL = 7 * 24 * 60 * 60
+    MAGIC_INTENT_KEY_VERSION = "v2"
+    MAGIC_GOOGLE_TEXT_TTL = 6 * 60 * 60
+    MAGIC_PLACE_DETAILS_TTL = 14 * 24 * 60 * 60
+    MAGIC_FINAL_RESULTS_TTL = 10 * 60
+
+    def _magic_cache_get(self, key: str) -> Optional[Dict[str, Any]]:
+        if not self.is_available:
+            return None
+        try:
+            raw = self._redis_client.get(key)
+            if raw is None:
+                return None
+            return self._decompress_data(raw)
+        except RedisError as exc:
+            logger.warning("Redis error reading Magic cache key %s: %s", key, exc)
+            return None
+        except Exception as exc:
+            logger.warning("Unexpected error reading Magic cache key %s: %s", key, exc)
+            return None
+
+    def _magic_cache_set(
+        self, key: str, payload: Dict[str, Any], ttl_seconds: int
+    ) -> bool:
+        if not self.is_available:
+            return False
+        try:
+            self._redis_client.setex(key, ttl_seconds, self._compress_data(payload))
+            return True
+        except RedisError as exc:
+            logger.error("Redis error writing Magic cache key %s: %s", key, exc)
+            return False
+        except Exception as exc:
+            logger.error("Unexpected error writing Magic cache key %s: %s", key, exc)
+            return False
+
+    def get_magic_intent(self, normalised_prompt: str) -> Optional[Dict[str, Any]]:
+        return self._magic_cache_get(
+            f"magic:intent:{self.MAGIC_INTENT_KEY_VERSION}:{normalised_prompt}"
+        )
+
+    def set_magic_intent(
+        self, normalised_prompt: str, payload: Dict[str, Any]
+    ) -> bool:
+        return self._magic_cache_set(
+            f"magic:intent:{self.MAGIC_INTENT_KEY_VERSION}:{normalised_prompt}",
+            payload,
+            self.MAGIC_INTENT_TTL,
+        )
+
+    def build_magic_google_text_key(
+        self,
+        query: str,
+        *,
+        lat: float,
+        lng: float,
+        radius_km: float,
+        included_types: Optional[Sequence[str]] = None,
+    ) -> str:
+        lat_cell, lng_cell = self._snap_coordinates(lat, lng)
+        query_hash = hashlib.sha1(query.strip().lower().encode("utf-8")).hexdigest()[:16]
+        types_payload = json.dumps(sorted(included_types or []), separators=(",", ":"))
+        types_hash = hashlib.sha1(types_payload.encode("utf-8")).hexdigest()[:12]
+        radius = int(round(radius_km))
+        return (
+            f"magic:google:text:v1:{query_hash}:g_{lat_cell}_{lng_cell}:"
+            f"r{radius}:types_{types_hash}"
+        )
+
+    def get_magic_google_results(self, key: str) -> Optional[Dict[str, Any]]:
+        return self._magic_cache_get(key)
+
+    def set_magic_google_results(
+        self,
+        key: str,
+        payload: Dict[str, Any],
+        ttl_seconds: Optional[int] = None,
+    ) -> bool:
+        return self._magic_cache_set(
+            key,
+            payload,
+            ttl_seconds or self.MAGIC_GOOGLE_TEXT_TTL,
+        )
+
+    def get_magic_place_details(
+        self, google_place_id: str
+    ) -> Optional[Dict[str, Any]]:
+        return self._magic_cache_get(f"magic:google:place:v1:{google_place_id}")
+
+    def set_magic_place_details(
+        self,
+        google_place_id: str,
+        payload: Dict[str, Any],
+        ttl_seconds: Optional[int] = None,
+    ) -> bool:
+        return self._magic_cache_set(
+            f"magic:google:place:v1:{google_place_id}",
+            payload,
+            ttl_seconds or self.MAGIC_PLACE_DETAILS_TTL,
+        )
+
+    def get_magic_final_results(self, key: str) -> Optional[Dict[str, Any]]:
+        return self._magic_cache_get(key)
+
+    def set_magic_final_results(
+        self,
+        key: str,
+        payload: Dict[str, Any],
+        ttl_seconds: Optional[int] = None,
+    ) -> bool:
+        return self._magic_cache_set(
+            key,
+            payload,
+            ttl_seconds or self.MAGIC_FINAL_RESULTS_TTL,
+        )
 
     def get_cached_recommendations(
         self, center_lat: float, center_lng: float, request_radius_km: float = 2.0

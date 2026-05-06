@@ -5,6 +5,8 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
+from pinit.api.schemas_magic import MagicSearchDebug
+
 
 class TagMatch(BaseModel):
     tag: str = Field(..., description="Tag name")
@@ -64,13 +66,48 @@ class MomentumIndicator(BaseModel):
 
 class LocationRecommendation(BaseModel):
     location_id: int
+    google_place_id: Optional[str] = None
+    is_known_location: Optional[bool] = None
     name: str
     vicinity: Optional[str] = None
     cuisine_primary: Optional[str] = None
     rating: Optional[float] = None
     user_ratings_total: Optional[int] = None
     price_level: Optional[float] = None
+    photo_reference: Optional[str] = None
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+    types: Optional[str] = None
+    open_now: Optional[bool] = None
     distance_km: float
+
+    # Rich place metadata. Populated from the locations table for known
+    # locations, and directly from Google Places (Text Search) for external
+    # candidates surfaced by /locations/magic-search. Optional everywhere
+    # else so existing /recommendations/proximal callers stay unchanged.
+    formatted_address: Optional[str] = None
+    business_status: Optional[str] = None
+    google_maps_uri: Optional[str] = None
+    website: Optional[str] = None
+    international_phone_number: Optional[str] = None
+    editorial_summary: Optional[str] = None
+    review_summary: Optional[str] = None
+    opening_hours_text: Optional[List[str]] = None
+    good_for_children: Optional[bool] = None
+    good_for_groups: Optional[bool] = None
+    good_for_watching_sports: Optional[bool] = None
+    live_music: Optional[bool] = None
+    outdoor_seating: Optional[bool] = None
+    serves_beer: Optional[bool] = None
+    serves_breakfast: Optional[bool] = None
+    serves_brunch: Optional[bool] = None
+    serves_cocktails: Optional[bool] = None
+    serves_coffee: Optional[bool] = None
+    serves_dessert: Optional[bool] = None
+    serves_dinner: Optional[bool] = None
+    serves_lunch: Optional[bool] = None
+    serves_vegetarian_food: Optional[bool] = None
+    serves_wine: Optional[bool] = None
 
     # Five-component scores
     vibe_score: float = Field(..., description="Vibe match score (0-1)")
@@ -93,6 +130,13 @@ class LocationRecommendation(BaseModel):
     taste_breakdown: Optional[List[TagMatch]] = Field(None, description="Breakdown of taste score by matching tags")
     friend_saves: Optional[List[FriendSave]] = Field(None, description="Friends who saved/visited this location")
     momentum: Optional[MomentumIndicator] = Field(None, description="Trending and discovery indicators")
+
+
+class MagicLocationRecommendation(LocationRecommendation):
+    source: List[str] = Field(default_factory=list)
+    match_reasons: List[str] = Field(default_factory=list)
+    intent_matches: Dict[str, Any] = Field(default_factory=dict)
+    confidence: float = 0.0
 
 
 class ProximalResponse(BaseModel):
@@ -149,7 +193,7 @@ class AddLocationRequest(BaseModel):
     google_place_id: str = Field(..., description="Google Place ID for the location")
     source: Optional[str] = Field(
         "in-app",
-        description="Source of the location add: 'in-app', 'tiktok', or 'instagram'",
+        description="Source of the location add: 'in-app', 'tiktok', 'instagram', or 'magic-search-open'",
     )
     classify_photo: Optional[bool] = Field(True, description="Whether to classify the location's photo with AI")
     generate_emoji: Optional[bool] = Field(True, description="Whether to generate an emoji for the location")
@@ -185,6 +229,10 @@ class MagicSearchRequest(BaseModel):
     max_results: Optional[int] = Field(20, description="Max number of places to search and rank", ge=1, le=50)
     include_taste_breakdown: Optional[bool] = Field(False, description="Include detailed taste score breakdown")
 
+class MagicSearchSection(BaseModel):
+    title: str
+    subtitle: Optional[str] = None
+    recommendations: List[MagicLocationRecommendation] = Field(default_factory=list)
 
 
 class MagicSearchResponse(BaseModel):
@@ -195,7 +243,9 @@ class MagicSearchResponse(BaseModel):
     radius_km: float
     total_candidates: int
     total_ranked: int
-    recommendations: List[LocationRecommendation]
+    recommendations: List[MagicLocationRecommendation]
+    sections: List[MagicSearchSection] = Field(default_factory=list)
+    debug: Optional[MagicSearchDebug] = None
     timestamp: str
 
 class FilterOptions(BaseModel):

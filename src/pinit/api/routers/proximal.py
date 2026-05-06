@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime
+import hashlib
 import logging
+import math
+from time import perf_counter
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
@@ -24,9 +27,11 @@ from pinit.api.schemas import (
     HiddenGemsResponse,
     IndividualScore,
     LocationCoordinatesResponse,
+    MagicLocationRecommendation,
     LocationRecommendation,
     MagicSearchRequest,
     MagicSearchResponse,
+    MagicSearchSection,
     ProximalRequest,
     ProximalResponse,
     TagMatch,
@@ -36,15 +41,21 @@ from pinit.config.secrets import GOOGLE_PLACE_API_KEY
 from pinit.api.services.proximal_service import (
     add_location_emoji,
     create_location_from_place_details,
-    fetch_google_place_details,
     fetch_google_place_basic_details,
     refresh_location_from_google_place_details,
-    text_search,
 )
+from pinit.api.schemas_magic import MagicIntent, MagicSearchDebug
 from pinit.api.services.background_jobs import get_background_job_runner
+from pinit.api.services.magic_google_service import get_or_fetch_google_candidates
+from pinit.api.services.magic_intent_parser import normalise_prompt, parse_magic_intent
 from pinit.api.schemas_location_tasks import PipelinePayload
 from pinit.api.services.location_tasks import InProcessDispatcher, PubSubDispatcher, run_pipeline_inline
 from pinit.api.services.cache_service import get_cache_service
+from pinit.core.recommendation.magic_explanations import build_magic_sections
+from pinit.core.recommendation.magic_ranking import (
+    dedupe_magic_candidates,
+    rerank_magic_candidates,
+)
 from pinit.core.recommendation.proximal_recommendation import (
     ProximalConfig,
     build_batch_proximal_recommendations,
@@ -1583,6 +1594,9 @@ async def add_location_by_place_id(request: AddLocationRequest) -> AddLocationRe
       TikTok vibe blending (aggregates ALL video_insights rows for this
       location). Also updates reccomended_dishes with top 3 key_dishes.
       Skips Google Places API entirely.
+    - **Existing + source='magic-search-open'**: Re-run full enrichment fan-out
+      asynchronously so temporary magic-search cards become canonical records
+      with details, emoji, photos, menu analysis, and vibe tags.
     - **Existing + source='in-app'/'instagram'**: Re-process vibe tagging
       ONLY if updated_vibe is False or NULL. Skips Google Places API.
     """
@@ -1701,64 +1715,486 @@ async def add_location_by_place_id(request: AddLocationRequest) -> AddLocationRe
     # Note: errors above are raised as HTTPException to surface to clients.
 
 
+def _magic_search_negative_location_id(google_place_id: str) -> int:
+    digest = hashlib.sha1(google_place_id.encode("utf-8")).hexdigest()
+    return -int(digest[:12], 16)
+
+
+def _magic_search_place_name(place: Dict[str, Any]) -> str:
+    display = place.get("displayName")
+    if isinstance(display, dict):
+        text = str(display.get("text") or "").strip()
+        if text:
+            return text
+    for key in ("name", "shortFormattedAddress", "formattedAddress"):
+        value = str(place.get(key) or "").strip()
+        if value:
+            return value
+    return "Unknown place"
+
+
+def _magic_search_place_price_level(place: Dict[str, Any]) -> Optional[float]:
+    value = place.get("priceLevel")
+    if isinstance(value, (int, float)):
+        return float(value)
+    price_map = {
+        "PRICE_LEVEL_FREE": 0.0,
+        "PRICE_LEVEL_INEXPENSIVE": 1.0,
+        "PRICE_LEVEL_MODERATE": 2.0,
+        "PRICE_LEVEL_EXPENSIVE": 3.0,
+        "PRICE_LEVEL_VERY_EXPENSIVE": 4.0,
+    }
+    return price_map.get(str(value or "").strip().upper())
+
+
+def _magic_search_photo_reference(place: Dict[str, Any]) -> Optional[str]:
+    photos = place.get("photos")
+    if not isinstance(photos, list):
+        return None
+    for photo in photos:
+        if not isinstance(photo, dict):
+            continue
+        name = str(photo.get("name") or "").strip()
+        if name:
+            return name
+    return None
+
+
+def _magic_search_google_baseline_score(rating: Any, user_ratings_total: Any) -> float:
+    try:
+        rating_score = max(0.0, min(float(rating or 0.0) / 5.0, 1.0))
+    except (TypeError, ValueError):
+        rating_score = 0.0
+    try:
+        review_count = max(0.0, float(user_ratings_total or 0.0))
+    except (TypeError, ValueError):
+        review_count = 0.0
+    review_score = min(math.log1p(review_count) / math.log1p(1000.0), 1.0)
+    if rating_score <= 0.0 and review_score <= 0.0:
+        return 0.35
+    return max(0.0, min((rating_score * 0.75) + (review_score * 0.25), 1.0))
+
+
+def _magic_search_action_adjusted_score(candidate: Dict[str, Any]) -> float:
+    base = float(candidate.get("final_score") or 0.0)
+    saves = int(candidate.get("saves_count") or 0)
+    been_to = int(candidate.get("been_to_count") or 0)
+    likes = int(candidate.get("likes_count") or 0)
+    shares = int(candidate.get("share_count") or 0)
+    dislikes = int(candidate.get("dislikes_count") or 0)
+    boost = min(0.25, saves * 0.015 + been_to * 0.010 + likes * 0.012 + shares * 0.010)
+    penalty = min(0.35, dislikes * 0.040)
+    return max(0.0, base + boost - penalty)
+
+
+def _coerce_optional_bool(value: Any) -> Optional[bool]:
+    """Coerce DB / Places-v1 booleans, ignoring NaN/None and unrecognised values."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    try:
+        if pd.isna(value):
+            return None
+    except TypeError:
+        pass
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if s == "true":
+            return True
+        if s == "false":
+            return False
+    return None
+
+
+def _coerce_opening_hours_text(value: Any) -> Optional[List[str]]:
+    """Normalise opening_hours_text from a DB column or external candidate."""
+    if value is None:
+        return None
+    if isinstance(value, list):
+        cleaned = [str(item).strip() for item in value if str(item or "").strip()]
+        return cleaned or None
+    if isinstance(value, str):
+        text = value.strip()
+        return [text] if text else None
+    return None
+
+
+def _magic_search_rich_fields(candidate: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract rich place fields (website, summaries, vibe booleans, …) for the response.
+
+    Works uniformly for known DB rows (which already use snake_case column
+    names) and for external Places-v1 candidates produced by
+    ``_magic_search_external_candidate``.
+    """
+    return {
+        "formatted_address": _safe_optional_str(candidate.get("formatted_address")),
+        "business_status": _safe_optional_str(candidate.get("business_status")),
+        "google_maps_uri": _safe_optional_str(candidate.get("google_maps_uri")),
+        "website": _safe_optional_str(candidate.get("website")),
+        "international_phone_number": _safe_optional_str(
+            candidate.get("international_phone_number")
+        ),
+        "editorial_summary": _safe_optional_str(candidate.get("editorial_summary")),
+        "review_summary": _safe_optional_str(candidate.get("review_summary")),
+        "opening_hours_text": _coerce_opening_hours_text(
+            candidate.get("opening_hours_text")
+        ),
+        "good_for_children": _coerce_optional_bool(candidate.get("good_for_children")),
+        "good_for_groups": _coerce_optional_bool(candidate.get("good_for_groups")),
+        "good_for_watching_sports": _coerce_optional_bool(
+            candidate.get("good_for_watching_sports")
+        ),
+        "live_music": _coerce_optional_bool(candidate.get("live_music")),
+        "outdoor_seating": _coerce_optional_bool(candidate.get("outdoor_seating")),
+        "serves_beer": _coerce_optional_bool(candidate.get("serves_beer")),
+        "serves_breakfast": _coerce_optional_bool(candidate.get("serves_breakfast")),
+        "serves_brunch": _coerce_optional_bool(candidate.get("serves_brunch")),
+        "serves_cocktails": _coerce_optional_bool(candidate.get("serves_cocktails")),
+        "serves_coffee": _coerce_optional_bool(candidate.get("serves_coffee")),
+        "serves_dessert": _coerce_optional_bool(candidate.get("serves_dessert")),
+        "serves_dinner": _coerce_optional_bool(candidate.get("serves_dinner")),
+        "serves_lunch": _coerce_optional_bool(candidate.get("serves_lunch")),
+        "serves_vegetarian_food": _coerce_optional_bool(
+            candidate.get("serves_vegetarian_food")
+        ),
+        "serves_wine": _coerce_optional_bool(candidate.get("serves_wine")),
+    }
+
+
+def _magic_search_summary_text(value: Any) -> Optional[str]:
+    """Pull the human-readable text from a Places v1 summary object.
+
+    Both ``editorialSummary`` and ``reviewSummary`` come back as nested
+    LocalizedText / SummaryText objects. ``reviewSummary.text`` is itself a
+    LocalizedText with its own ``text`` field, while ``editorialSummary``
+    directly carries a ``text`` string.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        return text or None
+    if isinstance(value, dict):
+        candidate = value.get("text")
+        if isinstance(candidate, dict):
+            candidate = candidate.get("text")
+        if isinstance(candidate, str):
+            text = candidate.strip()
+            return text or None
+    return None
+
+
+def _magic_search_opening_hours_text(place: Dict[str, Any]) -> Optional[List[str]]:
+    """Return the weekday-by-weekday opening hours strings, if available."""
+    hours = place.get("currentOpeningHours") or place.get("regularOpeningHours") or {}
+    if not isinstance(hours, dict):
+        return None
+    descriptions = hours.get("weekdayDescriptions")
+    if not isinstance(descriptions, list):
+        return None
+    cleaned = [str(item).strip() for item in descriptions if str(item or "").strip()]
+    return cleaned or None
+
+
+def _fill_missing_magic_search_google_fields(
+    candidate: Dict[str, Any],
+    place: Optional[Dict[str, Any]],
+) -> None:
+    """Fill DB candidates with Google Text Search fields not stored locally yet."""
+    if not place:
+        return
+
+    location = place.get("location") or {}
+    types = place.get("types") or []
+    opening = place.get("currentOpeningHours") or {}
+    google_fields = {
+        "formatted_address": place.get("formattedAddress"),
+        "business_status": place.get("businessStatus"),
+        "google_maps_uri": place.get("googleMapsUri"),
+        "website": place.get("websiteUri"),
+        "international_phone_number": place.get("internationalPhoneNumber"),
+        "editorial_summary": _magic_search_summary_text(place.get("editorialSummary")),
+        "review_summary": _magic_search_summary_text(place.get("reviewSummary")),
+        "opening_hours_text": _magic_search_opening_hours_text(place),
+        "photo_reference": _magic_search_photo_reference(place),
+        "lat": location.get("latitude"),
+        "lng": location.get("longitude"),
+        "types": ",".join(types) if isinstance(types, list) else str(types),
+        "open_now": opening.get("openNow"),
+        "good_for_children": place.get("goodForChildren"),
+        "good_for_groups": place.get("goodForGroups"),
+        "good_for_watching_sports": place.get("goodForWatchingSports"),
+        "live_music": place.get("liveMusic"),
+        "outdoor_seating": place.get("outdoorSeating"),
+        "serves_beer": place.get("servesBeer"),
+        "serves_breakfast": place.get("servesBreakfast"),
+        "serves_brunch": place.get("servesBrunch"),
+        "serves_cocktails": place.get("servesCocktails"),
+        "serves_coffee": place.get("servesCoffee"),
+        "serves_dessert": place.get("servesDessert"),
+        "serves_dinner": place.get("servesDinner"),
+        "serves_lunch": place.get("servesLunch"),
+        "serves_vegetarian_food": place.get("servesVegetarianFood"),
+        "serves_wine": place.get("servesWine"),
+    }
+
+    for key, value in google_fields.items():
+        if value in (None, "", []):
+            continue
+        if candidate.get(key) in (None, "", []):
+            candidate[key] = value
+
+
+def _magic_search_external_candidate(
+    place: Dict[str, Any],
+    *,
+    request_lat: float,
+    request_lng: float,
+    search_position: int,
+) -> Optional[Dict[str, Any]]:
+    from pinit.core.recommendation.proximal_recommendation import haversine_distance
+
+    gid = str(place.get("id") or "").strip()
+    location = place.get("location") or {}
+    lat = location.get("latitude")
+    lng = location.get("longitude")
+    if not gid or lat is None or lng is None:
+        return None
+
+    opening = place.get("currentOpeningHours") or {}
+    open_now = opening.get("openNow")
+    if open_now is False:
+        return None
+
+    lat_f = float(lat)
+    lng_f = float(lng)
+    distance_km = haversine_distance(request_lat, request_lng, lat_f, lng_f)
+    rating = place.get("rating")
+    reviews = place.get("userRatingCount")
+    quality_score = _magic_search_google_baseline_score(rating, reviews)
+    distance_score = max(0.0, 1.0 - min(distance_km / 5.0, 1.0))
+    order_score = max(0.0, 1.0 - min(search_position, 20) / 20.0)
+    final_score = (
+        quality_score * 0.72
+        + distance_score * 0.18
+        + order_score * 0.10
+    )
+    types = place.get("types") or []
+
+    return {
+        "location_id": _magic_search_negative_location_id(gid),
+        "google_place_id": gid,
+        "is_known_location": False,
+        "name": _magic_search_place_name(place),
+        "vicinity": place.get("shortFormattedAddress") or place.get("formattedAddress"),
+        "formatted_address": place.get("formattedAddress"),
+        "business_status": place.get("businessStatus"),
+        "google_maps_uri": place.get("googleMapsUri"),
+        "website": place.get("websiteUri"),
+        "international_phone_number": place.get("internationalPhoneNumber"),
+        "editorial_summary": _magic_search_summary_text(place.get("editorialSummary")),
+        "review_summary": _magic_search_summary_text(place.get("reviewSummary")),
+        "opening_hours_text": _magic_search_opening_hours_text(place),
+        "lat": lat_f,
+        "lng": lng_f,
+        "types": ",".join(types) if isinstance(types, list) else str(types),
+        "open_now": open_now,
+        "rating": float(rating) if rating is not None else None,
+        "user_ratings_total": int(reviews) if reviews is not None else None,
+        "price_level": _magic_search_place_price_level(place),
+        "photo_reference": _magic_search_photo_reference(place),
+        "distance_km": distance_km,
+        "vibe_score": 0.0,
+        "dietary_score": 0.0,
+        "quality_score": quality_score,
+        "social_score": 0.0,
+        "collaborative_score": 0.0,
+        "final_score": max(0.0, min(final_score, 1.0)),
+        "good_for_children": place.get("goodForChildren"),
+        "good_for_groups": place.get("goodForGroups"),
+        "good_for_watching_sports": place.get("goodForWatchingSports"),
+        "live_music": place.get("liveMusic"),
+        "outdoor_seating": place.get("outdoorSeating"),
+        "serves_beer": place.get("servesBeer"),
+        "serves_breakfast": place.get("servesBreakfast"),
+        "serves_brunch": place.get("servesBrunch"),
+        "serves_cocktails": place.get("servesCocktails"),
+        "serves_coffee": place.get("servesCoffee"),
+        "serves_dessert": place.get("servesDessert"),
+        "serves_dinner": place.get("servesDinner"),
+        "serves_lunch": place.get("servesLunch"),
+        "serves_vegetarian_food": place.get("servesVegetarianFood"),
+        "serves_wine": place.get("servesWine"),
+    }
+
+
+def _get_or_parse_magic_intent(
+    prompt: str,
+    cache_service: Any,
+) -> tuple[MagicIntent, bool]:
+    normalised = normalise_prompt(prompt)
+    cached = None
+    if hasattr(cache_service, "get_magic_intent"):
+        cached = cache_service.get_magic_intent(normalised)
+    if cached:
+        payload = cached.get("intent", cached)
+        return MagicIntent.model_validate(payload), True
+
+    intent = parse_magic_intent(prompt)
+    if hasattr(cache_service, "set_magic_intent"):
+        cache_service.set_magic_intent(
+            normalised,
+            {
+                "intent": intent.model_dump(mode="json"),
+                "cached_at": datetime.utcnow().isoformat(),
+            },
+        )
+    logger.info("Parsed magic intent from prompt=%r: %s", prompt, intent.model_dump())
+    return intent, False
+
+
+async def _get_magic_user_profile(
+    user_id: str,
+    cache_service: Any,
+    supabase: Any,
+) -> tuple[Optional[Dict[str, Any]], bool]:
+    if hasattr(cache_service, "get_user_profile"):
+        cached = await asyncio.to_thread(cache_service.get_user_profile, user_id)
+        if cached is not None:
+            return cached, True
+
+    if hasattr(cache_service, "get_or_build_user_profile"):
+        profile = await asyncio.to_thread(
+            cache_service.get_or_build_user_profile,
+            user_id,
+            supabase,
+        )
+        return profile, False
+
+    profile = await asyncio.to_thread(supabase.get_user, user_id)
+    if not profile:
+        return None, False
+    return {
+        "user_id": user_id,
+        "vibe_vector": profile.get("vibe_tag_affinity"),
+        "dietary_vector": profile.get("dietary_requirement_tag_affinity"),
+        "action_count": 0,
+        "exists": True,
+    }, False
+
+
 @router.post("/locations/magic-search", response_model=MagicSearchResponse)
 async def magic_search(request: MagicSearchRequest) -> MagicSearchResponse:
     """
-    Search Google Places with a free-text prompt, ingest results, and rank them.
+    Search Google Places with a free-text prompt and rank known + external results.
 
     Flow:
     1. Text Search (New) API → raw place dicts with enterprise-tier fields
-    2. Upsert any new places into the database via fetch_google_place_details
-    3. Load full location rows (quality_score, vibe_vector, etc.) from DB
-    4. Rank with _rank_cached_candidates (user-personalised scoring)
+    2. Batch-load Supabase rows for place IDs already known to the database
+    3. Build lightweight baseline candidates for unknown Google places
+    4. Rank known places with app signals and unknown places with Google baseline
     5. Return MagicSearchResponse
     """
+    started_at = perf_counter()
+    radius_km = request.radius_km or 2.0
+    debug = MagicSearchDebug()
     supabase = get_supabase_service()
+    cache_service = get_cache_service()
 
-    # Validate user exists
-    user_data = supabase.get_user(request.user_id)
-    if not user_data:
-        raise HTTPException(status_code=404, detail=f"User '{request.user_id}' not found")
-
-    _FOOD_TYPES = ["restaurant", "cafe", "bar", "bakery", "meal_takeaway", "night_club"]
     _FOOD_TYPES_SET = {
         "restaurant", "cafe", "bar", "food", "bakery",
         "meal_delivery", "meal_takeaway", "night_club",
     }
 
-    # Step 1: Text search — returns raw Places API v1 place dicts
+    intent_started = perf_counter()
+    intent_task = asyncio.create_task(
+        asyncio.to_thread(_get_or_parse_magic_intent, request.prompt, cache_service)
+    )
+    profile_task = asyncio.create_task(
+        _get_magic_user_profile(request.user_id, cache_service, supabase)
+    )
+
     try:
-        places, api_calls = text_search(
-            query=request.prompt,
-            place_types=_FOOD_TYPES,
-            lat=request.latitude,
-            lng=request.longitude,
-            radius_m=(request.radius_km or 2.0) * 1000,
+        intent, _cache_hit_intent = await intent_task
+        debug.intent_parse_latency_ms = (perf_counter() - intent_started) * 1000.0
+        debug.google_queries = intent.google_queries
+
+        google_started = perf_counter()
+        google_task = asyncio.create_task(
+            get_or_fetch_google_candidates(
+                intent,
+                lat=request.latitude,
+                lng=request.longitude,
+                radius_km=radius_km,
+                cache=cache_service,
+            )
         )
+
+        user_profile, profile_cache_hit = await profile_task
+        debug.cache_hit_user_profile = profile_cache_hit
+        if not user_profile:
+            google_task.cancel()
+            raise HTTPException(
+                status_code=404,
+                detail=f"User '{request.user_id}' not found",
+            )
+
+        google_result = await google_task
+        debug.google_search_latency_ms = (perf_counter() - google_started) * 1000.0
+        debug.cache_hit_google_search = google_result.cache_hit_google_search
+        debug.total_google_calls = google_result.total_google_calls
+        debug.total_candidates_before_dedupe = (
+            google_result.total_candidates_before_dedupe
+        )
+        debug.total_candidates_after_dedupe = (
+            google_result.total_candidates_after_dedupe
+        )
+        if google_result.google_queries:
+            debug.google_queries = google_result.google_queries
+        places = google_result.places
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     logger.info(
-        "Magic search: text_search returned %d places for prompt=%r (%d API calls)",
-        len(places), request.prompt, api_calls,
+        "Magic search: async Google returned %d places for prompt=%r (%d API calls, cache_hit=%s)",
+        len(places),
+        request.prompt,
+        debug.total_google_calls,
+        debug.cache_hit_google_search,
+    )
+
+    logger.info(
+        "Magic search: raw places returned (id: name): %s",
+        [(place.get("id"), place.get("display_name")) for place in places],
     )
 
     if not places:
+        debug.magic_search_latency_ms = (perf_counter() - started_at) * 1000.0
+        logger.info("Magic search metrics: %s", debug.model_dump())
         return MagicSearchResponse(
             user_id=request.user_id,
             center_lat=request.latitude,
             center_lon=request.longitude,
             prompt=request.prompt,
-            radius_km=request.radius_km,
+            radius_km=radius_km,
             total_candidates=0,
             total_ranked=0,
             recommendations=[],
+            sections=[],
+            debug=debug,
             timestamp=datetime.utcnow().isoformat(),
         )
 
+    hydration_started = perf_counter()
+
     # Step 2: Filter to food-type places and collect their google_place_ids
     food_place_ids: List[str] = []
-    place_types_by_id: Dict[str, List[str]] = {}
+    place_by_id: Dict[str, Dict[str, Any]] = {}
     for place in places:
         gid = place.get("id")
         if not gid:
@@ -1768,83 +2204,100 @@ async def magic_search(request: MagicSearchRequest) -> MagicSearchResponse:
         if types_raw and not any(t in _FOOD_TYPES_SET for t in types_raw):
             continue
         food_place_ids.append(gid)
-        place_types_by_id[gid] = types_raw
+        place_by_id[gid] = place
 
     # Batch-fetch all already-known locations in a single DB round-trip
     existing_by_gid = supabase.get_locations_by_google_place_ids(food_place_ids)
 
-    # For places not yet in the DB, fetch details + upsert one by one
     location_ids_to_fetch: List[int] = []
+    gid_by_location_id: Dict[int, str] = {}
     for gid in food_place_ids:
         if gid in existing_by_gid:
-            location_ids_to_fetch.append(existing_by_gid[gid]["location_id"])
-        else:
-            place_details = fetch_google_place_details(gid)
-            if not place_details:
-                continue
-            fetched_types = place_details.get("types", [])
-            if isinstance(fetched_types, str):
-                fetched_types = [t.strip() for t in fetched_types.split(",")]
-            if fetched_types and not any(t in _FOOD_TYPES_SET for t in fetched_types):
-                continue
-            lid = place_details.get("location_id")
+            lid = existing_by_gid[gid].get("location_id")
             if lid:
-                location_ids_to_fetch.append(lid)
+                lid_int = int(lid)
+                location_ids_to_fetch.append(lid_int)
+                gid_by_location_id[lid_int] = gid
 
     # Batch-fetch all full rows (quality_score, vibe_vector, etc.) in one query
     candidates: List[Dict[str, Any]] = supabase.get_locations_by_ids(location_ids_to_fetch)
+    for candidate in candidates:
+        loc_id = int(candidate.get("location_id"))
+        gid = gid_by_location_id.get(loc_id)
+        candidate.setdefault("google_place_id", gid)
+        candidate["is_known_location"] = True
+        _fill_missing_magic_search_google_fields(candidate, place_by_id.get(gid or ""))
 
     # Keep only places that are currently open (or whose status is unknown / not stored)
-    before_open_filter = len(candidates)
-    candidates = [c for c in candidates if c.get("open_now") is not False]
-    logger.info(
-        "Magic search: %d food locations collected, %d open (filtered %d closed)",
-        before_open_filter, len(candidates), before_open_filter - len(candidates),
-    )
+    # before_open_filter = len(candidates)
+    # candidates = [c for c in candidates if c.get("open_now") is not False]
+    # logger.info(
+    #     "Magic search: %d food locations collected, %d open (filtered %d closed)",
+    #     before_open_filter, len(candidates), before_open_filter - len(candidates),
+    # )
 
-    if not candidates:
-        return MagicSearchResponse(
-            user_id=request.user_id,
-            center_lat=request.latitude,
-            center_lon=request.longitude,
-            prompt=request.prompt,
-            radius_km=request.radius_km,
-            total_candidates=len(places),
-            total_ranked=0,
-            recommendations=[],
-            timestamp=datetime.utcnow().isoformat(),
+    external_candidates: List[Dict[str, Any]] = []
+    for index, gid in enumerate(food_place_ids):
+        if gid in existing_by_gid:
+            continue
+        external = _magic_search_external_candidate(
+            place_by_id[gid],
+            request_lat=request.latitude,
+            request_lng=request.longitude,
+            search_position=index,
         )
+        if external is not None:
+            external_candidates.append(external)
+    debug.place_hydration_latency_ms = (perf_counter() - hydration_started) * 1000.0
 
     logger.info(
         "Magic search: fetched the following candidates for ranking (location_id: name): %s",
         [(c["location_id"], c["name"]) for c in candidates],
     )
     # Step 4: Rank using the shared cache-style ranking (user-personalised scores)
+    rerank_started = perf_counter()
+    ranking_radius_km = max(radius_km, 50.0) if intent.location_name else radius_km
     scored = _rank_cached_candidates(
         candidates=candidates,
         request_lat=request.latitude,
         request_lng=request.longitude,
-        request_radius_km=request.radius_km or 2.0,
+        request_radius_km=ranking_radius_km,
         quality_weight=0.30,
         vibe_weight=0.25,
         dietary_weight=0.10,
-        max_results=request.max_results or 20,
+        max_results=max(len(candidates), request.max_results or 20),
         user_id=request.user_id,
         social_weight=0.20,
         collaborative_weight=0.15,
+        user_profile=user_profile,
     )
+    for candidate in scored:
+        candidate["final_score"] = _magic_search_action_adjusted_score(candidate)
+
+    combined_scored = dedupe_magic_candidates(scored + external_candidates)
+    combined_scored = rerank_magic_candidates(
+        combined_scored,
+        intent=intent,
+        request_radius_km=ranking_radius_km,
+    )
+    combined_scored = combined_scored[: request.max_results or 20]
+    for rank, candidate in enumerate(combined_scored, start=1):
+        candidate["rank"] = rank
+    debug.rerank_latency_ms = (perf_counter() - rerank_started) * 1000.0
 
     # Step 5: Build response
     recommendations = []
-    for candidate in scored:
+    for candidate in combined_scored:
         friend_saves_raw = candidate.get("friend_saves")
         friend_saves = None
         if friend_saves_raw and isinstance(friend_saves_raw, list):
             friend_saves = [FriendSave(**fs) for fs in friend_saves_raw]
 
         recommendations.append(
-            LocationRecommendation(
+            MagicLocationRecommendation(
                 location_id=int(candidate["location_id"]),
+                google_place_id=_safe_optional_str(candidate.get("google_place_id")),
+                is_known_location=bool(candidate.get("is_known_location", True)),
                 name=candidate["name"],
                 vicinity=_safe_optional_str(candidate.get("vicinity")),
                 cuisine_primary=_safe_optional_str(candidate.get("cuisine_primary")),
@@ -1855,6 +2308,11 @@ async def magic_search(request: MagicSearchRequest) -> MagicSearchResponse:
                 price_level=float(candidate["price_level"])
                 if candidate.get("price_level") is not None
                 else None,
+                photo_reference=_safe_optional_str(candidate.get("photo_reference")),
+                lat=float(candidate["lat"]) if candidate.get("lat") is not None else None,
+                lng=float(candidate["lng"]) if candidate.get("lng") is not None else None,
+                types=_safe_optional_str(candidate.get("types")),
+                open_now=candidate.get("open_now"),
                 distance_km=float(candidate["distance_km"]),
                 vibe_score=float(candidate["vibe_score"]),
                 dietary_score=float(candidate["dietary_score"]),
@@ -1863,25 +2321,39 @@ async def magic_search(request: MagicSearchRequest) -> MagicSearchResponse:
                 collaborative_score=float(candidate.get("collaborative_score", 0.0)),
                 final_score=float(candidate["final_score"]),
                 rank=int(candidate["rank"]),
+                source=list(candidate.get("source") or []),
+                match_reasons=list(candidate.get("match_reasons") or []),
+                intent_matches=dict(candidate.get("intent_matches") or {}),
+                confidence=float(candidate.get("confidence") or candidate["final_score"]),
                 friend_saves=friend_saves,
                 **_photo_fields(candidate),
+                **_magic_search_rich_fields(candidate),
             )
         )
+    sections = [
+        MagicSearchSection(**section)
+        for section in build_magic_sections(recommendations)
+    ]
 
     logger.info(
         "Magic search complete: prompt=%r, %d candidates → %d ranked",
         request.prompt, len(places), len(recommendations),
     )
+    debug.total_ranked = len(recommendations)
+    debug.magic_search_latency_ms = (perf_counter() - started_at) * 1000.0
+    logger.info("Magic search metrics: %s", debug.model_dump())
 
     return MagicSearchResponse(
         user_id=request.user_id,
         center_lat=request.latitude,
         center_lon=request.longitude,
         prompt=request.prompt,
-        radius_km=request.radius_km,
+        radius_km=radius_km,
         total_candidates=len(places),
         total_ranked=len(recommendations),
         recommendations=recommendations,
+        sections=sections,
+        debug=debug,
         timestamp=datetime.utcnow().isoformat(),
     )
 

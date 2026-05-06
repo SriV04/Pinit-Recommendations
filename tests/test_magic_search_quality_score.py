@@ -25,6 +25,9 @@ class _FakeResponse:
             "name": "Known Place",
             "location_popularity_app": [
                 {
+                    "saves_count": 9,
+                    "dislikes_count": 2,
+                    "been_to_count": 3,
                     "app_engagement_score": 0.72,
                     "google_baseline_score": 0.48,
                     "video_insight_score": 0.25,
@@ -63,6 +66,50 @@ class _FakeClient:
 
 
 class MagicSearchQualityScoreTests(unittest.TestCase):
+    def test_magic_search_action_adjustment_boosts_saves_and_penalises_dislikes(self) -> None:
+        saved = {"final_score": 0.50, "saves_count": 8, "been_to_count": 1, "dislikes_count": 0}
+        disliked = {"final_score": 0.50, "saves_count": 0, "been_to_count": 0, "dislikes_count": 4}
+
+        self.assertGreater(
+            proximal._magic_search_action_adjusted_score(saved),
+            proximal._magic_search_action_adjusted_score(disliked),
+        )
+        self.assertGreater(proximal._magic_search_action_adjusted_score(saved), 0.50)
+        self.assertLess(proximal._magic_search_action_adjusted_score(disliked), 0.50)
+
+    def test_magic_search_external_candidate_uses_negative_id_and_google_baseline(self) -> None:
+        candidate = proximal._magic_search_external_candidate(
+            {
+                "id": "google-new-place",
+                "displayName": {"text": "New Place"},
+                "shortFormattedAddress": "New Street",
+                "types": ["restaurant"],
+                "location": {"latitude": 51.501, "longitude": -0.121},
+                "rating": 4.7,
+                "userRatingCount": 240,
+                "currentOpeningHours": {"openNow": True},
+                "photos": [
+                    {"name": "places/google-new-place/photos/photo-1"},
+                ],
+            },
+            request_lat=51.500,
+            request_lng=-0.120,
+            search_position=0,
+        )
+
+        self.assertIsNotNone(candidate)
+        assert candidate is not None
+        self.assertLess(candidate["location_id"], 0)
+        self.assertEqual(candidate["google_place_id"], "google-new-place")
+        self.assertEqual(candidate["name"], "New Place")
+        self.assertFalse(candidate["is_known_location"])
+        self.assertEqual(
+            candidate["photo_reference"],
+            "places/google-new-place/photos/photo-1",
+        )
+        self.assertGreater(candidate["quality_score"], 0)
+        self.assertGreater(candidate["final_score"], 0)
+
     def test_ranked_candidates_include_quality_score_when_source_row_lacks_pillars(self) -> None:
         candidate = {
             "location_id": 101,
@@ -98,6 +145,10 @@ class MagicSearchQualityScoreTests(unittest.TestCase):
         rows = service.get_locations_by_ids([101])
 
         self.assertIn("location_popularity_app", service.client.query.selected)
+        self.assertIn("saves_count", service.client.query.selected)
+        self.assertEqual(rows[0]["saves_count"], 9)
+        self.assertEqual(rows[0]["dislikes_count"], 2)
+        self.assertEqual(rows[0]["been_to_count"], 3)
         self.assertEqual(rows[0]["app_engagement_score"], 0.72)
         self.assertEqual(rows[0]["google_baseline_score"], 0.48)
         self.assertEqual(rows[0]["video_insight_score"], 0.25)

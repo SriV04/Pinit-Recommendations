@@ -448,6 +448,7 @@ class SupabaseService:
             self.client.table("locations")
             .select(
                 "*,location_popularity_app("
+                "saves_count,dislikes_count,been_to_count,"
                 "app_engagement_score,google_baseline_score,"
                 "video_insight_score,share_count,quality_bias:quality_score"
                 ")"
@@ -469,6 +470,9 @@ class SupabaseService:
 
             if isinstance(lpa, dict):
                 for key in (
+                    "saves_count",
+                    "dislikes_count",
+                    "been_to_count",
                     "app_engagement_score",
                     "google_baseline_score",
                     "video_insight_score",
