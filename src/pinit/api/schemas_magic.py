@@ -16,6 +16,7 @@ class MagicIntent(BaseModel):
     dietary: List[str] = Field(default_factory=list)
     time_context: Optional[str] = None
     location_name: Optional[str] = None
+    location_rectangle: Optional[Dict[str, Dict[str, float]]] = None
 
     positive_terms: List[str] = Field(default_factory=list)
     negative_terms: List[str] = Field(default_factory=list)

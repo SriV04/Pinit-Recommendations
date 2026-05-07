@@ -78,8 +78,26 @@ class MagicSearchInfrastructureTests(unittest.TestCase):
         self.assertEqual(intent.budget, "cheap")
         self.assertEqual(intent.time_context, "tonight")
         self.assertEqual(intent.included_types, ["restaurant"])
-        self.assertEqual(intent.google_queries[:2], ["thai restaurant", "casual thai restaurant"])
-        self.assertLessEqual(len(intent.google_queries), 3)
+        self.assertEqual(intent.google_queries, ["cheap vibey Thai for a group tonight"])
+        self.assertEqual(
+            intent.location_rectangle,
+            {
+                "low": {"latitude": 51.4100, "longitude": -0.3250},
+                "high": {"latitude": 51.5680, "longitude": 0.0200},
+            },
+        )
+
+    def test_parse_magic_intent_uses_area_rectangle_when_prompt_mentions_london_area(self) -> None:
+        intent = parse_magic_intent("cheap sushi on old compton street")
+
+        self.assertEqual(intent.google_queries, ["cheap sushi on old compton street"])
+        self.assertEqual(
+            intent.location_rectangle,
+            {
+                "low": {"latitude": 51.5090, "longitude": -0.1435},
+                "high": {"latitude": 51.5175, "longitude": -0.1290},
+            },
+        )
 
     def test_parse_magic_intent_extracts_prompt_location(self) -> None:
         northolt = parse_magic_intent("Bougie Turkish in Northolt")
@@ -90,8 +108,8 @@ class MagicSearchInfrastructureTests(unittest.TestCase):
         self.assertEqual(northolt.cleaned_query, "turkish restaurant in northolt")
         self.assertEqual(london.cleaned_query, "turkish restaurant in london")
         self.assertNotEqual(northolt.google_queries, london.google_queries)
-        self.assertIn("turkish restaurant in northolt", northolt.google_queries)
-        self.assertIn("turkish restaurant in london", london.google_queries)
+        self.assertEqual(northolt.google_queries, ["Bougie Turkish in Northolt"])
+        self.assertEqual(london.google_queries, ["Bougie Turkish in London"])
 
     def test_parse_magic_intent_preserves_formal_dinner_modifier(self) -> None:
         intent = parse_magic_intent("formal dinner in hammersmith river")
@@ -108,7 +126,7 @@ class MagicSearchInfrastructureTests(unittest.TestCase):
         )
         self.assertEqual(
             intent.google_queries[0],
-            "formal dinner restaurant in hammersmith river",
+            "formal dinner in hammersmith river",
         )
 
     def test_magic_cache_helpers_round_trip_compressed_payloads(self) -> None:
@@ -119,7 +137,7 @@ class MagicSearchInfrastructureTests(unittest.TestCase):
 
         self.assertTrue(cache.set_magic_intent("brunch", intent_payload))
         self.assertEqual(cache.get_magic_intent("brunch"), intent_payload)
-        self.assertEqual(cache._redis_client.ttls["magic:intent:v2:brunch"], 7 * 24 * 60 * 60)
+        self.assertEqual(cache._redis_client.ttls["magic:intent:v3:brunch"], 7 * 24 * 60 * 60)
 
         google_key = cache.build_magic_google_text_key(
             "brunch restaurant",
@@ -224,6 +242,41 @@ class MagicGoogleServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(client.calls), 1)
         self.assertEqual(result.google_queries, ["thai restaurant"])
+
+    async def test_async_google_fetch_uses_raw_prompt_and_rectangle_restriction(self) -> None:
+        intent = parse_magic_intent("cheap sushi on old compton street")
+        client = _FakeAsyncClient(
+            [
+                [
+                    {"id": f"primary-{idx}", "types": ["restaurant"]}
+                    for idx in range(16)
+                ],
+            ]
+        )
+
+        result = await get_or_fetch_google_candidates(
+            intent,
+            lat=40.7128,
+            lng=-74.0060,
+            radius_km=2.0,
+            cache=None,
+            api_key="test-key",
+            client=client,
+        )
+
+        self.assertEqual(result.google_queries, ["cheap sushi on old compton street"])
+        body = client.calls[0]["json"]
+        self.assertEqual(body["textQuery"], "cheap sushi on old compton street")
+        self.assertEqual(
+            body["locationRestriction"],
+            {
+                "rectangle": {
+                    "low": {"latitude": 51.5090, "longitude": -0.1435},
+                    "high": {"latitude": 51.5175, "longitude": -0.1290},
+                }
+            },
+        )
+        self.assertNotIn("locationBias", body)
 
 
 if __name__ == "__main__":

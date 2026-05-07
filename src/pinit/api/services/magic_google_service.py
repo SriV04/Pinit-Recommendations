@@ -95,13 +95,16 @@ async def _fetch_text_search(
     body: Dict[str, Any] = {
         "textQuery": query,
         "maxResultCount": 20,
-        "locationBias": {
+    }
+    if intent.location_rectangle:
+        body["locationRestriction"] = {"rectangle": intent.location_rectangle}
+    else:
+        body["locationBias"] = {
             "circle": {
                 "center": {"latitude": lat, "longitude": lng},
                 "radius": float(radius_km * 1000.0),
             }
-        },
-    }
+        }
     if intent.included_types:
         body["includedType"] = intent.included_types[0]
 
@@ -155,6 +158,7 @@ async def get_or_fetch_google_candidates(
                     lng=lng,
                     radius_km=radius_km,
                     included_types=intent.included_types,
+                    location_rectangle=intent.location_rectangle,
                 )
                 cache_lookups += 1
                 cached_payload = cache.get_magic_google_results(cache_key)

@@ -212,7 +212,7 @@ class ProximalCacheService:
     # ============================================================================
 
     MAGIC_INTENT_TTL = 7 * 24 * 60 * 60
-    MAGIC_INTENT_KEY_VERSION = "v2"
+    MAGIC_INTENT_KEY_VERSION = "v3"
     MAGIC_GOOGLE_TEXT_TTL = 6 * 60 * 60
     MAGIC_PLACE_DETAILS_TTL = 14 * 24 * 60 * 60
     MAGIC_FINAL_RESULTS_TTL = 10 * 60
@@ -269,15 +269,22 @@ class ProximalCacheService:
         lng: float,
         radius_km: float,
         included_types: Optional[Sequence[str]] = None,
+        location_rectangle: Optional[Dict[str, Dict[str, float]]] = None,
     ) -> str:
         lat_cell, lng_cell = self._snap_coordinates(lat, lng)
         query_hash = hashlib.sha1(query.strip().lower().encode("utf-8")).hexdigest()[:16]
         types_payload = json.dumps(sorted(included_types or []), separators=(",", ":"))
         types_hash = hashlib.sha1(types_payload.encode("utf-8")).hexdigest()[:12]
+        rectangle_payload = json.dumps(
+            location_rectangle or {},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        rectangle_hash = hashlib.sha1(rectangle_payload.encode("utf-8")).hexdigest()[:12]
         radius = int(round(radius_km))
         return (
             f"magic:google:text:v1:{query_hash}:g_{lat_cell}_{lng_cell}:"
-            f"r{radius}:types_{types_hash}"
+            f"r{radius}:types_{types_hash}:rect_{rectangle_hash}"
         )
 
     def get_magic_google_results(self, key: str) -> Optional[Dict[str, Any]]:

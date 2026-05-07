@@ -6,6 +6,10 @@ import re
 from typing import Any, Iterable, List
 
 from pinit.api.schemas_magic import MagicIntent
+from pinit.api.services.london_areas import (
+    default_london_rectangle,
+    find_london_area_rectangle,
+)
 
 
 _CUISINE_ALIASES = {
@@ -246,6 +250,10 @@ def _with_location(query: str, location_name: str | None) -> str:
     return f"{query} in {location_name}"
 
 
+def _raw_query_text(prompt: str) -> str:
+    return re.sub(r"\s+", " ", prompt.strip())
+
+
 def _extract_google_query_modifiers(text: str) -> List[str]:
     return _unique(
         modifier
@@ -298,20 +306,8 @@ def _cleaned_query(
 
 
 def build_google_queries(intent: MagicIntent) -> List[str]:
-    queries = [intent.cleaned_query]
-    cuisine = intent.cuisines[0] if intent.cuisines else None
-
-    if cuisine:
-        location_suffix = f" in {intent.location_name}" if intent.location_name else ""
-        if "casual" in intent.vibe_tags:
-            queries.append(f"casual {cuisine} restaurant{location_suffix}")
-        queries.append(f"{cuisine} food{location_suffix}")
-    elif intent.occasion == "brunch":
-        queries.append(_with_location("brunch near me", intent.location_name))
-    elif intent.budget == "cheap":
-        queries.append(_with_location("cheap eats", intent.location_name))
-
-    return _unique(q for q in queries if q)[:3]
+    query = _raw_query_text(intent.raw_prompt) or intent.cleaned_query
+    return [query] if query else []
 
 
 def parse_magic_intent(prompt: str) -> MagicIntent:
@@ -325,6 +321,9 @@ def parse_magic_intent(prompt: str) -> MagicIntent:
     negative_terms = _extract_all(normalised, _NEGATIVE_PHRASES)
     included_types = _included_types(normalised, cuisines, occasion)
     location_name = _extract_location_name(normalised)
+    location_rectangle = (
+        find_london_area_rectangle(normalised) or default_london_rectangle()
+    )
     query_modifiers = _extract_google_query_modifiers(normalised)
     cleaned_query = _cleaned_query(
         normalised,
@@ -368,6 +367,7 @@ def parse_magic_intent(prompt: str) -> MagicIntent:
         dietary=dietary,
         time_context=time_context,
         location_name=location_name,
+        location_rectangle=location_rectangle,
         positive_terms=_unique(tokens),
         negative_terms=negative_terms,
         strict_constraints=strict_constraints,
