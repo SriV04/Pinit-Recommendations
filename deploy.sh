@@ -164,6 +164,7 @@ gcloud run deploy $SERVICE_NAME \
   --platform managed \
   --region $REGION \
   --allow-unauthenticated \
+  --to-latest \
   --set-env-vars "$ENV_VARS" \
   --set-secrets "$SECRETS" \
   --memory "${API_MEMORY}" \

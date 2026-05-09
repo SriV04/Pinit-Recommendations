@@ -845,6 +845,11 @@ class SupabaseService:
         response = self.client.table("locations").select("location_id", count="exact").limit(0).execute()
         return response.count if hasattr(response, 'count') and response.count is not None else 0
 
+    def count_locations_for_health(self) -> int:
+        """Get an inexpensive estimated location count for health checks."""
+        response = self.client.table("locations").select("location_id", count="planned").limit(0).execute()
+        return response.count if hasattr(response, 'count') and response.count is not None else 0
+
     def count_users(self) -> int:
         """Get total count of users without fetching rows."""
         response = self.client.table("users").select("supabase_id", count="exact").limit(0).execute()

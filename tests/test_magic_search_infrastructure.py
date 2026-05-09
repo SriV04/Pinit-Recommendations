@@ -79,13 +79,7 @@ class MagicSearchInfrastructureTests(unittest.TestCase):
         self.assertEqual(intent.time_context, "tonight")
         self.assertEqual(intent.included_types, ["restaurant"])
         self.assertEqual(intent.google_queries, ["cheap vibey Thai for a group tonight"])
-        self.assertEqual(
-            intent.location_rectangle,
-            {
-                "low": {"latitude": 51.4100, "longitude": -0.3250},
-                "high": {"latitude": 51.5680, "longitude": 0.0200},
-            },
-        )
+        self.assertIsNone(intent.location_rectangle)
 
     def test_parse_magic_intent_uses_area_rectangle_when_prompt_mentions_london_area(self) -> None:
         intent = parse_magic_intent("cheap sushi on old compton street")
@@ -137,7 +131,7 @@ class MagicSearchInfrastructureTests(unittest.TestCase):
 
         self.assertTrue(cache.set_magic_intent("brunch", intent_payload))
         self.assertEqual(cache.get_magic_intent("brunch"), intent_payload)
-        self.assertEqual(cache._redis_client.ttls["magic:intent:v3:brunch"], 7 * 24 * 60 * 60)
+        self.assertEqual(cache._redis_client.ttls["magic:intent:v4:brunch"], 7 * 24 * 60 * 60)
 
         google_key = cache.build_magic_google_text_key(
             "brunch restaurant",
@@ -242,6 +236,39 @@ class MagicGoogleServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(client.calls), 1)
         self.assertEqual(result.google_queries, ["thai restaurant"])
+
+    async def test_async_google_fetch_uses_request_coordinates_when_no_london_area(self) -> None:
+        intent = parse_magic_intent("quick coffee")
+        client = _FakeAsyncClient(
+            [
+                [
+                    {"id": f"primary-{idx}", "types": ["cafe"]}
+                    for idx in range(16)
+                ],
+            ]
+        )
+
+        await get_or_fetch_google_candidates(
+            intent,
+            lat=50.8225,
+            lng=-0.1372,
+            radius_km=1.5,
+            cache=None,
+            api_key="test-key",
+            client=client,
+        )
+
+        body = client.calls[0]["json"]
+        self.assertNotIn("locationRestriction", body)
+        self.assertEqual(
+            body["locationBias"],
+            {
+                "circle": {
+                    "center": {"latitude": 50.8225, "longitude": -0.1372},
+                    "radius": 1500.0,
+                }
+            },
+        )
 
     async def test_async_google_fetch_uses_raw_prompt_and_rectangle_restriction(self) -> None:
         intent = parse_magic_intent("cheap sushi on old compton street")

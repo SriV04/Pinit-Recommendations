@@ -747,7 +747,12 @@ async def health_check() -> HealthResponse:
 
     # Query database for counts (lightweight count-only queries)
     try:
-        locations_count = supabase.count_locations()
+        count_locations_for_health = getattr(
+            supabase,
+            "count_locations_for_health",
+            supabase.count_locations,
+        )
+        locations_count = count_locations_for_health()
         users_count = supabase.count_users()
         tags_count = supabase.count_tags()
 
@@ -2256,7 +2261,7 @@ async def magic_search(request: MagicSearchRequest) -> MagicSearchResponse:
     )
     # Step 4: Rank using the shared cache-style ranking (user-personalised scores)
     rerank_started = perf_counter()
-    ranking_radius_km = max(radius_km, 50.0) if intent.location_name else radius_km
+    ranking_radius_km = max(radius_km, 50.0) if intent.location_rectangle else radius_km
     scored = _rank_cached_candidates(
         candidates=candidates,
         request_lat=request.latitude,

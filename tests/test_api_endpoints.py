@@ -234,6 +234,20 @@ class _FailingHealthSupabase:
         raise RuntimeError("database unavailable")
 
 
+class _TimeoutExactLocationCountSupabase:
+    def count_locations(self) -> int:
+        raise RuntimeError("canceling statement due to statement timeout")
+
+    def count_locations_for_health(self) -> int:
+        return 145321
+
+    def count_users(self) -> int:
+        return 7
+
+    def count_tags(self) -> int:
+        return 25
+
+
 class _FakeDispatcher:
     dispatched: list[object] = []
 
@@ -305,6 +319,21 @@ class ProximalApiEndpointTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["status"], "unhealthy")
         self.assertFalse(response.json()["data_loaded"])
+
+    def test_health_uses_timeout_safe_location_count(self) -> None:
+        with patch.object(
+            proximal,
+            "get_supabase_service",
+            return_value=_TimeoutExactLocationCountSupabase(),
+        ):
+            response = self.client.get("/health")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "healthy")
+        self.assertTrue(response.json()["data_loaded"])
+        self.assertEqual(response.json()["total_locations"], 145321)
+        self.assertEqual(response.json()["total_users"], 7)
+        self.assertEqual(response.json()["total_tags"], 25)
 
     def test_hidden_gems_returns_ranked_under_reviewed_locations(self) -> None:
         with patch.object(proximal, "get_supabase_service", return_value=self.supabase):
@@ -646,6 +675,63 @@ class ProximalApiEndpointTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(body["total_ranked"], 1)
         self.assertEqual(body["recommendations"][0]["name"], "Hammersmith Formal")
+
+    def test_magic_search_keeps_camera_radius_for_non_area_location_phrases(self) -> None:
+        google_result = MagicGoogleSearchResult(
+            places=[
+                {
+                    "id": "known-place-id",
+                    "types": ["restaurant"],
+                    "location": {"latitude": 51.5095, "longitude": -0.1490},
+                }
+            ],
+            total_google_calls=1,
+            total_candidates_before_dedupe=1,
+            total_candidates_after_dedupe=1,
+            google_queries=["Avo toast in the sun"],
+        )
+        captured: dict[str, float] = {}
+
+        def _capture_rank(**kwargs):
+            captured["request_radius_km"] = kwargs["request_radius_km"]
+            ranked = []
+            for candidate in kwargs["candidates"]:
+                ranked.append(
+                    {
+                        **candidate,
+                        "distance_km": 0.1,
+                        "vibe_score": 0.0,
+                        "dietary_score": 0.0,
+                        "social_score": 0.0,
+                        "collaborative_score": 0.0,
+                        "final_score": 0.8,
+                    }
+                )
+            return ranked
+
+        with (
+            self._patched_integrations(),
+            patch.object(
+                proximal,
+                "get_or_fetch_google_candidates",
+                new=AsyncMock(return_value=google_result),
+            ),
+            patch.object(proximal, "_rank_cached_candidates", side_effect=_capture_rank),
+        ):
+            response = self.client.post(
+                "/locations/magic-search",
+                json={
+                    "user_id": USER_ID,
+                    "latitude": 50.8225,
+                    "longitude": -0.1372,
+                    "prompt": "Avo toast in the sun",
+                    "radius_km": 1.5,
+                    "max_results": 5,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(captured["request_radius_km"], 1.5)
 
     def test_bubble_recommendations_return_group_results(self) -> None:
         with self._patched_integrations():

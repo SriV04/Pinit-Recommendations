@@ -7,7 +7,6 @@ from typing import Any, Iterable, List
 
 from pinit.api.schemas_magic import MagicIntent
 from pinit.api.services.london_areas import (
-    default_london_rectangle,
     find_london_area_rectangle,
 )
 
@@ -321,9 +320,7 @@ def parse_magic_intent(prompt: str) -> MagicIntent:
     negative_terms = _extract_all(normalised, _NEGATIVE_PHRASES)
     included_types = _included_types(normalised, cuisines, occasion)
     location_name = _extract_location_name(normalised)
-    location_rectangle = (
-        find_london_area_rectangle(normalised) or default_london_rectangle()
-    )
+    location_rectangle = find_london_area_rectangle(normalised)
     query_modifiers = _extract_google_query_modifiers(normalised)
     cleaned_query = _cleaned_query(
         normalised,

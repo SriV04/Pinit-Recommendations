@@ -212,7 +212,7 @@ class ProximalCacheService:
     # ============================================================================
 
     MAGIC_INTENT_TTL = 7 * 24 * 60 * 60
-    MAGIC_INTENT_KEY_VERSION = "v3"
+    MAGIC_INTENT_KEY_VERSION = "v4"
     MAGIC_GOOGLE_TEXT_TTL = 6 * 60 * 60
     MAGIC_PLACE_DETAILS_TTL = 14 * 24 * 60 * 60
     MAGIC_FINAL_RESULTS_TTL = 10 * 60
