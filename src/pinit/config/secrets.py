@@ -43,7 +43,7 @@ def get_secret(secret_id: str) -> str:
     env_value = os.getenv(env_var_name)
     if env_value:
         logger.debug("Loaded %s from environment variable", secret_id)
-        return env_value
+        return env_value.strip()
 
     # Priority 2: Try Secret Manager (only works in GCP with proper permissions)
     if HAS_SECRET_MANAGER:
@@ -53,7 +53,7 @@ def get_secret(secret_id: str) -> str:
                 client = secretmanager.SecretManagerServiceClient()
                 name = f"projects/{project_id}/secrets/{secret_id}/versions/latest"
                 response = client.access_secret_version(request={"name": name})
-                secret_value = response.payload.data.decode("UTF-8")
+                secret_value = response.payload.data.decode("UTF-8").strip()
                 logger.debug("Loaded %s from Secret Manager", secret_id)
                 return secret_value
         except Exception as exc:
