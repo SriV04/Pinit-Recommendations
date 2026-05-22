@@ -230,6 +230,7 @@ MENU_WORKER_URL="$(gcloud run services describe "${WORKER_MENU_SERVICE}" --proje
 for TASK in pipeline details_enrich emoji photos vibe_reprocess; do
   gcloud pubsub subscriptions update "${TOPIC}-${TASK}" \
     --project "${PROJECT}" \
+    --ack-deadline 600 \
     --push-endpoint "${FAST_WORKER_URL}/internal/pubsub/location-tasks" \
     --push-auth-service-account "${PUSH_SA}"
 done
