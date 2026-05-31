@@ -4,7 +4,7 @@
 
 **Goal:** Add an experimental live-web agent layer to Magic Search that discovers current restaurant candidates, validates them through Google Places, merges them with the existing Google/Pinit path, and surfaces source metadata explaining why each result appeared.
 
-**Architecture:** Keep the existing Magic Search endpoint as the stable fast path. Add a parallel OpenAI web-search provider that returns structured candidate hints with citations and reasons, then validate/resolve every hinted place through Google before ranking. Treat web-agent signals as additive metadata and a capped ranking feature so bad or slow web output cannot break the search experience.
+**Architecture:** Keep the existing Magic Search endpoint as the stable fast path. Add a parallel OpenAI web-search provider that returns structured candidate hints with citations, reasons, and optional Google Place IDs. Trust OpenAI-provided Place IDs enough to try a cheap Supabase match first; only web-agent hints that do not match existing Supabase rows go through Google Text Search resolution. Treat web-agent signals as additive metadata and a capped ranking feature so bad or slow web output cannot break the search experience.
 
 **Tech Stack:** FastAPI, Python `asyncio`, OpenAI Responses API with web search and structured output, Google Places API v1 Text Search/Place Details, Redis cache through `ProximalCacheService`, Pydantic v2, pytest/unittest.
 
@@ -23,11 +23,13 @@
 ## Design Constraints
 
 - The web-agent path is experimental and must be disabled when `OPENAI_API_KEY` is missing.
-- Google Places remains the identity authority. A web-agent result is not eligible unless it resolves to a Google Place ID and food-type place.
+- Existing Supabase rows are the first identity authority for OpenAI-provided Google Place IDs. If the web agent gives a Place ID that already exists in Supabase, use the local record and attach web-agent metadata without making another Google call.
+- Google Places is the fallback identity authority for web-agent hints that are missing from Supabase or lack a Place ID. Those hints must resolve to a Google Place ID and food-type place before they are eligible.
 - First response latency target is unchanged: return results as soon as Google + DB ranking is ready, with the web-agent included only if it finishes within the time budget.
 - Initial web-agent timeout: `1.8s`. Initial Google path timeout remains governed by the existing Google service.
 - Web-agent ranking influence is capped at `0.08` additive score before final clamping.
-- Cache web-agent results by normalized prompt, location cell, radius, and user vibe summary for `30 minutes`.
+- Cache web-agent results by normalized prompt, location cell, radius, and user vibe summary for `30 minutes`. Cache stores OpenAI suggestions; Supabase matching is still performed per request so local records immediately benefit from newly ingested places.
+- Initial cost guardrail: no Google resolver calls for web-agent suggestions whose `google_place_id` is already present in Supabase. Cap Google resolver calls for web-agent misses at `4` per request.
 - Return source metadata in the response for product learning, even when the source has no ranking boost.
 
 ## File Structure
@@ -41,7 +43,7 @@
 - Modify `src/pinit/api/schemas.py`
   - Adds source metadata fields to `MagicLocationRecommendation` and opt-in request flags.
 - Modify `src/pinit/api/routers/proximal.py`
-  - Starts the web-agent task in parallel, validates/resolves candidates through Google, merges resolved candidates before reranking, and records debug metrics.
+  - Starts the web-agent task in parallel, batch-matches OpenAI Place IDs through Supabase, validates only local misses through Google, merges resolved candidates before reranking, and records debug metrics.
 - Modify `src/pinit/core/recommendation/magic_ranking.py`
   - Adds capped `agentic_web_score` support and richer source list handling.
 - Modify `src/pinit/core/recommendation/magic_explanations.py`
@@ -193,7 +195,9 @@ class MagicSearchDebug(BaseModel):
     web_agent_timed_out: bool = False
     web_agent_cache_hit: bool = False
     web_agent_candidates: int = 0
+    web_agent_supabase_hits: int = 0
     web_agent_resolved_candidates: int = 0
+    web_agent_google_resolve_calls: int = 0
     cache_hit_google_search: bool = False
     cache_hit_place_details: bool = False
     cache_hit_user_profile: bool = False
@@ -707,7 +711,7 @@ git commit -m "feat: add magic search live web agent provider"
 
 ---
 
-### Task 4: Resolve Web-Agent Hints Through Google Places
+### Task 4: Resolve Only Supabase-Missing Web-Agent Hints Through Google
 
 **Files:**
 - Modify: `src/pinit/api/services/magic_google_service.py`
@@ -743,8 +747,17 @@ class _FakeGoogleResponse:
 
 
 class MagicWebAgentResolverTests(unittest.IsolatedAsyncioTestCase):
-    async def test_resolver_searches_name_and_preserves_agent_metadata(self) -> None:
+    async def test_resolver_skips_known_place_ids_and_searches_only_misses(self) -> None:
         suggestions = [
+            {
+                "name": "Known Place",
+                "google_place_id": "known-gid",
+                "address_hint": "Soho",
+                "reason": "Already in Supabase",
+                "confidence": 0.9,
+                "source_claims": ["ai_hotspot"],
+                "citations": [],
+            },
             {
                 "name": "Test Place",
                 "google_place_id": None,
@@ -770,6 +783,7 @@ class MagicWebAgentResolverTests(unittest.IsolatedAsyncioTestCase):
 
         places = await resolve_magic_web_agent_suggestions(
             suggestions,
+            known_google_place_ids={"known-gid"},
             lat=51.5095,
             lng=-0.1490,
             radius_km=2.0,
@@ -777,6 +791,7 @@ class MagicWebAgentResolverTests(unittest.IsolatedAsyncioTestCase):
             client=client,
         )
 
+        self.assertEqual(len(client.calls), 1)
         self.assertEqual(places[0]["id"], "gid-1")
         self.assertEqual(places[0]["web_agent"]["confidence"], 0.8)
         self.assertIn("Test Place Soho", client.calls[0]["textQuery"])
@@ -787,7 +802,7 @@ class MagicWebAgentResolverTests(unittest.IsolatedAsyncioTestCase):
 Run:
 
 ```bash
-pytest tests/test_magic_web_agent.py::MagicWebAgentResolverTests::test_resolver_searches_name_and_preserves_agent_metadata -q
+pytest tests/test_magic_web_agent.py::MagicWebAgentResolverTests::test_resolver_skips_known_place_ids_and_searches_only_misses -q
 ```
 
 Expected: FAIL because `resolve_magic_web_agent_suggestions` does not exist.
@@ -800,15 +815,26 @@ In `src/pinit/api/services/magic_google_service.py`, add:
 async def resolve_magic_web_agent_suggestions(
     suggestions: List[Dict[str, Any]],
     *,
+    known_google_place_ids: Optional[set[str]] = None,
     lat: float,
     lng: float,
     radius_km: float,
     api_key: Optional[str] = None,
     client: Any = None,
     timeout: float = 2.0,
+    max_google_resolves: int = 4,
 ) -> List[Dict[str, Any]]:
     key = api_key or GOOGLE_PLACE_API_KEY
     if not key or not suggestions:
+        return []
+
+    known_ids = {str(item).strip() for item in (known_google_place_ids or set()) if str(item).strip()}
+    suggestions_to_resolve = [
+        item
+        for item in suggestions
+        if str(item.get("google_place_id") or "").strip() not in known_ids
+    ][:max_google_resolves]
+    if not suggestions_to_resolve:
         return []
 
     close_client = False
@@ -856,7 +882,7 @@ async def resolve_magic_web_agent_suggestions(
         return place
 
     try:
-        tasks = [_resolve_one(item) for item in suggestions[:8]]
+        tasks = [_resolve_one(item) for item in suggestions_to_resolve]
         for result in await asyncio.gather(*tasks, return_exceptions=True):
             if isinstance(result, Exception) or result is None:
                 continue
@@ -878,7 +904,7 @@ Also import `asyncio` at the top of the file.
 Run:
 
 ```bash
-pytest tests/test_magic_web_agent.py::MagicWebAgentResolverTests::test_resolver_searches_name_and_preserves_agent_metadata -q
+pytest tests/test_magic_web_agent.py::MagicWebAgentResolverTests::test_resolver_skips_known_place_ids_and_searches_only_misses -q
 ```
 
 Expected: PASS.
@@ -887,7 +913,7 @@ Expected: PASS.
 
 ```bash
 git add src/pinit/api/services/magic_google_service.py tests/test_magic_web_agent.py
-git commit -m "feat: resolve magic web agent places through google"
+git commit -m "feat: resolve only unknown magic web agent places through google"
 ```
 
 ---
@@ -940,6 +966,80 @@ class MagicAgenticMergeTests(unittest.IsolatedAsyncioTestCase):
             await proximal.magic_search(request)
 
         web_agent.assert_not_awaited()
+
+    async def test_web_agent_place_ids_hit_supabase_before_google_resolver(self) -> None:
+        from pinit.api.routers import proximal
+        from pinit.api.services.magic_web_agent import MagicWebAgentResult
+
+        request = MagicSearchRequest(
+            user_id="user-1",
+            latitude=51.5095,
+            longitude=-0.1490,
+            prompt="hot new date night spots in Soho",
+            enable_live_web_agent=True,
+        )
+        suggestion = {
+            "name": "Known Place",
+            "google_place_id": "gid-known",
+            "address_hint": "Soho",
+            "reason": "Mentioned in a recent list",
+            "confidence": 0.85,
+            "source_claims": ["ai_hotspot"],
+            "citations": [{"url": "https://example.com", "title": "List"}],
+        }
+        known_candidate = {
+            "location_id": 123,
+            "google_place_id": "gid-known",
+            "is_known_location": True,
+            "name": "Known Place",
+            "vicinity": "Soho",
+            "lat": 51.51,
+            "lng": -0.13,
+            "distance_km": 0.3,
+            "rating": 4.6,
+            "user_ratings_total": 120,
+            "price_level": 2,
+            "vibe_score": 0.0,
+            "dietary_score": 0.0,
+            "quality_score": 0.8,
+            "social_score": 0.0,
+            "collaborative_score": 0.0,
+            "final_score": 0.7,
+            "rank": 1,
+        }
+
+        def rank_side_effect(*, candidates, **kwargs):
+            self.assertEqual(candidates[0]["web_agent"]["reason"], suggestion["reason"])
+            return [{**candidates[0], **known_candidate}]
+
+        with patch.object(proximal, "get_supabase_service") as get_supabase, \
+             patch.object(proximal, "get_cache_service") as get_cache, \
+             patch.object(proximal, "_get_or_parse_magic_intent") as parse_intent, \
+             patch.object(proximal, "_get_magic_user_profile", new=AsyncMock(return_value=({"vibe_vector": []}, False))), \
+             patch.object(proximal, "get_or_fetch_google_candidates", new=AsyncMock()) as google, \
+             patch.object(proximal, "fetch_magic_web_agent_suggestions", new=AsyncMock(return_value=MagicWebAgentResult(suggestions=[suggestion]))), \
+             patch.object(proximal, "resolve_magic_web_agent_suggestions", new=AsyncMock(return_value=[])) as resolver, \
+             patch.object(proximal, "_rank_cached_candidates", side_effect=rank_side_effect):
+            supabase = get_supabase.return_value
+            supabase.get_locations_by_google_place_ids.return_value = {
+                "gid-known": {"location_id": 123}
+            }
+            supabase.get_locations_by_ids.return_value = [known_candidate]
+            supabase.vibe_tag_order = {}
+            get_cache.return_value = object()
+            parse_intent.return_value = (proximal.parse_magic_intent(request.prompt), False)
+            google.return_value.places = []
+            google.return_value.total_google_calls = 0
+            google.return_value.cache_hit_google_search = False
+            google.return_value.total_candidates_before_dedupe = 0
+            google.return_value.total_candidates_after_dedupe = 0
+            google.return_value.google_queries = []
+
+            response = await proximal.magic_search(request)
+
+        resolver.assert_not_awaited()
+        self.assertEqual(response.debug.web_agent_supabase_hits, 1)
+        self.assertEqual(response.debug.web_agent_google_resolve_calls, 0)
 ```
 
 - [ ] **Step 2: Run the integration test to verify it fails**
@@ -947,10 +1047,10 @@ class MagicAgenticMergeTests(unittest.IsolatedAsyncioTestCase):
 Run:
 
 ```bash
-pytest tests/test_magic_search_agentic_integration.py::MagicAgenticMergeTests::test_web_agent_task_is_started_only_when_enabled -q
+pytest tests/test_magic_search_agentic_integration.py::MagicAgenticMergeTests -q
 ```
 
-Expected: FAIL because `fetch_magic_web_agent_suggestions` is not imported or integrated.
+Expected: FAIL because `fetch_magic_web_agent_suggestions` is not imported or integrated, and because the current endpoint returns early when Google has no places even if the web agent has Supabase-matchable Place IDs.
 
 - [ ] **Step 3: Integrate the web-agent task**
 
@@ -991,10 +1091,10 @@ After `user_profile` is loaded and before awaiting Google, start the optional we
             )
 ```
 
-After `google_result = await google_task`, collect web-agent output:
+After `google_result = await google_task`, collect web-agent suggestions but do not call Google yet:
 
 ```python
-        web_agent_places: List[Dict[str, Any]] = []
+        web_agent_suggestions: List[Dict[str, Any]] = []
         if web_agent_task is not None:
             web_agent_started = perf_counter()
             web_agent_result = await web_agent_task
@@ -1002,20 +1102,111 @@ After `google_result = await google_task`, collect web-agent output:
             debug.web_agent_timed_out = web_agent_result.timed_out
             debug.web_agent_cache_hit = web_agent_result.cache_hit
             debug.web_agent_candidates = len(web_agent_result.suggestions)
-            if web_agent_result.suggestions:
-                web_agent_places = await resolve_magic_web_agent_suggestions(
-                    web_agent_result.suggestions,
-                    lat=request.latitude,
-                    lng=request.longitude,
-                    radius_km=radius_km,
-                )
-                debug.web_agent_resolved_candidates = len(web_agent_places)
+            if not web_agent_result.timed_out:
+                web_agent_suggestions = list(web_agent_result.suggestions)
 ```
 
-Before assigning `places = google_result.places`, merge:
+Assign the regular Google results first:
 
 ```python
-        places = google_result.places + web_agent_places
+        places = google_result.places
+```
+
+Replace the current empty-Google early return condition:
+
+```python
+    if not places:
+```
+
+with:
+
+```python
+    if not places and not web_agent_suggestions:
+```
+
+In the hydration block, after building `food_place_ids` and `place_by_id` from Google Text Search places, add Supabase-first matching for OpenAI Place IDs:
+
+```python
+    web_agent_by_gid: Dict[str, Dict[str, Any]] = {}
+    for suggestion in web_agent_suggestions:
+        gid = str(suggestion.get("google_place_id") or "").strip()
+        if gid and gid not in web_agent_by_gid:
+            web_agent_by_gid[gid] = suggestion
+
+    combined_place_ids = list(dict.fromkeys(food_place_ids + list(web_agent_by_gid)))
+```
+
+Replace the existing Supabase lookup:
+
+```python
+    existing_by_gid = supabase.get_locations_by_google_place_ids(food_place_ids)
+```
+
+with:
+
+```python
+    existing_by_gid = supabase.get_locations_by_google_place_ids(combined_place_ids)
+    debug.web_agent_supabase_hits = sum(
+        1 for gid in web_agent_by_gid if gid in existing_by_gid
+    )
+```
+
+Replace the location-id collection loop:
+
+```python
+    for gid in food_place_ids:
+```
+
+with:
+
+```python
+    for gid in combined_place_ids:
+```
+
+When full Supabase rows are loaded, attach web-agent metadata to known local candidates:
+
+```python
+    for candidate in candidates:
+        loc_id = int(candidate.get("location_id"))
+        gid = gid_by_location_id.get(loc_id)
+        candidate.setdefault("google_place_id", gid)
+        candidate["is_known_location"] = True
+        if gid in web_agent_by_gid:
+            candidate["web_agent"] = web_agent_by_gid[gid]
+        _fill_missing_magic_search_google_fields(candidate, place_by_id.get(gid or ""))
+```
+
+After known candidates are hydrated, resolve only web-agent suggestions that missed Supabase:
+
+```python
+    web_agent_misses = [
+        suggestion
+        for suggestion in web_agent_suggestions
+        if not str(suggestion.get("google_place_id") or "").strip()
+        or str(suggestion.get("google_place_id") or "").strip() not in existing_by_gid
+    ]
+    web_agent_places: List[Dict[str, Any]] = []
+    if web_agent_misses:
+        debug.web_agent_google_resolve_calls = min(len(web_agent_misses), 4)
+        web_agent_places = await resolve_magic_web_agent_suggestions(
+            web_agent_misses,
+            known_google_place_ids=set(existing_by_gid),
+            lat=request.latitude,
+            lng=request.longitude,
+            radius_km=radius_km,
+            max_google_resolves=4,
+        )
+        debug.web_agent_resolved_candidates = len(web_agent_places)
+
+    for place in web_agent_places:
+        gid = str(place.get("id") or "").strip()
+        if not gid or gid in existing_by_gid or gid in place_by_id:
+            continue
+        types_raw = place.get("types", [])
+        if types_raw and not any(t in _FOOD_TYPES_SET for t in types_raw):
+            continue
+        food_place_ids.append(gid)
+        place_by_id[gid] = place
 ```
 
 - [ ] **Step 4: Run the integration test to verify it passes**
@@ -1023,7 +1214,7 @@ Before assigning `places = google_result.places`, merge:
 Run:
 
 ```bash
-pytest tests/test_magic_search_agentic_integration.py::MagicAgenticMergeTests::test_web_agent_task_is_started_only_when_enabled -q
+pytest tests/test_magic_search_agentic_integration.py::MagicAgenticMergeTests -q
 ```
 
 Expected: PASS.
@@ -1273,10 +1464,10 @@ Expected: FAIL until the router gracefully handles `timed_out=True` without reso
 
 - [ ] **Step 3: Add timeout guardrails**
 
-In `src/pinit/api/routers/proximal.py`, wrap web-agent collection:
+In `src/pinit/api/routers/proximal.py`, make sure the web-agent collection block only passes suggestions forward when the provider did not time out:
 
 ```python
-        web_agent_places: List[Dict[str, Any]] = []
+        web_agent_suggestions: List[Dict[str, Any]] = []
         if web_agent_task is not None:
             web_agent_started = perf_counter()
             web_agent_result = await web_agent_task
@@ -1284,14 +1475,8 @@ In `src/pinit/api/routers/proximal.py`, wrap web-agent collection:
             debug.web_agent_timed_out = web_agent_result.timed_out
             debug.web_agent_cache_hit = web_agent_result.cache_hit
             debug.web_agent_candidates = len(web_agent_result.suggestions)
-            if not web_agent_result.timed_out and web_agent_result.suggestions:
-                web_agent_places = await resolve_magic_web_agent_suggestions(
-                    web_agent_result.suggestions,
-                    lat=request.latitude,
-                    lng=request.longitude,
-                    radius_km=radius_km,
-                )
-                debug.web_agent_resolved_candidates = len(web_agent_places)
+            if not web_agent_result.timed_out:
+                web_agent_suggestions = list(web_agent_result.suggestions)
 ```
 
 - [ ] **Step 4: Run the timeout test to verify it passes**
@@ -1394,12 +1579,12 @@ git commit -m "docs: document magic search web agent verification"
 - Web-agent disabled by default.
 - When enabled and OpenAI is unavailable, Magic Search still returns Google/Pinit results.
 - Web-agent output is cached for repeated prompt/location/vibe searches.
-- Every web-agent result is verified through Google Places before being returned.
+- Every web-agent result is either matched to an existing Supabase row by Google Place ID or resolved through Google Places before being returned.
 - Response includes source metadata with citations when web-search output provides them.
 - Debug payload makes latency, timeout, cache hit, raw candidate count, and resolved candidate count visible.
 
 ## Follow-Up After Experiment
 
-- Compare `web_agent_resolved_candidates / web_agent_candidates` across real requests.
+- Compare `web_agent_supabase_hits / web_agent_candidates` and `web_agent_resolved_candidates / web_agent_candidates` across real requests.
 - Compare top-10 click/save rate for `enable_live_web_agent=true` against default Magic Search.
 - If live web is useful but slow, move it to a progressive enhancement model: return fast results first, then push/refresh web-backed results in a second response path.
