@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
-from pinit.api.schemas_magic import MagicSearchDebug
+from pinit.api.schemas_magic import MagicAIEnrichmentPayload, MagicSearchDebug
 
 
 class TagMatch(BaseModel):
@@ -134,6 +134,7 @@ class LocationRecommendation(BaseModel):
 
 class MagicLocationRecommendation(LocationRecommendation):
     source: List[str] = Field(default_factory=list)
+    source_metadata: List[Dict[str, Any]] = Field(default_factory=list)
     match_reasons: List[str] = Field(default_factory=list)
     intent_matches: Dict[str, Any] = Field(default_factory=dict)
     confidence: float = 0.0
@@ -228,6 +229,10 @@ class MagicSearchRequest(BaseModel):
     radius_km: Optional[float] = Field(2.0, description="Search radius in kilometers", gt=0, le=50)
     max_results: Optional[int] = Field(20, description="Max number of places to search and rank", ge=1, le=50)
     include_taste_breakdown: Optional[bool] = Field(False, description="Include detailed taste score breakdown")
+    enable_live_web_agent: Optional[bool] = Field(
+        False,
+        description="When true, return cached AI enrichment and enqueue async refreshes.",
+    )
 
 class MagicSearchSection(BaseModel):
     title: str
@@ -245,6 +250,7 @@ class MagicSearchResponse(BaseModel):
     total_ranked: int
     recommendations: List[MagicLocationRecommendation]
     sections: List[MagicSearchSection] = Field(default_factory=list)
+    ai_enrichment: Optional[MagicAIEnrichmentPayload] = None
     debug: Optional[MagicSearchDebug] = None
     timestamp: str
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -213,3 +214,101 @@ async def get_or_fetch_google_candidates(
         total_candidates_after_dedupe=len(deduped),
         google_queries=executed_queries,
     )
+
+
+async def resolve_magic_web_agent_suggestions(
+    suggestions: List[Dict[str, Any]],
+    *,
+    known_google_place_ids: Optional[set[str]] = None,
+    lat: float,
+    lng: float,
+    radius_km: float,
+    api_key: Optional[str] = None,
+    client: Any = None,
+    timeout: float = 2.0,
+    max_google_resolves: int = 4,
+) -> List[Dict[str, Any]]:
+    """Resolve web-agent suggestions that are not already known locally.
+
+    Suggestions with Google Place IDs already present in Supabase should be
+    passed via ``known_google_place_ids`` so they do not incur another Google
+    Text Search call.
+    """
+    key = api_key or GOOGLE_PLACE_API_KEY
+    if not key or not suggestions:
+        return []
+
+    known_ids = {
+        str(item).strip()
+        for item in (known_google_place_ids or set())
+        if str(item).strip()
+    }
+    suggestions_to_resolve = [
+        item
+        for item in suggestions
+        if str(item.get("google_place_id") or "").strip() not in known_ids
+    ][:max_google_resolves]
+    if not suggestions_to_resolve:
+        return []
+
+    close_client = False
+    if client is None:
+        client = httpx.AsyncClient(timeout=timeout)
+        close_client = True
+
+    headers = {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": key,
+        "X-Goog-FieldMask": _FIELD_MASK,
+    }
+    resolved: List[Dict[str, Any]] = []
+    seen_ids: set[str] = set()
+
+    async def _resolve_one(suggestion: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        query = str(suggestion.get("place_resolution_query") or "").strip()
+        if not query:
+            name = str(suggestion.get("name") or "").strip()
+            address_hint = str(suggestion.get("address_hint") or "").strip()
+            query = f"{name} {address_hint}".strip()
+        if not query:
+            return None
+
+        body: Dict[str, Any] = {
+            "textQuery": query,
+            "maxResultCount": 3,
+            "locationBias": {
+                "circle": {
+                    "center": {"latitude": lat, "longitude": lng},
+                    "radius": float(radius_km * 1000.0),
+                }
+            },
+            "includedType": "restaurant",
+        }
+        response = await client.post(
+            _TEXT_SEARCH_URL,
+            json=body,
+            headers=headers,
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        places = list(response.json().get("places") or [])
+        if not places:
+            return None
+        place = dict(places[0])
+        place["web_agent"] = suggestion
+        return place
+
+    try:
+        tasks = [_resolve_one(item) for item in suggestions_to_resolve]
+        for result in await asyncio.gather(*tasks, return_exceptions=True):
+            if isinstance(result, Exception) or result is None:
+                continue
+            place_id = str(result.get("id") or "").strip()
+            if not place_id or place_id in seen_ids:
+                continue
+            seen_ids.add(place_id)
+            resolved.append(result)
+        return resolved
+    finally:
+        if close_client:
+            await client.aclose()

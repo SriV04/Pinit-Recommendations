@@ -73,6 +73,9 @@ def build_match_reasons(
     if _score(score_breakdown, "google_quality") >= 0.8:
         _append_unique(reasons, "Highly rated on Google")
 
+    if _score(score_breakdown, "agentic_web") >= 0.04:
+        _append_unique(reasons, "Suggested by Magic Search AI")
+
     if not reasons:
         _append_unique(reasons, "Good fit for this search")
 

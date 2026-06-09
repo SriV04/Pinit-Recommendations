@@ -138,6 +138,35 @@ class MagicSearchQualityScoreTests(unittest.TestCase):
         self.assertIn("quality_score", ranked[0])
         self.assertEqual(ranked[0]["quality_score"], 0.0)
 
+    def test_ranked_candidates_can_keep_out_of_radius_magic_search_results(self) -> None:
+        candidate = {
+            "location_id": 202,
+            "name": "Relevant Nepalese Restaurant",
+            "lat": 51.5500,
+            "lng": -0.1200,
+            "rating": 4.5,
+            "user_ratings_total": 120,
+            "price_level": 2,
+        }
+
+        with patch.object(proximal, "get_supabase_service", return_value=_FakeSupabase()):
+            ranked = proximal._rank_cached_candidates(
+                candidates=[candidate],
+                request_lat=51.5000,
+                request_lng=-0.1200,
+                request_radius_km=2.0,
+                quality_weight=0.30,
+                vibe_weight=0.25,
+                dietary_weight=0.10,
+                max_results=20,
+                user_id=None,
+                filter_by_radius=False,
+            )
+
+        self.assertEqual(len(ranked), 1)
+        self.assertGreater(ranked[0]["distance_km"], 2.0)
+        self.assertEqual(ranked[0]["location_id"], 202)
+
     def test_get_locations_by_ids_flattens_lpa_pillars_for_magic_search(self) -> None:
         service = SupabaseService.__new__(SupabaseService)
         service.client = _FakeClient()

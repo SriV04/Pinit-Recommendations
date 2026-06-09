@@ -371,6 +371,41 @@ def _novelty_score(candidate: Mapping[str, Any], intent: MagicIntent) -> float:
     return _clamp(base + min(app_score * 0.15, 0.15))
 
 
+def _agentic_web_score(candidate: Mapping[str, Any]) -> float:
+    web_agent = candidate.get("web_agent")
+    if not isinstance(web_agent, Mapping):
+        return 0.0
+
+    confidence = _clamp(_float(web_agent.get("confidence"), 0.0))
+    claims = set(web_agent.get("source_claims") or [])
+    claim_bonus = 0.0
+    if "ai_hotspot" in claims or "social_buzz" in claims:
+        claim_bonus += 0.02
+    if "date_spot" in claims or "new_opening" in claims:
+        claim_bonus += 0.01
+    return min(0.08, confidence * 0.06 + claim_bonus)
+
+
+def _source_metadata(candidate: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    metadata: List[Dict[str, Any]] = []
+    web_agent = candidate.get("web_agent")
+    if isinstance(web_agent, Mapping):
+        citations = list(web_agent.get("citations") or [])
+        first_citation = citations[0] if citations else {}
+        metadata.append(
+            {
+                "source": "ai_agent",
+                "label": "Suggested by Magic Search AI",
+                "confidence": _clamp(_float(web_agent.get("confidence"), 0.0)),
+                "url": first_citation.get("url"),
+                "title": first_citation.get("title"),
+                "detail": web_agent.get("reason"),
+                "claims": list(web_agent.get("source_claims") or []),
+            }
+        )
+    return metadata
+
+
 def _source(candidate: Mapping[str, Any]) -> List[str]:
     source = ["Google"]
     if candidate.get("is_known_location", True):
@@ -379,6 +414,8 @@ def _source(candidate: Mapping[str, Any]) -> List[str]:
         source.append("Friends")
     if _float(candidate.get("video_insight_score"), 0.0) > 0:
         source.append("Video")
+    if isinstance(candidate.get("web_agent"), Mapping):
+        source.append("AI Agent")
     return source
 
 
@@ -398,6 +435,7 @@ def rerank_magic_candidates(
         distance = _distance_score(item, request_radius_km)
         availability = _availability_score(item, intent)
         novelty = _novelty_score(item, intent)
+        agentic_web = _agentic_web_score(item)
 
         final_score = (
             0.35 * base_personalised_score
@@ -406,6 +444,7 @@ def rerank_magic_candidates(
             + 0.10 * distance
             + 0.10 * availability
             + 0.05 * novelty
+            + agentic_web
         )
 
         score_breakdown = {
@@ -415,9 +454,11 @@ def rerank_magic_candidates(
             "distance": distance,
             "availability": availability,
             "novelty": novelty,
+            "agentic_web": agentic_web,
         }
         item["intent_matches"] = score_breakdown
         item["source"] = _source(item)
+        item["source_metadata"] = _source_metadata(item)
         item["confidence"] = _clamp((final_score * 0.65) + (intent_scores["overall"] * 0.35))
         item["final_score"] = _clamp(final_score)
         item["quality_score"] = google_quality

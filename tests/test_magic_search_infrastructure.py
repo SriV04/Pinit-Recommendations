@@ -155,6 +155,48 @@ class MagicSearchInfrastructureTests(unittest.TestCase):
             final_payload,
         )
 
+    def test_magic_web_agent_cache_helpers_round_trip(self) -> None:
+        cache = self._cache()
+
+        key = cache.build_magic_web_agent_key(
+            prompt="hot new date night spots in Soho",
+            lat=51.5095,
+            lng=-0.1490,
+            radius_km=2.0,
+            vibe_summary={"romantic": 0.91, "trendy": 0.77},
+        )
+        payload = {
+            "suggestions": [{"name": "Test", "google_place_id": "gid-1"}],
+            "cached_at": "2026-05-31T12:00:00",
+        }
+
+        self.assertTrue(cache.set_magic_web_agent_results(key, payload))
+        self.assertEqual(cache.get_magic_web_agent_results(key), payload)
+        self.assertTrue(key.startswith("magic:web_agent:v1:"))
+
+    def test_magic_ai_area_cache_key_uses_signature_and_ttl(self) -> None:
+        cache = self._cache()
+        signature = {
+            "geo_bucket": "51.494:-0.174",
+            "radius_bucket": "2km",
+            "intent_hash": "abc123",
+            "freshness": "recent",
+        }
+
+        key = cache.build_magic_ai_area_key(signature)
+        payload = {
+            "items": [{"name": "Test", "google_place_id": "gid-1"}],
+            "cached_at": "2026-05-31T12:00:00",
+        }
+
+        self.assertEqual(
+            key,
+            "magic:ai_area:v2:51.494:-0.174:2km:abc123:recent",
+        )
+        self.assertTrue(cache.set_magic_ai_area_results(key, payload))
+        self.assertEqual(cache.get_magic_ai_area_results(key), payload)
+        self.assertEqual(cache._redis_client.ttls[key], 24 * 60 * 60)
+
 
 class MagicGoogleServiceTests(unittest.IsolatedAsyncioTestCase):
     def _cache(self) -> ProximalCacheService:

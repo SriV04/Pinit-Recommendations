@@ -216,6 +216,8 @@ class ProximalCacheService:
     MAGIC_GOOGLE_TEXT_TTL = 6 * 60 * 60
     MAGIC_PLACE_DETAILS_TTL = 14 * 24 * 60 * 60
     MAGIC_FINAL_RESULTS_TTL = 10 * 60
+    MAGIC_WEB_AGENT_TTL = 30 * 60
+    MAGIC_AI_AREA_TTL = 24 * 60 * 60
 
     def _magic_cache_get(self, key: str) -> Optional[Dict[str, Any]]:
         if not self.is_available:
@@ -332,6 +334,64 @@ class ProximalCacheService:
             key,
             payload,
             ttl_seconds or self.MAGIC_FINAL_RESULTS_TTL,
+        )
+
+    def build_magic_ai_area_key(self, signature: Dict[str, Any]) -> str:
+        return (
+            "magic:ai_area:v2:"
+            f"{signature['geo_bucket']}:"
+            f"{signature['radius_bucket']}:"
+            f"{signature['intent_hash']}:"
+            f"{signature['freshness']}"
+        )
+
+    def get_magic_ai_area_results(self, key: str) -> Optional[Dict[str, Any]]:
+        return self._magic_cache_get(key)
+
+    def set_magic_ai_area_results(
+        self,
+        key: str,
+        payload: Dict[str, Any],
+        ttl_seconds: Optional[int] = None,
+    ) -> bool:
+        return self._magic_cache_set(
+            key,
+            payload,
+            ttl_seconds or self.MAGIC_AI_AREA_TTL,
+        )
+
+    def build_magic_web_agent_key(
+        self,
+        *,
+        prompt: str,
+        lat: float,
+        lng: float,
+        radius_km: float,
+        vibe_summary: Optional[Dict[str, float]] = None,
+    ) -> str:
+        lat_cell, lng_cell = self._snap_coordinates(lat, lng)
+        prompt_hash = hashlib.sha1(prompt.strip().lower().encode("utf-8")).hexdigest()[:16]
+        vibe_payload = json.dumps(vibe_summary or {}, sort_keys=True, separators=(",", ":"))
+        vibe_hash = hashlib.sha1(vibe_payload.encode("utf-8")).hexdigest()[:12]
+        radius = int(round(radius_km))
+        return (
+            f"magic:web_agent:v1:{prompt_hash}:g_{lat_cell}_{lng_cell}:"
+            f"r{radius}:vibe_{vibe_hash}"
+        )
+
+    def get_magic_web_agent_results(self, key: str) -> Optional[Dict[str, Any]]:
+        return self._magic_cache_get(key)
+
+    def set_magic_web_agent_results(
+        self,
+        key: str,
+        payload: Dict[str, Any],
+        ttl_seconds: Optional[int] = None,
+    ) -> bool:
+        return self._magic_cache_set(
+            key,
+            payload,
+            ttl_seconds or self.MAGIC_WEB_AGENT_TTL,
         )
 
     def get_cached_recommendations(

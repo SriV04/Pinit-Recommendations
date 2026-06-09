@@ -128,6 +128,37 @@ class MagicRankingTests(unittest.TestCase):
         self.assertIn("Open now", reasons)
         self.assertIn("People you trust have saved this", reasons)
 
+    def test_web_agent_score_is_capped_and_source_metadata_is_preserved(self) -> None:
+        intent = parse_magic_intent("hot date night in Soho")
+        ranked = rerank_magic_candidates(
+            [
+                {
+                    "location_id": -1,
+                    "google_place_id": "gid-1",
+                    "name": "Test",
+                    "lat": 51.51,
+                    "lng": -0.13,
+                    "distance_km": 0.3,
+                    "rating": 4.5,
+                    "user_ratings_total": 200,
+                    "final_score": 0.4,
+                    "web_agent": {
+                        "reason": "Recent date-night list mention",
+                        "confidence": 1.0,
+                        "source_claims": ["ai_hotspot", "date_spot"],
+                        "citations": [{"url": "https://example.com", "title": "List"}],
+                    },
+                }
+            ],
+            intent=intent,
+            request_radius_km=2.0,
+        )
+
+        self.assertLessEqual(ranked[0]["intent_matches"]["agentic_web"], 0.08)
+        self.assertIn("AI Agent", ranked[0]["source"])
+        self.assertEqual(ranked[0]["source_metadata"][0]["source"], "ai_agent")
+        self.assertIn("Suggested by Magic Search AI", ranked[0]["match_reasons"])
+
 
 if __name__ == "__main__":
     unittest.main()

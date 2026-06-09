@@ -44,9 +44,13 @@ from pinit.api.services.proximal_service import (
     fetch_google_place_basic_details,
     refresh_location_from_google_place_details,
 )
-from pinit.api.schemas_magic import MagicIntent, MagicSearchDebug
+from pinit.api.schemas_magic import MagicAIEnrichmentPayload, MagicIntent, MagicSearchDebug
 from pinit.api.services.background_jobs import get_background_job_runner
-from pinit.api.services.magic_google_service import get_or_fetch_google_candidates
+from pinit.api.services.magic_google_service import (
+    get_or_fetch_google_candidates,
+)
+from pinit.api.services.magic_ai_enrichment import build_magic_ai_enrichment_payload
+from pinit.api.services.magic_ai_signature import build_magic_ai_signature
 from pinit.api.services.magic_intent_parser import normalise_prompt, parse_magic_intent
 from pinit.api.schemas_location_tasks import PipelinePayload
 from pinit.api.services.location_tasks import InProcessDispatcher, PubSubDispatcher, run_pipeline_inline
@@ -327,6 +331,7 @@ def _rank_cached_candidates(
     cuisine_diversity_lambda: float = 0.7,
     enable_seen_decay: bool = True,
     enable_rank_jitter: bool = False,
+    filter_by_radius: bool = True,
     # Bundled user profile from cache_service. Avoids per-request
     # round-trips for vectors / friends / action_count.
     user_profile: Optional[Dict[str, Any]] = None,
@@ -340,7 +345,7 @@ def _rank_cached_candidates(
     Args:
         candidates: List of cached candidate dictionaries
         request_lat, request_lng: Request center coordinates
-        request_radius_km: Request radius for filtering
+        request_radius_km: Request radius for filtering or distance annotation
         quality_weight, vibe_weight, dietary_weight: Original scoring weights
         max_results: Maximum number of results to return
         cuisine_filters: Optional cuisine tag filters (OR logic)
@@ -414,7 +419,10 @@ def _rank_cached_candidates(
         candidates, cuisine_filters, vibe_filters
     )
 
-    # Step 2: Filter by radius first to get candidate location IDs
+    # Step 2: Filter by radius first to get candidate location IDs.
+    # Live Magic Search has already used Google/text retrieval to choose
+    # relevant candidates, so callers can keep all results and let later
+    # ranking stages treat distance as a preference rather than a hard gate.
     radius_filtered = []
     for candidate in filtered_candidates:
         lat = candidate.get("lat")
@@ -422,7 +430,7 @@ def _rank_cached_candidates(
         if lat is None or lng is None:
             continue
         distance_km = haversine_distance(request_lat, request_lng, lat, lng)
-        if distance_km <= request_radius_km:
+        if not filter_by_radius or distance_km <= request_radius_km:
             candidate["distance_km"] = distance_km
             radius_filtered.append(candidate)
 
@@ -435,6 +443,8 @@ def _rank_cached_candidates(
         )
         return []
 
+    radius_mode = "strict" if filter_by_radius else "distance_only"
+
     # Diagnostic: how many of the radius-filtered candidates have a
     # populated quality_score? If this is 0 while the count is large, the
     # cache payload was written before location_popularity_app was seeded.
@@ -445,10 +455,11 @@ def _rank_cached_candidates(
         (float(c.get("quality_score") or 0) for c in radius_filtered), default=0.0
     )
     logger.info(
-        "🧭 _rank_cached_candidates: %d candidates in radius %.1f km "
-        "(input=%d, tag-filtered=%d, quality_score>0: %d, max=%.3f)",
+        "🧭 _rank_cached_candidates: %d candidates after radius handling %.1f km "
+        "(mode=%s, input=%d, tag-filtered=%d, quality_score>0: %d, max=%.3f)",
         len(radius_filtered),
         request_radius_km,
+        radius_mode,
         len(candidates),
         len(filtered_candidates),
         rf_qs_present,
@@ -1274,6 +1285,35 @@ async def _schedule_or_run_location_job(
 
     # Legacy in-process background queue (still used by older helpers in this module).
     await get_background_job_runner().enqueue(job_name, handler)
+
+
+async def _refresh_magic_ai_enrichment_cache(
+    *,
+    cache_key: str,
+    prompt: str,
+    lat: float,
+    lng: float,
+    radius_km: float,
+    signature: Dict[str, Any],
+    user_profile: Dict[str, Any],
+    supabase: Any,
+    cache_service: Any,
+) -> None:
+    payload = await build_magic_ai_enrichment_payload(
+        prompt=prompt,
+        lat=lat,
+        lng=lng,
+        radius_km=radius_km,
+        signature=signature,
+        user_profile=user_profile,
+        supabase=supabase,
+    )
+    cache_service.set_magic_ai_area_results(cache_key, payload)
+    logger.info(
+        "Magic AI enrichment cache refreshed: key=%s items=%d",
+        cache_key,
+        len(payload.get("items") or []),
+    )
 
 
 async def _upsert_video_insights_for_location(
@@ -2108,6 +2148,7 @@ async def magic_search(request: MagicSearchRequest) -> MagicSearchResponse:
     debug = MagicSearchDebug()
     supabase = get_supabase_service()
     cache_service = get_cache_service()
+    ai_enrichment_payload: Optional[MagicAIEnrichmentPayload] = None
 
     _FOOD_TYPES_SET = {
         "restaurant", "cafe", "bar", "food", "bakery",
@@ -2147,6 +2188,44 @@ async def magic_search(request: MagicSearchRequest) -> MagicSearchResponse:
                 detail=f"User '{request.user_id}' not found",
             )
 
+        if request.enable_live_web_agent:
+            ai_signature = build_magic_ai_signature(
+                intent=intent,
+                raw_prompt=request.prompt,
+                lat=request.latitude,
+                lng=request.longitude,
+                radius_km=radius_km,
+            )
+            ai_cache_key = cache_service.build_magic_ai_area_key(ai_signature)
+            cached_ai = cache_service.get_magic_ai_area_results(ai_cache_key)
+            if cached_ai is not None:
+                cached_payload = dict(cached_ai)
+                cached_payload["cache_hit"] = True
+                ai_enrichment_payload = MagicAIEnrichmentPayload.model_validate(
+                    cached_payload
+                )
+                debug.ai_enrichment_cache_hit = True
+                debug.ai_enrichment_items = len(ai_enrichment_payload.items)
+            else:
+                async def refresh_ai_enrichment() -> None:
+                    await _refresh_magic_ai_enrichment_cache(
+                        cache_key=ai_cache_key,
+                        prompt=request.prompt,
+                        lat=request.latitude,
+                        lng=request.longitude,
+                        radius_km=radius_km,
+                        signature=ai_signature,
+                        user_profile=user_profile,
+                        supabase=supabase,
+                        cache_service=cache_service,
+                    )
+
+                await get_background_job_runner().enqueue(
+                    "magic_ai_enrichment_refresh",
+                    refresh_ai_enrichment,
+                )
+                debug.ai_enrichment_refresh_enqueued = True
+
         google_result = await google_task
         debug.google_search_latency_ms = (perf_counter() - google_started) * 1000.0
         debug.cache_hit_google_search = google_result.cache_hit_google_search
@@ -2159,6 +2238,7 @@ async def magic_search(request: MagicSearchRequest) -> MagicSearchResponse:
         )
         if google_result.google_queries:
             debug.google_queries = google_result.google_queries
+
         places = google_result.places
     except HTTPException:
         raise
@@ -2191,6 +2271,7 @@ async def magic_search(request: MagicSearchRequest) -> MagicSearchResponse:
             total_ranked=0,
             recommendations=[],
             sections=[],
+            ai_enrichment=ai_enrichment_payload,
             debug=debug,
             timestamp=datetime.utcnow().isoformat(),
         )
@@ -2211,12 +2292,14 @@ async def magic_search(request: MagicSearchRequest) -> MagicSearchResponse:
         food_place_ids.append(gid)
         place_by_id[gid] = place
 
-    # Batch-fetch all already-known locations in a single DB round-trip
-    existing_by_gid = supabase.get_locations_by_google_place_ids(food_place_ids)
+    combined_place_ids = list(dict.fromkeys(food_place_ids))
+
+    # Batch-fetch all already-known locations in a single DB round-trip.
+    existing_by_gid = supabase.get_locations_by_google_place_ids(combined_place_ids)
 
     location_ids_to_fetch: List[int] = []
     gid_by_location_id: Dict[int, str] = {}
-    for gid in food_place_ids:
+    for gid in combined_place_ids:
         if gid in existing_by_gid:
             lid = existing_by_gid[gid].get("location_id")
             if lid:
@@ -2274,6 +2357,7 @@ async def magic_search(request: MagicSearchRequest) -> MagicSearchResponse:
         user_id=request.user_id,
         social_weight=0.20,
         collaborative_weight=0.15,
+        filter_by_radius=False,
         user_profile=user_profile,
     )
     for candidate in scored:
@@ -2327,6 +2411,7 @@ async def magic_search(request: MagicSearchRequest) -> MagicSearchResponse:
                 final_score=float(candidate["final_score"]),
                 rank=int(candidate["rank"]),
                 source=list(candidate.get("source") or []),
+                source_metadata=list(candidate.get("source_metadata") or []),
                 match_reasons=list(candidate.get("match_reasons") or []),
                 intent_matches=dict(candidate.get("intent_matches") or {}),
                 confidence=float(candidate.get("confidence") or candidate["final_score"]),
@@ -2358,6 +2443,7 @@ async def magic_search(request: MagicSearchRequest) -> MagicSearchResponse:
         total_ranked=len(recommendations),
         recommendations=recommendations,
         sections=sections,
+        ai_enrichment=ai_enrichment_payload,
         debug=debug,
         timestamp=datetime.utcnow().isoformat(),
     )

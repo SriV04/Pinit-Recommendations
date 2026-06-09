@@ -694,6 +694,7 @@ class ProximalApiEndpointTests(unittest.TestCase):
 
         def _capture_rank(**kwargs):
             captured["request_radius_km"] = kwargs["request_radius_km"]
+            captured["filter_by_radius"] = kwargs["filter_by_radius"]
             ranked = []
             for candidate in kwargs["candidates"]:
                 ranked.append(
@@ -732,6 +733,7 @@ class ProximalApiEndpointTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(captured["request_radius_km"], 1.5)
+        self.assertIs(captured["filter_by_radius"], False)
 
     def test_bubble_recommendations_return_group_results(self) -> None:
         with self._patched_integrations():
