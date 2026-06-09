@@ -2,10 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from typing import Any, Dict, List, Optional
-
-import pandas as pd
 
 from pinit.api.schemas_location_tasks import (
     DetailsEnrichPayload,
@@ -27,6 +26,7 @@ from pinit.config.secrets import GOOGLE_PLACE_API_KEY
 from pinit.integrations.supabase import get_supabase_service
 
 logger = logging.getLogger(__name__)
+VIBE_PROCESSING_LOCK_STALE_SECONDS = 15 * 60
 
 
 class LocationTaskDispatcher:
@@ -154,11 +154,61 @@ def _truthy(value: Any) -> bool:
     if value is None:
         return False
     try:
-        if isinstance(value, float) and pd.isna(value):
+        if isinstance(value, float) and math.isnan(value):
             return False
     except Exception:
         pass
     return bool(value)
+
+
+async def _claim_vibe_processing(location_id: int, request_id: str, *, task_type: str) -> bool:
+    supabase = get_supabase_service()
+    claimed = await asyncio.to_thread(
+        supabase.claim_location_vibe_processing,
+        location_id,
+        request_id,
+        stale_after_seconds=VIBE_PROCESSING_LOCK_STALE_SECONDS,
+    )
+    if claimed:
+        logger.info(
+            "%s: claimed vibe processing lock (location_id=%s request_id=%s)",
+            task_type,
+            location_id,
+            request_id,
+        )
+    else:
+        logger.info(
+            "%s: skip vibe generation (updated_vibe already true or lock already held) "
+            "(location_id=%s request_id=%s)",
+            task_type,
+            location_id,
+            request_id,
+        )
+    return bool(claimed)
+
+
+async def _clear_vibe_processing(location_id: int, request_id: str, *, task_type: str) -> None:
+    supabase = get_supabase_service()
+    try:
+        await asyncio.to_thread(
+            supabase.clear_location_vibe_processing,
+            location_id,
+            request_id,
+        )
+        logger.info(
+            "%s: cleared vibe processing lock (location_id=%s request_id=%s)",
+            task_type,
+            location_id,
+            request_id,
+        )
+    except Exception as exc:
+        logger.warning(
+            "%s: failed to clear vibe processing lock (location_id=%s request_id=%s): %s",
+            task_type,
+            location_id,
+            request_id,
+            exc,
+        )
 
 
 async def pipeline_task(payload: PipelinePayload, *, dispatcher: LocationTaskDispatcher) -> None:
@@ -200,6 +250,16 @@ async def pipeline_task(payload: PipelinePayload, *, dispatcher: LocationTaskDis
     source = (payload.source or "in-app").lower().strip()
 
     if source in ("tiktok", "instagram"):
+        if updated_vibe:
+            logger.info(
+                "pipeline: skip vibe_reprocess for %s source (updated_vibe already true) "
+                "(location_id=%s request_id=%s)",
+                source,
+                payload.location_id,
+                payload.request_id,
+            )
+            return
+
         logger.info(
             "pipeline: dispatch vibe_reprocess (force_blend=true) (location_id=%s request_id=%s source=%s)",
             payload.location_id,
@@ -376,7 +436,7 @@ async def menu_vibe_task(payload: MenuVibePayload) -> None:
     updated_vibe = _truthy(updated_after_menu.get("updated_vibe"))
 
     blend_tiktok = (payload.source or "").lower().strip() == "tiktok"
-    if updated_vibe and not blend_tiktok:
+    if updated_vibe:
         logger.info(
             "menu_vibe: skip vibe generation (updated_vibe already true) (location_id=%s request_id=%s)",
             payload.location_id,
@@ -388,38 +448,55 @@ async def menu_vibe_task(payload: MenuVibePayload) -> None:
         has_summary = _truthy(updated_after_menu.get("generated_summary"))
     num_runs = 5 if has_summary else 1
 
-    vibe_vector = await generate_vibe_tags_for_location(
-        payload.location_id,
-        num_runs=num_runs,
-        blend_tiktok=blend_tiktok,
-    )
-    if vibe_vector is None:
-        # Do not ack silently; Pub/Sub retry helps transient LLM/network failures.
-        raise RuntimeError(f"menu_vibe vibe tagging returned None for location {payload.location_id}")
+    if not await _claim_vibe_processing(payload.location_id, payload.request_id, task_type="menu_vibe"):
+        return
+
+    try:
+        vibe_vector = await generate_vibe_tags_for_location(
+            payload.location_id,
+            num_runs=num_runs,
+            blend_tiktok=blend_tiktok,
+        )
+        if vibe_vector is None:
+            # Do not ack silently; Pub/Sub retry helps transient LLM/network failures.
+            raise RuntimeError(f"menu_vibe vibe tagging returned None for location {payload.location_id}")
+    except Exception:
+        await _clear_vibe_processing(payload.location_id, payload.request_id, task_type="menu_vibe")
+        raise
+    else:
+        await _clear_vibe_processing(payload.location_id, payload.request_id, task_type="menu_vibe")
 
 
 async def vibe_reprocess_task(payload: VibeReprocessPayload) -> None:
     row = await _get_location(payload.location_id)
     updated_vibe = _truthy(row.get("updated_vibe"))
 
-    if updated_vibe and not payload.force_blend:
+    if updated_vibe:
         logger.info(
-            "vibe_reprocess: skip (updated_vibe already true and force_blend=false) (location_id=%s request_id=%s)",
+            "vibe_reprocess: skip (updated_vibe already true) (location_id=%s request_id=%s)",
             payload.location_id,
             payload.request_id,
         )
         return
 
-    has_summary = _truthy(row.get("generated_summary"))
-    num_runs = 5 if has_summary else 1
+    num_runs = 3
 
-    vibe_vector = await generate_vibe_tags_for_location(
-        payload.location_id,
-        num_runs=num_runs,
-        blend_tiktok=payload.force_blend,
-    )
-    if vibe_vector is None:
-        raise RuntimeError(f"vibe_reprocess vibe tagging returned None for location {payload.location_id}")
+    if not await _claim_vibe_processing(payload.location_id, payload.request_id, task_type="vibe_reprocess"):
+        return
+
+    try:
+        vibe_vector = await generate_vibe_tags_for_location(
+            payload.location_id,
+            num_runs=num_runs,
+            blend_tiktok=payload.force_blend,
+        )
+        if vibe_vector is None:
+            raise RuntimeError(f"vibe_reprocess vibe tagging returned None for location {payload.location_id}")
+    except Exception:
+        await _clear_vibe_processing(payload.location_id, payload.request_id, task_type="vibe_reprocess")
+        raise
+    else:
+        await _clear_vibe_processing(payload.location_id, payload.request_id, task_type="vibe_reprocess")
 
 
 async def run_pipeline_inline(

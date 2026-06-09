@@ -64,5 +64,33 @@ def install_optional_dependency_stubs() -> None:
         crawl4ai_module.CrawlerRunConfig = CrawlerRunConfig
         sys.modules["crawl4ai"] = crawl4ai_module
 
+    if "openai" not in sys.modules:
+        openai_module = types.ModuleType("openai")
+
+        class OpenAI:
+            def __init__(self, *args, **kwargs) -> None:
+                pass
+
+        class AsyncOpenAI:
+            def __init__(self, *args, **kwargs) -> None:
+                pass
+
+        openai_module.OpenAI = OpenAI
+        openai_module.AsyncOpenAI = AsyncOpenAI
+        sys.modules["openai"] = openai_module
+
+    if "pandas" not in sys.modules:
+        pandas_module = types.ModuleType("pandas")
+
+        def isna(value):
+            return value != value
+
+        class DataFrame:
+            pass
+
+        pandas_module.isna = isna
+        pandas_module.DataFrame = DataFrame
+        sys.modules["pandas"] = pandas_module
+
 
 install_optional_dependency_stubs()

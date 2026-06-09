@@ -510,6 +510,44 @@ class SupabaseService:
                     cache.invalidate_geographic_cache(lat, lng, radius_km=20.0)
 
         return response.data[0] if response.data else None
+
+    def claim_location_vibe_processing(
+        self,
+        location_id: int,
+        request_id: str,
+        *,
+        stale_after_seconds: int = 900,
+    ) -> bool:
+        """Atomically claim vibe processing for a location.
+
+        Returns True only when the location still needs a vibe vector and no
+        fresh worker lock is already present. This prevents duplicate Pub/Sub
+        deliveries from running the Grok pipeline concurrently.
+        """
+        response = self.client.rpc(
+            "claim_location_vibe_processing",
+            {
+                "p_location_id": location_id,
+                "p_request_id": request_id,
+                "p_stale_after_seconds": stale_after_seconds,
+            },
+        ).execute()
+        return bool(response.data)
+
+    def clear_location_vibe_processing(self, location_id: int, request_id: str) -> None:
+        """Clear a vibe-processing lock if it is still owned by request_id."""
+        (
+            self.client.table("locations")
+            .update(
+                {
+                    "vibe_processing_request_id": None,
+                    "vibe_processing_started_at": None,
+                }
+            )
+            .eq("location_id", location_id)
+            .eq("vibe_processing_request_id", request_id)
+            .execute()
+        )
     
     def delete_location(self, location_id: int) -> bool:
         """Delete a location"""
