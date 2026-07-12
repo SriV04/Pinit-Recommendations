@@ -46,6 +46,13 @@ def _normalise_item(
     matched_location_id: Optional[int],
 ) -> Dict[str, Any]:
     google_place_id = str((place or {}).get("id") or "").strip() or None
+    # Keep the full resolved Google place so future cache reads can build a
+    # rich candidate. Drop the echoed suggestion blob to avoid storing it twice.
+    google_place = (
+        {key: value for key, value in place.items() if key != "web_agent"}
+        if place
+        else None
+    )
     return {
         "google_place_id": google_place_id,
         "name": _display_name(place, str(suggestion.get("name") or "")),
@@ -65,6 +72,7 @@ def _normalise_item(
             if matched_location_id is not None
             else ("google_resolved" if google_place_id else "unresolved")
         ),
+        "google_place": google_place,
     }
 
 
@@ -77,7 +85,8 @@ async def build_magic_ai_enrichment_payload(
     signature: Dict[str, Any],
     user_profile: Optional[Dict[str, Any]],
     supabase: Any,
-    max_candidates: int = 8,
+    # Fewer candidates => fewer venues for the agent to web-search => faster.
+    max_candidates: int = 6,
     fetch_suggestions: FetchSuggestions = fetch_magic_web_agent_suggestions,
     resolve_suggestions: ResolveSuggestions = resolve_magic_web_agent_suggestions,
 ) -> Dict[str, Any]:

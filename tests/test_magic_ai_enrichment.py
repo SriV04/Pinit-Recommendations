@@ -132,6 +132,12 @@ class MagicAIEnrichmentTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(payload["items"][2]["google_place_id"])
         self.assertIsNone(payload["items"][2]["matched_location_id"])
         self.assertEqual(payload["items"][2]["match_status"], "unresolved")
+        # Resolved items cache the full Google place (minus the echoed
+        # suggestion) so future calls can build a rich candidate; unresolved
+        # ones have nothing to store.
+        self.assertEqual(payload["items"][0]["google_place"]["id"], "gid-1")
+        self.assertNotIn("web_agent", payload["items"][0]["google_place"])
+        self.assertIsNone(payload["items"][2]["google_place"])
         resolve_suggestions.assert_awaited_once()
         resolver_suggestions = resolve_suggestions.await_args.args[0]
         self.assertTrue(

@@ -380,10 +380,14 @@ def _agentic_web_score(candidate: Mapping[str, Any]) -> float:
     claims = set(web_agent.get("source_claims") or [])
     claim_bonus = 0.0
     if "ai_hotspot" in claims or "social_buzz" in claims:
-        claim_bonus += 0.02
+        claim_bonus += 0.04
     if "date_spot" in claims or "new_opening" in claims:
-        claim_bonus += 0.01
-    return min(0.08, confidence * 0.06 + claim_bonus)
+        claim_bonus += 0.03
+    if "critic_mentioned" in claims:
+        claim_bonus += 0.03
+    # Strong, confidence-scaled boost so agentic finds land in the top results
+    # rather than being out-scored by venues with established Google ratings.
+    return min(0.20, confidence * 0.14 + claim_bonus)
 
 
 def _source_metadata(candidate: Mapping[str, Any]) -> List[Dict[str, Any]]:

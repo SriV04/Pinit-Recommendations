@@ -338,7 +338,7 @@ class ProximalCacheService:
 
     def build_magic_ai_area_key(self, signature: Dict[str, Any]) -> str:
         return (
-            "magic:ai_area:v2:"
+            "magic:ai_area:v4:"
             f"{signature['geo_bucket']}:"
             f"{signature['radius_bucket']}:"
             f"{signature['intent_hash']}:"

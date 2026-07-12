@@ -435,28 +435,19 @@ class SupabaseService:
         )
         return {row["google_place_id"]: row for row in (response.data or [])}
 
-    def get_locations_by_ids(
-        self, location_ids: List[int]
-    ) -> List[Dict[str, Any]]:
-        """Batch-fetch full location rows by primary key.
+    # Columns selected when a full location row plus its app-popularity pillars
+    # are needed for ranking.
+    _LOCATION_WITH_POPULARITY_SELECT = (
+        "*,location_popularity_app("
+        "saves_count,dislikes_count,been_to_count,"
+        "app_engagement_score,google_baseline_score,"
+        "video_insight_score,share_count,quality_bias:quality_score"
+        ")"
+    )
 
-        Returns rows in an unspecified order; missing IDs are silently skipped.
-        """
-        if not location_ids:
-            return []
-        response = (
-            self.client.table("locations")
-            .select(
-                "*,location_popularity_app("
-                "saves_count,dislikes_count,been_to_count,"
-                "app_engagement_score,google_baseline_score,"
-                "video_insight_score,share_count,quality_bias:quality_score"
-                ")"
-            )
-            .in_("location_id", list(location_ids))
-            .execute()
-        )
-        rows = response.data or []
+    @staticmethod
+    def _flatten_location_popularity(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Hoist the nested location_popularity_app pillars onto each row."""
         flat: List[Dict[str, Any]] = []
         for row in rows:
             item = dict(row)
@@ -483,8 +474,49 @@ class SupabaseService:
                         item[key] = lpa[key]
 
             flat.append(item)
+        return flat
 
+    def get_locations_by_ids(
+        self, location_ids: List[int]
+    ) -> List[Dict[str, Any]]:
+        """Batch-fetch full location rows by primary key.
+
+        Returns rows in an unspecified order; missing IDs are silently skipped.
+        """
+        if not location_ids:
+            return []
+        response = (
+            self.client.table("locations")
+            .select(self._LOCATION_WITH_POPULARITY_SELECT)
+            .in_("location_id", list(location_ids))
+            .execute()
+        )
+        flat = self._flatten_location_popularity(response.data or [])
         return self._normalise_pillar_rows(flat)
+
+    def get_locations_with_popularity_by_google_place_ids(
+        self, google_place_ids: List[str]
+    ) -> Dict[str, Dict[str, Any]]:
+        """Batch-fetch full location rows (with popularity pillars) keyed by
+        google_place_id, in a single round-trip.
+
+        Collapses the membership lookup + full-row fetch that magic search
+        previously did as two sequential queries.
+        """
+        if not google_place_ids:
+            return {}
+        response = (
+            self.client.table("locations")
+            .select(self._LOCATION_WITH_POPULARITY_SELECT)
+            .in_("google_place_id", list(google_place_ids))
+            .execute()
+        )
+        flat = self._flatten_location_popularity(response.data or [])
+        return {
+            row["google_place_id"]: row
+            for row in self._normalise_pillar_rows(flat)
+            if row.get("google_place_id")
+        }
 
     def get_location_without_emoji(self) -> List[Dict[str, Any]]:
         """Get locations without an emoji assigned"""

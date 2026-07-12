@@ -138,6 +138,10 @@ class MagicLocationRecommendation(LocationRecommendation):
     match_reasons: List[str] = Field(default_factory=list)
     intent_matches: Dict[str, Any] = Field(default_factory=dict)
     confidence: float = 0.0
+    section: Optional[str] = Field(
+        None,
+        description="Header of the response section this place is grouped under",
+    )
 
 
 class ProximalResponse(BaseModel):
@@ -235,9 +239,14 @@ class MagicSearchRequest(BaseModel):
     )
 
 class MagicSearchSection(BaseModel):
+    """A lightweight header for grouping the response.
+
+    Recommendations are NOT relisted here — each carries its own ``section``
+    field naming the header it belongs to. This list only conveys the ordered
+    headers (and their subtitles) the client should render.
+    """
     title: str
     subtitle: Optional[str] = None
-    recommendations: List[MagicLocationRecommendation] = Field(default_factory=list)
 
 
 class MagicSearchResponse(BaseModel):

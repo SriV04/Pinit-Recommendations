@@ -45,6 +45,7 @@ class MagicSearchDebug(BaseModel):
     ai_enrichment_cache_hit: bool = False
     ai_enrichment_refresh_enqueued: bool = False
     ai_enrichment_items: int = 0
+    ai_enrichment_ranked_candidates: int = 0
     cache_hit_google_search: bool = False
     cache_hit_place_details: bool = False
     cache_hit_user_profile: bool = False
@@ -74,6 +75,10 @@ class MagicAIEnrichmentItem(BaseModel):
     citations: List[Dict[str, Any]] = Field(default_factory=list)
     matched_location_id: Optional[int] = None
     match_status: str
+    # Raw resolved Places v1 place, kept in the cache so future calls can build
+    # a fully-populated candidate. Excluded from the API response to avoid
+    # duplicating data already broken out onto each recommendation.
+    google_place: Optional[Dict[str, Any]] = Field(default=None, exclude=True)
 
 
 class MagicAIEnrichmentPayload(BaseModel):
@@ -102,18 +107,3 @@ class MagicCandidate(BaseModel):
 
     existing_pinit_data: Optional[Dict[str, Any]] = None
     google_data: Dict[str, Any] = Field(default_factory=dict)
-
-
-class MagicWebAgentCitation(BaseModel):
-    url: str
-    title: Optional[str] = None
-
-
-class MagicWebAgentSuggestionModel(BaseModel):
-    name: str
-    google_place_id: Optional[str] = None
-    address_hint: Optional[str] = None
-    reason: str
-    confidence: float = 0.0
-    source_claims: List[str] = Field(default_factory=list)
-    citations: List[MagicWebAgentCitation] = Field(default_factory=list)

@@ -82,65 +82,72 @@ def build_match_reasons(
     return reasons[:5]
 
 
-def _slice_top(recommendations: Sequence[Any], limit: int) -> List[Any]:
-    return list(recommendations[:limit])
+# Section subtitles, keyed by header title. Display order is fixed below.
+_MAGIC_SECTION_SUBTITLES: Dict[str, str] = {
+    "Best matches": "Highest overall Magic Search score",
+    "Friend-backed picks": "Places with trusted social signal",
+    "Hidden gems": "Strong ratings without obvious touristy mass appeal",
+    "Reliable nearby options": "High Google quality with practical availability",
+    "More places": "More spots worth a look",
+}
+_MAGIC_SECTION_ORDER: List[str] = list(_MAGIC_SECTION_SUBTITLES.keys())
+
+
+def _is_friend_backed(item: Any) -> bool:
+    return (
+        float(_candidate_value(item, "social_score", 0.0) or 0.0) > 0
+        or bool(_candidate_value(item, "friend_saves"))
+    )
+
+
+def _is_hidden_gem(item: Any) -> bool:
+    scores = _candidate_value(item, "intent_matches", {}) or {}
+    return _score(scores, "novelty") >= 0.7
+
+
+def _is_reliable_nearby(item: Any) -> bool:
+    scores = _candidate_value(item, "intent_matches", {}) or {}
+    return _score(scores, "google_quality") >= 0.75 and _score(scores, "availability") >= 0.6
+
+
+def _assign_magic_section(item: Any, index: int) -> str:
+    """Pick the single section header for a ranked recommendation.
+
+    The top 3 are the headline "Best matches"; the rest fall into the first
+    themed section they qualify for, defaulting to "More places".
+    """
+    if index < 3:
+        return "Best matches"
+    if _is_friend_backed(item):
+        return "Friend-backed picks"
+    if _is_hidden_gem(item):
+        return "Hidden gems"
+    if _is_reliable_nearby(item):
+        return "Reliable nearby options"
+    return "More places"
 
 
 def build_magic_sections(recommendations: Sequence[Any]) -> List[Dict[str, Any]]:
-    """Group ranked Magic Search results into curated response sections."""
+    """Assign each recommendation a single ``section`` header and return the
+    ordered, header-only section list.
+
+    Mutates each recommendation in place (sets ``section``) rather than
+    relisting it, so a place is serialised exactly once in the response.
+    """
     if not recommendations:
         return []
 
-    sections: List[Dict[str, Any]] = [
-        {
-            "title": "Best matches",
-            "subtitle": "Highest overall Magic Search score",
-            "recommendations": _slice_top(recommendations, 3),
-        }
-    ]
+    used: set[str] = set()
+    for index, item in enumerate(recommendations):
+        title = _assign_magic_section(item, index)
+        if isinstance(item, Mapping):
+            item["section"] = title
+        else:
+            setattr(item, "section", title)
+        used.add(title)
 
-    friend_backed = [
-        item
-        for item in recommendations
-        if float(_candidate_value(item, "social_score", 0.0) or 0.0) > 0
-        or _candidate_value(item, "friend_saves")
+    return [
+        {"title": title, "subtitle": _MAGIC_SECTION_SUBTITLES[title]}
+        for title in _MAGIC_SECTION_ORDER
+        if title in used
     ]
-    if friend_backed:
-        sections.append(
-            {
-                "title": "Friend-backed picks",
-                "subtitle": "Places with trusted social signal",
-                "recommendations": _slice_top(friend_backed, 3),
-            }
-        )
-
-    hidden_gems = [
-        item
-        for item in recommendations
-        if _score(_candidate_value(item, "intent_matches", {}) or {}, "novelty") >= 0.7
-    ]
-    if hidden_gems:
-        sections.append(
-            {
-                "title": "Hidden gems",
-                "subtitle": "Strong ratings without obvious touristy mass appeal",
-                "recommendations": _slice_top(hidden_gems, 3),
-            }
-        )
-
-    safe_nearby = [
-        item
-        for item in recommendations
-        if _score(_candidate_value(item, "intent_matches", {}) or {}, "google_quality") >= 0.75
-        and _score(_candidate_value(item, "intent_matches", {}) or {}, "availability") >= 0.6
-    ]
-    if safe_nearby:
-        sections.append(
-            {
-                "title": "Reliable nearby options",
-                "subtitle": "High Google quality with practical availability",
-                "recommendations": _slice_top(safe_nearby, 3),
-            }
-        )
-
-    return sections[:4]

@@ -191,7 +191,7 @@ class MagicSearchInfrastructureTests(unittest.TestCase):
 
         self.assertEqual(
             key,
-            "magic:ai_area:v2:51.494:-0.174:2km:abc123:recent",
+            "magic:ai_area:v4:51.494:-0.174:2km:abc123:recent",
         )
         self.assertTrue(cache.set_magic_ai_area_results(key, payload))
         self.assertEqual(cache.get_magic_ai_area_results(key), payload)

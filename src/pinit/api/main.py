@@ -19,6 +19,12 @@ from pinit.cli.warm_cache import (
     warm_cache_timezone_from_env,
     warm_cache_zone_set_from_env,
 )
+from pinit.cli.warm_magic import (
+    magic_prewarm_enabled_from_env,
+    magic_prewarm_interval_from_env,
+    magic_prewarm_zone_set_from_env,
+    warm_magic_loop,
+)
 from pinit.integrations.pubsub_tasks import get_pubsub_config
 
 # Configure logging (respect LOG_LEVEL env)
@@ -30,6 +36,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 _warm_cache_task: asyncio.Task | None = None
+_warm_magic_task: asyncio.Task | None = None
 
 app = FastAPI(
     title="Pinit Proximal Recommendations API",
@@ -50,7 +57,7 @@ app.include_router(proximal.router)
 
 @app.on_event("startup")
 async def startup_background_workers() -> None:
-    global _warm_cache_task
+    global _warm_cache_task, _warm_magic_task
     cfg = get_pubsub_config()
     if cfg.enabled:
         logger.info("Pub/Sub enabled (project_id=%s topic=%s)", cfg.project_id, cfg.topic)
@@ -83,16 +90,39 @@ async def startup_background_workers() -> None:
             warm_cache_timezone_from_env(),
         )
 
+    if magic_prewarm_enabled_from_env() and _warm_magic_task is None:
+        _warm_magic_task = asyncio.create_task(
+            warm_magic_loop(
+                zone_set=magic_prewarm_zone_set_from_env(),
+                interval_seconds=magic_prewarm_interval_from_env(),
+                start_hour=warm_cache_start_hour_from_env(),
+                end_hour=warm_cache_end_hour_from_env(),
+                timezone_name=warm_cache_timezone_from_env(),
+            )
+        )
+        logger.info(
+            "Started magic enrichment pre-warm scheduler (zone_set=%s interval=%ss)",
+            magic_prewarm_zone_set_from_env(),
+            magic_prewarm_interval_from_env(),
+        )
+
 
 @app.on_event("shutdown")
 async def shutdown_background_workers() -> None:
-    global _warm_cache_task
+    global _warm_cache_task, _warm_magic_task
     if _warm_cache_task is not None:
         _warm_cache_task.cancel()
         with suppress(asyncio.CancelledError):
             await _warm_cache_task
         _warm_cache_task = None
         logger.info("Stopped warm cache scheduler")
+
+    if _warm_magic_task is not None:
+        _warm_magic_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await _warm_magic_task
+        _warm_magic_task = None
+        logger.info("Stopped magic enrichment pre-warm scheduler")
 
     if not get_pubsub_config().enabled:
         await get_background_job_runner().stop()

@@ -154,10 +154,50 @@ class MagicRankingTests(unittest.TestCase):
             request_radius_km=2.0,
         )
 
-        self.assertLessEqual(ranked[0]["intent_matches"]["agentic_web"], 0.08)
+        agentic_web = ranked[0]["intent_matches"]["agentic_web"]
+        self.assertLessEqual(agentic_web, 0.20)
+        self.assertGreaterEqual(agentic_web, 0.15)  # confident agentic finds get a strong boost
         self.assertIn("AI Agent", ranked[0]["source"])
         self.assertEqual(ranked[0]["source_metadata"][0]["source"], "ai_agent")
         self.assertIn("Suggested by Magic Search AI", ranked[0]["match_reasons"])
+
+
+    def test_confident_ai_only_candidate_outranks_mediocre_known_venue(self) -> None:
+        intent = parse_magic_intent("hot new restaurants in brighton")
+        # Lean AI-only candidate, shaped like _magic_ai_enrichment_candidate():
+        # no Google rating, but base + quality seeded from agent confidence.
+        ai_only = {
+            "location_id": -99,
+            "google_place_id": "gid-ai",
+            "name": "The Set",
+            "lat": 50.83,
+            "lng": -0.14,
+            "distance_km": 0.5,
+            "quality_score": 0.9,
+            "final_score": 0.9,
+            "web_agent": {
+                "reason": "Buzzy new opening",
+                "confidence": 0.9,
+                "source_claims": ["new_opening", "critic_mentioned"],
+                "citations": [],
+            },
+        }
+        known = {
+            "location_id": 1,
+            "google_place_id": "gid-known",
+            "name": "Average Diner",
+            "lat": 50.83,
+            "lng": -0.14,
+            "distance_km": 0.5,
+            "rating": 3.9,
+            "user_ratings_total": 80,
+            "final_score": 0.45,
+        }
+        ranked = rerank_magic_candidates(
+            [known, ai_only], intent=intent, request_radius_km=2.0
+        )
+        self.assertEqual(ranked[0]["name"], "The Set")
+        self.assertIn("AI Agent", ranked[0]["source"])
 
 
 if __name__ == "__main__":

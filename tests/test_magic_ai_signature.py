@@ -19,7 +19,7 @@ from pinit.api.services.magic_intent_parser import parse_magic_intent
 
 class MagicAISignatureTests(unittest.TestCase):
     def test_geo_bucket_rounds_to_neighbourhood_scale(self) -> None:
-        self.assertEqual(geo_bucket(51.49414, -0.17383), "51.494:-0.174")
+        self.assertEqual(geo_bucket(51.49414, -0.17383), "51.49:-0.17")
 
     def test_radius_bucket_groups_close_values(self) -> None:
         self.assertEqual(radius_bucket(0.8), "1km")

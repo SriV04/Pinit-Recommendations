@@ -202,22 +202,32 @@ class _FakeSupabase:
 
     def get_locations_by_ids(self, location_ids: list[int]) -> list[dict]:
         return [
-            {
-                **_candidate(
-                    4001,
-                    "Magic Known Place",
-                    51.5095,
-                    -0.1490,
-                    cuisine="japanese",
-                    quality_score=0.88,
-                ),
-                "google_place_id": "known-place-id",
-                "saves_count": 10,
-                "dislikes_count": 0,
-            }
+            self._magic_known_row()
             for location_id in location_ids
             if location_id == 4001
         ]
+
+    def _magic_known_row(self) -> dict:
+        return {
+            **_candidate(
+                4001,
+                "Magic Known Place",
+                51.5095,
+                -0.1490,
+                cuisine="japanese",
+                quality_score=0.88,
+            ),
+            "google_place_id": "known-place-id",
+            "saves_count": 10,
+            "dislikes_count": 0,
+        }
+
+    def get_locations_with_popularity_by_google_place_ids(
+        self, google_place_ids: list[str]
+    ) -> dict:
+        if "known-place-id" in google_place_ids:
+            return {"known-place-id": self._magic_known_row()}
+        return {}
 
     def get_bubble_added_locations(self, bubble_id: str) -> list[dict]:
         return [
@@ -478,6 +488,10 @@ class ProximalApiEndpointTests(unittest.TestCase):
         self.assertIn("confidence", body["recommendations"][0])
         self.assertGreaterEqual(len(body["sections"]), 1)
         self.assertEqual(body["sections"][0]["title"], "Best matches")
+        # Sections are header-only; each recommendation carries its own section
+        # header instead of being relisted inside the section.
+        self.assertNotIn("recommendations", body["sections"][0])
+        self.assertEqual(body["recommendations"][0]["section"], "Best matches")
         self.assertEqual(body["debug"]["total_google_calls"], 1)
         self.assertEqual(body["debug"]["total_candidates_before_dedupe"], 2)
         self.assertEqual(body["debug"]["total_candidates_after_dedupe"], 2)
@@ -656,8 +670,8 @@ class ProximalApiEndpointTests(unittest.TestCase):
             new=AsyncMock(return_value=google_result),
         ), patch.object(
             self.supabase,
-            "get_locations_by_ids",
-            return_value=[hammersmith_candidate],
+            "get_locations_with_popularity_by_google_place_ids",
+            return_value={"known-place-id": hammersmith_candidate},
         ):
             response = self.client.post(
                 "/locations/magic-search",
@@ -734,6 +748,69 @@ class ProximalApiEndpointTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(captured["request_radius_km"], 1.5)
         self.assertIs(captured["filter_by_radius"], False)
+
+    def test_magic_search_does_not_cap_or_filter_near_me_cuisine_queries(self) -> None:
+        # Magic search no longer caps the radius or drops far candidates: a
+        # "near me" cuisine query keeps the requested radius and returns both
+        # the near and far venues.
+        google_result = MagicGoogleSearchResult(
+            places=[
+                {
+                    "id": "near-uyghur-id",
+                    "displayName": {"text": "Near Uyghur Kitchen"},
+                    "types": ["restaurant"],
+                    "location": {"latitude": 51.5095, "longitude": -0.1490},
+                    "rating": 4.7,
+                    "userRatingCount": 120,
+                },
+                {
+                    "id": "far-uyghur-id",
+                    "displayName": {"text": "Far Uyghur Kitchen"},
+                    "types": ["restaurant"],
+                    "location": {"latitude": 51.5095, "longitude": -0.7000},
+                    "rating": 4.9,
+                    "userRatingCount": 900,
+                },
+            ],
+            total_google_calls=1,
+            total_candidates_before_dedupe=2,
+            total_candidates_after_dedupe=2,
+            google_queries=["authentic Uyghur cuisine near me"],
+        )
+        captured: dict[str, float] = {}
+
+        async def _capture_google_candidates(*args, **kwargs):
+            captured["google_radius_km"] = kwargs["radius_km"]
+            return google_result
+
+        with (
+            self._patched_integrations(),
+            patch.object(
+                proximal,
+                "get_or_fetch_google_candidates",
+                new=AsyncMock(side_effect=_capture_google_candidates),
+            ),
+        ):
+            response = self.client.post(
+                "/locations/magic-search",
+                json={
+                    "user_id": USER_ID,
+                    "latitude": 51.5095,
+                    "longitude": -0.1490,
+                    "prompt": "authentic Uyghur cuisine near me",
+                    "radius_km": 50,
+                    "max_results": 5,
+                },
+            )
+
+        body = response.json()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(captured["google_radius_km"], 50.0)
+        self.assertEqual(body["radius_km"], 50.0)
+        self.assertEqual(
+            sorted(item["name"] for item in body["recommendations"]),
+            ["Far Uyghur Kitchen", "Near Uyghur Kitchen"],
+        )
 
     def test_bubble_recommendations_return_group_results(self) -> None:
         with self._patched_integrations():

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 import hashlib
 import logging
 import math
+import re
 from time import perf_counter
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
@@ -74,6 +76,14 @@ from pinit.integrations.supabase import get_supabase_service
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+# Short TTL for negative-cached (empty) AI enrichment results so a transient
+# agent failure doesn't suppress enrichment for the full 24h area TTL.
+_MAGIC_AI_AREA_EMPTY_TTL_SECONDS = 600
+# Grid (degrees, ~11km) the AI-area anchor is snapped to. The anchor comes from
+# the median of the Google results, which jitters by ~1km between different
+# phrasings of the same-area search; snapping collapses them onto one stable
+# cache key so they share the expensive Grok enrichment.
+_MAGIC_AI_AREA_GRID_DEG = 0.1
 
 
 def _photo_fields(row: Any) -> Dict[str, Any]:
@@ -477,16 +487,19 @@ def _rank_cached_candidates(
     action_count = 0
 
     if user_id and not is_group_mode:
-        # Social scoring
-        social_scores, friend_attributions = compute_social_scores(
-            user_id, candidate_location_ids, supabase
-        )
+        # Social and collaborative scoring are independent and each makes its
+        # own Supabase round-trips; run them concurrently so the request waits
+        # on the slower of the two rather than their sum.
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            social_future = executor.submit(
+                compute_social_scores, user_id, candidate_location_ids, supabase
+            )
+            collab_future = executor.submit(
+                compute_collaborative_scores, user_id, candidate_location_ids, supabase
+            )
+            social_scores, friend_attributions = social_future.result()
+            collab_scores = collab_future.result()
         has_friends = any(s > 0 for s in social_scores.values())
-
-        # Collaborative scoring
-        collab_scores = compute_collaborative_scores(
-            user_id, candidate_location_ids, supabase
-        )
 
         # Get action count for adaptive weights — prefer the bundled profile
         if user_profile is not None and "action_count" in user_profile:
@@ -1308,11 +1321,17 @@ async def _refresh_magic_ai_enrichment_cache(
         user_profile=user_profile,
         supabase=supabase,
     )
-    cache_service.set_magic_ai_area_results(cache_key, payload)
+    item_count = len(payload.get("items") or [])
+    # Negative-cache empty results with a short TTL: a one-off agent timeout or
+    # empty run shouldn't poison the area for the full 24h. The short TTL still
+    # prevents hammering Grok on every request while letting it retry soon.
+    ttl_seconds = None if item_count else _MAGIC_AI_AREA_EMPTY_TTL_SECONDS
+    cache_service.set_magic_ai_area_results(cache_key, payload, ttl_seconds=ttl_seconds)
     logger.info(
-        "Magic AI enrichment cache refreshed: key=%s items=%d",
+        "Magic AI enrichment cache refreshed: key=%s items=%d ttl=%s",
         cache_key,
-        len(payload.get("items") or []),
+        item_count,
+        ttl_seconds or "default",
     )
 
 
@@ -1993,46 +2012,17 @@ def _fill_missing_magic_search_google_fields(
             candidate[key] = value
 
 
-def _magic_search_external_candidate(
-    place: Dict[str, Any],
-    *,
-    request_lat: float,
-    request_lng: float,
-    search_position: int,
-) -> Optional[Dict[str, Any]]:
-    from pinit.core.recommendation.proximal_recommendation import haversine_distance
+def _magic_search_place_fields(place: Dict[str, Any]) -> Dict[str, Any]:
+    """Map a Places v1 place dict to the rich snake_case fields a Magic Search
+    candidate carries (rating, photos, summaries, serves* flags, …).
 
-    gid = str(place.get("id") or "").strip()
-    location = place.get("location") or {}
-    lat = location.get("latitude")
-    lng = location.get("longitude")
-    if not gid or lat is None or lng is None:
-        return None
-
-    opening = place.get("currentOpeningHours") or {}
-    open_now = opening.get("openNow")
-    if open_now is False:
-        return None
-
-    lat_f = float(lat)
-    lng_f = float(lng)
-    distance_km = haversine_distance(request_lat, request_lng, lat_f, lng_f)
+    Shared by Google-only externals and AI-agent finds so an agent suggestion,
+    once resolved, surfaces with the same full information as any other place.
+    """
+    types = place.get("types") or []
     rating = place.get("rating")
     reviews = place.get("userRatingCount")
-    quality_score = _magic_search_google_baseline_score(rating, reviews)
-    distance_score = max(0.0, 1.0 - min(distance_km / 5.0, 1.0))
-    order_score = max(0.0, 1.0 - min(search_position, 20) / 20.0)
-    final_score = (
-        quality_score * 0.72
-        + distance_score * 0.18
-        + order_score * 0.10
-    )
-    types = place.get("types") or []
-
     return {
-        "location_id": _magic_search_negative_location_id(gid),
-        "google_place_id": gid,
-        "is_known_location": False,
         "name": _magic_search_place_name(place),
         "vicinity": place.get("shortFormattedAddress") or place.get("formattedAddress"),
         "formatted_address": place.get("formattedAddress"),
@@ -2043,21 +2033,12 @@ def _magic_search_external_candidate(
         "editorial_summary": _magic_search_summary_text(place.get("editorialSummary")),
         "review_summary": _magic_search_summary_text(place.get("reviewSummary")),
         "opening_hours_text": _magic_search_opening_hours_text(place),
-        "lat": lat_f,
-        "lng": lng_f,
         "types": ",".join(types) if isinstance(types, list) else str(types),
-        "open_now": open_now,
+        "open_now": (place.get("currentOpeningHours") or {}).get("openNow"),
         "rating": float(rating) if rating is not None else None,
         "user_ratings_total": int(reviews) if reviews is not None else None,
         "price_level": _magic_search_place_price_level(place),
         "photo_reference": _magic_search_photo_reference(place),
-        "distance_km": distance_km,
-        "vibe_score": 0.0,
-        "dietary_score": 0.0,
-        "quality_score": quality_score,
-        "social_score": 0.0,
-        "collaborative_score": 0.0,
-        "final_score": max(0.0, min(final_score, 1.0)),
         "good_for_children": place.get("goodForChildren"),
         "good_for_groups": place.get("goodForGroups"),
         "good_for_watching_sports": place.get("goodForWatchingSports"),
@@ -2074,6 +2055,251 @@ def _magic_search_external_candidate(
         "serves_vegetarian_food": place.get("servesVegetarianFood"),
         "serves_wine": place.get("servesWine"),
     }
+
+
+def _magic_search_external_candidate(
+    place: Dict[str, Any],
+    *,
+    request_lat: float,
+    request_lng: float,
+    search_position: int,
+) -> Optional[Dict[str, Any]]:
+    from pinit.core.recommendation.proximal_recommendation import haversine_distance
+
+    gid = str(place.get("id") or "").strip()
+    location = place.get("location") or {}
+    lat = location.get("latitude")
+    lng = location.get("longitude")
+    if not gid or lat is None or lng is None:
+        return None
+
+    open_now = (place.get("currentOpeningHours") or {}).get("openNow")
+    if open_now is False:
+        return None
+
+    lat_f = float(lat)
+    lng_f = float(lng)
+    distance_km = haversine_distance(request_lat, request_lng, lat_f, lng_f)
+    quality_score = _magic_search_google_baseline_score(
+        place.get("rating"), place.get("userRatingCount")
+    )
+    distance_score = max(0.0, 1.0 - min(distance_km / 5.0, 1.0))
+    order_score = max(0.0, 1.0 - min(search_position, 20) / 20.0)
+    final_score = (
+        quality_score * 0.72
+        + distance_score * 0.18
+        + order_score * 0.10
+    )
+
+    return {
+        **_magic_search_place_fields(place),
+        "location_id": _magic_search_negative_location_id(gid),
+        "google_place_id": gid,
+        "is_known_location": False,
+        "lat": lat_f,
+        "lng": lng_f,
+        "distance_km": distance_km,
+        "vibe_score": 0.0,
+        "dietary_score": 0.0,
+        "quality_score": quality_score,
+        "social_score": 0.0,
+        "collaborative_score": 0.0,
+        "final_score": max(0.0, min(final_score, 1.0)),
+    }
+
+
+def _magic_ai_web_agent_payload(item: "MagicAIEnrichmentItem") -> Dict[str, Any]:
+    """Build the ``web_agent`` blob the ranker reads for the agentic boost.
+
+    ``magic_ranking`` keys its agentic-web score, AI source label and citations
+    off ``candidate["web_agent"]``; this packs the enrichment item into that
+    shape.
+    """
+    return {
+        "name": item.name,
+        "reason": item.reason,
+        "confidence": float(item.confidence or 0.0),
+        "source_claims": list(item.source_claims or []),
+        "citations": list(item.citations or []),
+        "address_hint": item.address_hint,
+        "neighbourhood_hint": item.neighbourhood_hint,
+        "place_resolution_query": item.place_resolution_query,
+    }
+
+
+def _magic_ai_enrichment_candidate(
+    item: "MagicAIEnrichmentItem",
+    *,
+    request_lat: float,
+    request_lng: float,
+) -> Optional[Dict[str, Any]]:
+    """Turn an AI-suggested venue into a rankable candidate.
+
+    Only items the web agent managed to geo-resolve (lat/lng present) can be
+    ranked and rendered; unresolved name-only suggestions are skipped. When the
+    resolved Google place was stored on the item (``google_place``), the
+    candidate carries the same full information as any other place — rating,
+    photos, opening hours, serves* flags — rather than being lean.
+    """
+    from pinit.core.recommendation.proximal_recommendation import haversine_distance
+
+    if item.lat is None or item.lng is None:
+        return None
+
+    gid = str(item.google_place_id or "").strip()
+    lat_f = float(item.lat)
+    lng_f = float(item.lng)
+    distance_km = haversine_distance(request_lat, request_lng, lat_f, lng_f)
+    is_known = item.matched_location_id is not None
+    location_id = (
+        int(item.matched_location_id)
+        if is_known
+        else _magic_search_negative_location_id(gid or f"ai:{item.name}:{lat_f},{lng_f}")
+    )
+    ai_confidence = max(0.0, min(float(item.confidence or 0.0), 1.0))
+
+    google_place = item.google_place if isinstance(item.google_place, dict) else None
+    if google_place:
+        candidate: Dict[str, Any] = dict(_magic_search_place_fields(google_place))
+    else:
+        candidate = {
+            "name": item.name,
+            "vicinity": item.formatted_address,
+            "formatted_address": item.formatted_address,
+            "open_now": None,
+            "rating": None,
+            "user_ratings_total": None,
+            "price_level": None,
+        }
+
+    # Use the real Google quality when we have it, floored so a low/no-rating
+    # find still ranks; seed base from the agent's confidence so high-confidence
+    # discoveries surface in the top results rather than being buried.
+    google_quality = _magic_search_google_baseline_score(
+        candidate.get("rating"), candidate.get("user_ratings_total")
+    )
+
+    candidate.update(
+        {
+            "location_id": location_id,
+            "google_place_id": gid or None,
+            "is_known_location": is_known,
+            "name": candidate.get("name") or item.name,
+            "lat": lat_f,
+            "lng": lng_f,
+            "distance_km": distance_km,
+            "vibe_score": 0.0,
+            "dietary_score": 0.0,
+            "quality_score": max(0.6, ai_confidence, google_quality),
+            "social_score": 0.0,
+            "collaborative_score": 0.0,
+            "final_score": ai_confidence,
+        }
+    )
+    return candidate
+
+
+def _merge_magic_ai_enrichment(
+    payload: Optional[MagicAIEnrichmentPayload],
+    *,
+    known_candidates: List[Dict[str, Any]],
+    external_candidates: List[Dict[str, Any]],
+    request_lat: float,
+    request_lng: float,
+) -> List[Dict[str, Any]]:
+    """Fold AI web-agent suggestions into the candidate set before ranking.
+
+    Suggestions that match an existing candidate (by Google place ID or known
+    location ID) attach their ``web_agent`` blob onto it in place, so that
+    venue earns the agentic boost and AI attribution. Suggestions with no
+    existing match become lean, freshly-built candidates. Returns the list of
+    brand-new candidates to append; existing candidates are mutated in place.
+    """
+    if payload is None or not payload.items:
+        return []
+
+    by_gid: Dict[str, Dict[str, Any]] = {}
+    by_location_id: Dict[int, Dict[str, Any]] = {}
+    for candidate in (*known_candidates, *external_candidates):
+        gid = str(candidate.get("google_place_id") or "").strip()
+        if gid:
+            by_gid.setdefault(gid, candidate)
+        lid = candidate.get("location_id")
+        if lid is not None:
+            try:
+                by_location_id.setdefault(int(lid), candidate)
+            except (TypeError, ValueError):
+                pass
+
+    new_candidates: List[Dict[str, Any]] = []
+    seen_new_gids: set[str] = set()
+    for item in payload.items:
+        web_agent = _magic_ai_web_agent_payload(item)
+        gid = str(item.google_place_id or "").strip()
+
+        target: Optional[Dict[str, Any]] = None
+        if gid and gid in by_gid:
+            target = by_gid[gid]
+        elif item.matched_location_id is not None:
+            target = by_location_id.get(int(item.matched_location_id))
+
+        if target is not None:
+            target["web_agent"] = web_agent
+            continue
+
+        if gid and gid in seen_new_gids:
+            continue
+        candidate = _magic_ai_enrichment_candidate(
+            item, request_lat=request_lat, request_lng=request_lng
+        )
+        if candidate is None:
+            continue
+        candidate["web_agent"] = web_agent
+        new_candidates.append(candidate)
+        if gid:
+            seen_new_gids.add(gid)
+
+    return new_candidates
+
+
+def _magic_search_effective_center(
+    places: List[Dict[str, Any]],
+    *,
+    fallback_lat: float,
+    fallback_lng: float,
+) -> tuple[float, float]:
+    """Centre the agent/signature on where Google actually found results.
+
+    The prompt may name a place far from the caller's GPS (e.g. a Londoner
+    searching "hot new restaurants in Brighton"). Google Text Search geocodes
+    the query text, so its results are the ground truth for the search area —
+    the web agent and the AI cache key should follow them rather than the raw
+    GPS, otherwise the agent is told to search the wrong city and returns
+    nothing. Uses the median coordinate to resist outliers.
+    """
+    lats = sorted(
+        float((place.get("location") or {}).get("latitude"))
+        for place in places
+        if (place.get("location") or {}).get("latitude") is not None
+    )
+    lngs = sorted(
+        float((place.get("location") or {}).get("longitude"))
+        for place in places
+        if (place.get("location") or {}).get("longitude") is not None
+    )
+    if not lats or not lngs:
+        center_lat, center_lng = fallback_lat, fallback_lng
+    else:
+        mid = len(lats) // 2
+        center_lat, center_lng = lats[mid], lngs[mid]
+
+    # Snap onto a coarse grid so the AI-area cache key is stable across
+    # different phrasings of the same-area search (see _MAGIC_AI_AREA_GRID_DEG).
+    cell = _MAGIC_AI_AREA_GRID_DEG
+    return (
+        round(round(center_lat / cell) * cell, 2),
+        round(round(center_lng / cell) * cell, 2),
+    )
 
 
 def _get_or_parse_magic_intent(
@@ -2167,6 +2393,10 @@ async def magic_search(request: MagicSearchRequest) -> MagicSearchResponse:
         intent, _cache_hit_intent = await intent_task
         debug.intent_parse_latency_ms = (perf_counter() - intent_started) * 1000.0
         debug.google_queries = intent.google_queries
+        # Magic search does not filter or cap by radius/distance — the prompt may
+        # name a place far from the caller's GPS, and distance is only ever a
+        # soft ranking signal. Radius is just the Google location bias.
+        radius_km = request.radius_km or 2.0
 
         google_started = perf_counter()
         google_task = asyncio.create_task(
@@ -2188,44 +2418,6 @@ async def magic_search(request: MagicSearchRequest) -> MagicSearchResponse:
                 detail=f"User '{request.user_id}' not found",
             )
 
-        if request.enable_live_web_agent:
-            ai_signature = build_magic_ai_signature(
-                intent=intent,
-                raw_prompt=request.prompt,
-                lat=request.latitude,
-                lng=request.longitude,
-                radius_km=radius_km,
-            )
-            ai_cache_key = cache_service.build_magic_ai_area_key(ai_signature)
-            cached_ai = cache_service.get_magic_ai_area_results(ai_cache_key)
-            if cached_ai is not None:
-                cached_payload = dict(cached_ai)
-                cached_payload["cache_hit"] = True
-                ai_enrichment_payload = MagicAIEnrichmentPayload.model_validate(
-                    cached_payload
-                )
-                debug.ai_enrichment_cache_hit = True
-                debug.ai_enrichment_items = len(ai_enrichment_payload.items)
-            else:
-                async def refresh_ai_enrichment() -> None:
-                    await _refresh_magic_ai_enrichment_cache(
-                        cache_key=ai_cache_key,
-                        prompt=request.prompt,
-                        lat=request.latitude,
-                        lng=request.longitude,
-                        radius_km=radius_km,
-                        signature=ai_signature,
-                        user_profile=user_profile,
-                        supabase=supabase,
-                        cache_service=cache_service,
-                    )
-
-                await get_background_job_runner().enqueue(
-                    "magic_ai_enrichment_refresh",
-                    refresh_ai_enrichment,
-                )
-                debug.ai_enrichment_refresh_enqueued = True
-
         google_result = await google_task
         debug.google_search_latency_ms = (perf_counter() - google_started) * 1000.0
         debug.cache_hit_google_search = google_result.cache_hit_google_search
@@ -2240,6 +2432,55 @@ async def magic_search(request: MagicSearchRequest) -> MagicSearchResponse:
             debug.google_queries = google_result.google_queries
 
         places = google_result.places
+
+        # Re-centre the agent + AI cache key on where Google actually landed,
+        # so a "restaurants in Brighton" prompt searches Brighton even when the
+        # caller's GPS is in London. Falls back to the request GPS when Google
+        # returned nothing to anchor on.
+        if request.enable_live_web_agent:
+            agent_lat, agent_lng = _magic_search_effective_center(
+                places,
+                fallback_lat=request.latitude,
+                fallback_lng=request.longitude,
+            )
+            ai_signature = build_magic_ai_signature(
+                intent=intent,
+                raw_prompt=request.prompt,
+                lat=agent_lat,
+                lng=agent_lng,
+                radius_km=radius_km,
+            )
+            ai_cache_key = cache_service.build_magic_ai_area_key(ai_signature)
+            cached_ai = await asyncio.to_thread(
+                cache_service.get_magic_ai_area_results, ai_cache_key
+            )
+            if cached_ai is not None:
+                cached_payload = dict(cached_ai)
+                cached_payload["cache_hit"] = True
+                ai_enrichment_payload = MagicAIEnrichmentPayload.model_validate(
+                    cached_payload
+                )
+                debug.ai_enrichment_cache_hit = True
+                debug.ai_enrichment_items = len(ai_enrichment_payload.items)
+            else:
+                async def refresh_ai_enrichment() -> None:
+                    await _refresh_magic_ai_enrichment_cache(
+                        cache_key=ai_cache_key,
+                        prompt=request.prompt,
+                        lat=agent_lat,
+                        lng=agent_lng,
+                        radius_km=radius_km,
+                        signature=ai_signature,
+                        user_profile=user_profile,
+                        supabase=supabase,
+                        cache_service=cache_service,
+                    )
+
+                await get_background_job_runner().enqueue(
+                    "magic_ai_enrichment_refresh",
+                    refresh_ai_enrichment,
+                )
+                debug.ai_enrichment_refresh_enqueued = True
     except HTTPException:
         raise
     except Exception as exc:
@@ -2258,7 +2499,11 @@ async def magic_search(request: MagicSearchRequest) -> MagicSearchResponse:
         [(place.get("id"), place.get("display_name")) for place in places],
     )
 
-    if not places:
+    # Only short-circuit when there's genuinely nothing to rank. If the web
+    # agent surfaced venues, fall through so they still get ranked and returned
+    # even though Google text search came back empty.
+    has_ai_items = bool(ai_enrichment_payload and ai_enrichment_payload.items)
+    if not places and not has_ai_items:
         debug.magic_search_latency_ms = (perf_counter() - started_at) * 1000.0
         logger.info("Magic search metrics: %s", debug.model_dump())
         return MagicSearchResponse(
@@ -2294,27 +2539,24 @@ async def magic_search(request: MagicSearchRequest) -> MagicSearchResponse:
 
     combined_place_ids = list(dict.fromkeys(food_place_ids))
 
-    # Batch-fetch all already-known locations in a single DB round-trip.
-    existing_by_gid = supabase.get_locations_by_google_place_ids(combined_place_ids)
+    # Batch-fetch all already-known locations (full rows + popularity pillars)
+    # in a single DB round-trip, keyed by google_place_id. Run the blocking
+    # Supabase client off the event loop so concurrent requests aren't
+    # serialised behind it.
+    existing_by_gid = await asyncio.to_thread(
+        supabase.get_locations_with_popularity_by_google_place_ids,
+        combined_place_ids,
+    )
 
-    location_ids_to_fetch: List[int] = []
-    gid_by_location_id: Dict[int, str] = {}
+    candidates: List[Dict[str, Any]] = []
     for gid in combined_place_ids:
-        if gid in existing_by_gid:
-            lid = existing_by_gid[gid].get("location_id")
-            if lid:
-                lid_int = int(lid)
-                location_ids_to_fetch.append(lid_int)
-                gid_by_location_id[lid_int] = gid
-
-    # Batch-fetch all full rows (quality_score, vibe_vector, etc.) in one query
-    candidates: List[Dict[str, Any]] = supabase.get_locations_by_ids(location_ids_to_fetch)
-    for candidate in candidates:
-        loc_id = int(candidate.get("location_id"))
-        gid = gid_by_location_id.get(loc_id)
-        candidate.setdefault("google_place_id", gid)
+        candidate = existing_by_gid.get(gid)
+        if candidate is None:
+            continue
+        candidate["google_place_id"] = gid
         candidate["is_known_location"] = True
-        _fill_missing_magic_search_google_fields(candidate, place_by_id.get(gid or ""))
+        _fill_missing_magic_search_google_fields(candidate, place_by_id.get(gid))
+        candidates.append(candidate)
 
     # Keep only places that are currently open (or whose status is unknown / not stored)
     # before_open_filter = len(candidates)
@@ -2345,7 +2587,10 @@ async def magic_search(request: MagicSearchRequest) -> MagicSearchResponse:
     # Step 4: Rank using the shared cache-style ranking (user-personalised scores)
     rerank_started = perf_counter()
     ranking_radius_km = max(radius_km, 50.0) if intent.location_rectangle else radius_km
-    scored = _rank_cached_candidates(
+    # _rank_cached_candidates makes blocking Supabase calls (social/collab
+    # scoring); run it off the event loop so it doesn't stall other requests.
+    scored = await asyncio.to_thread(
+        _rank_cached_candidates,
         candidates=candidates,
         request_lat=request.latitude,
         request_lng=request.longitude,
@@ -2363,7 +2608,20 @@ async def magic_search(request: MagicSearchRequest) -> MagicSearchResponse:
     for candidate in scored:
         candidate["final_score"] = _magic_search_action_adjusted_score(candidate)
 
-    combined_scored = dedupe_magic_candidates(scored + external_candidates)
+    # Fold the Grok web-agent suggestions into the candidate set: matched venues
+    # get the agentic boost in place; AI-only finds are appended as candidates.
+    ai_enrichment_candidates = _merge_magic_ai_enrichment(
+        ai_enrichment_payload,
+        known_candidates=scored,
+        external_candidates=external_candidates,
+        request_lat=request.latitude,
+        request_lng=request.longitude,
+    )
+    debug.ai_enrichment_ranked_candidates = len(ai_enrichment_candidates)
+
+    combined_scored = dedupe_magic_candidates(
+        scored + external_candidates + ai_enrichment_candidates
+    )
     combined_scored = rerank_magic_candidates(
         combined_scored,
         intent=intent,

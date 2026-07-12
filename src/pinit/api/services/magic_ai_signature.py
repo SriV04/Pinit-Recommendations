@@ -23,7 +23,10 @@ def _normalise_prompt(raw_prompt: str) -> str:
 
 
 def geo_bucket(lat: float, lng: float) -> str:
-    return f"{round(lat, 3):.3f}:{round(lng, 3):.3f}"
+    # 2 decimals ≈ a ~1km cell. The AI enrichment describes "what's hot in this
+    # area", so a neighbourhood-scale bucket (rather than a ~110m one) keeps
+    # nearby searches on the same cache key and lifts the hit rate sharply.
+    return f"{round(lat, 2):.2f}:{round(lng, 2):.2f}"
 
 
 def radius_bucket(radius_km: float) -> str:
@@ -149,7 +152,21 @@ def build_magic_ai_signature(
         ]
         if part
     )
-    hash_payload = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
+    # Hash only the dimensions that materially change which venues an area
+    # search should surface. Dropping vibes/venue_types (noisy, free-text
+    # derived, and largely implied by primary_intent) collapses many prompt
+    # variations onto the same cache key without hurting relevance. freshness
+    # is already a separate component of the cache key.
+    hash_payload = json.dumps(
+        {
+            "primary_intent": canonical["primary_intent"],
+            "meal": canonical["meal"],
+            "cuisines": canonical["cuisines"],
+            "budget": canonical["budget"],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     return {
         **canonical,
         "geo_bucket": geo_bucket(lat, lng),

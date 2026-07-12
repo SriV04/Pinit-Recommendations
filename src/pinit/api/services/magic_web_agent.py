@@ -17,16 +17,66 @@ logger = logging.getLogger(__name__)
 
 XAI_BASE_URL = "https://api.x.ai/v1"
 DEFAULT_XAI_MAGIC_SEARCH_MODEL = "grok-4-1-fast-non-reasoning"
-DEFAULT_XAI_MAGIC_SEARCH_TIMEOUT_SECONDS = 25.0
+# The web_search tool routinely needs >25s. The agent runs in a background /
+# pre-warm job (never on the user's request path), so a generous timeout that
+# lets it actually complete and populate the cache beats timing out and
+# negative-caching an empty result. Override with XAI_MAGIC_SEARCH_TIMEOUT_SECONDS.
+DEFAULT_XAI_MAGIC_SEARCH_TIMEOUT_SECONDS = 40.0
 
-ALLOWED_SOURCE_CLAIMS = {
+SOURCE_CLAIM_TAGS = (
     "ai_hotspot",
     "social_buzz",
     "critic_mentioned",
     "new_opening",
     "date_spot",
     "friend_backed_candidate",
+)
+ALLOWED_SOURCE_CLAIMS = set(SOURCE_CLAIM_TAGS)
+
+# Free-text claim phrases Grok tends to emit, mapped onto our canonical tags.
+_SOURCE_CLAIM_KEYWORDS: Dict[str, tuple[str, ...]] = {
+    "new_opening": (
+        "new opening", "newly opened", "just opened", "opened", "opening",
+        "new permanent", "launch", "debut", "soft launch",
+    ),
+    "social_buzz": (
+        "buzz", "viral", "tiktok", "instagram", "social", "trending",
+        "hyped", "popular",
+    ),
+    "critic_mentioned": (
+        "critic", "review", "guide", "featured", "roundup", "round-up",
+        "michelin", "award", "best of", "list", "news",
+    ),
+    "date_spot": ("date", "romantic", "intimate"),
+    "friend_backed_candidate": ("friend", "locals love", "recommended by", "word of mouth"),
+    "ai_hotspot": ("hotspot", "hot spot", "must visit", "must-visit", "destination", "buzzed"),
 }
+
+
+def _coerce_source_claims(raw_claims: List[Any]) -> List[str]:
+    """Map Grok's free-text source claims onto our canonical tag enum.
+
+    Grok returns claims as free-text sentences (e.g. "New permanent opening
+    May 2026..."), so an exact-enum filter drops them all. Keep any value
+    already in the enum, keyword-map the rest, and default to ``ai_hotspot``
+    since every web-agent suggestion is at least an AI-surfaced candidate.
+    """
+    coerced: List[str] = []
+    for raw in raw_claims or []:
+        text = str(raw or "").strip().lower()
+        if not text:
+            continue
+        if text in ALLOWED_SOURCE_CLAIMS:
+            if text not in coerced:
+                coerced.append(text)
+            continue
+        for claim, keywords in _SOURCE_CLAIM_KEYWORDS.items():
+            if claim not in coerced and any(keyword in text for keyword in keywords):
+                coerced.append(claim)
+                break
+    if not coerced:
+        coerced.append("ai_hotspot")
+    return coerced
 
 
 class MagicWebAgentSuggestion(BaseModel):
@@ -97,6 +147,8 @@ def build_magic_web_agent_prompt(
         f"Search center: lat={lat:.5f}, lng={lng:.5f}, radius_km={radius_km:.1f}\n"
         f"User vibe summary: {vibe_text}\n"
         f"Maximum candidates: {max_candidates}\n"
+        "For source_claims, use ONLY these tags where they apply: "
+        f"{', '.join(SOURCE_CLAIM_TAGS)}.\n"
         "Return JSON only. For each candidate include name, place_resolution_query, address_hint, neighbourhood_hint, reason, confidence, source_claims, and citations."
     )
 
@@ -104,11 +156,7 @@ def build_magic_web_agent_prompt(
 def _normalise_web_agent_suggestion(
     suggestion: MagicWebAgentSuggestion,
 ) -> Dict[str, Any]:
-    claims = [
-        claim
-        for claim in suggestion.source_claims
-        if claim in ALLOWED_SOURCE_CLAIMS
-    ]
+    claims = _coerce_source_claims(suggestion.source_claims)
     return {
         "name": suggestion.name.strip(),
         "place_resolution_query": suggestion.place_resolution_query.strip(),
