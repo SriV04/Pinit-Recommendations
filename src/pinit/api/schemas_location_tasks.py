@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 
 
 LocationTaskType = Literal[
+    "process_location",
     "pipeline",
     "details_enrich",
     "emoji",
@@ -32,6 +33,10 @@ class PipelinePayload(LocationTaskPayloadBase):
     task_type: Literal["pipeline"]
 
 
+class ProcessLocationPayload(LocationTaskPayloadBase):
+    task_type: Literal["process_location"]
+
+
 class DetailsEnrichPayload(LocationTaskPayloadBase):
     task_type: Literal["details_enrich"]
 
@@ -55,6 +60,7 @@ class VibeReprocessPayload(LocationTaskPayloadBase):
 
 LocationTaskPayload = Annotated[
     Union[
+        ProcessLocationPayload,
         PipelinePayload,
         DetailsEnrichPayload,
         EmojiPayload,
@@ -64,4 +70,3 @@ LocationTaskPayload = Annotated[
     ],
     Field(discriminator="task_type"),
 ]
-

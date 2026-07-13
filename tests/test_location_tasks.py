@@ -16,7 +16,7 @@ if install_optional_dependency_stubs is not None:
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from pinit.api.schemas_location_tasks import PipelinePayload, VibeReprocessPayload
+from pinit.api.schemas_location_tasks import PipelinePayload, ProcessLocationPayload, VibeReprocessPayload
 from pinit.api.services import location_tasks
 
 
@@ -43,6 +43,21 @@ class _FakeSupabase:
 
 
 class LocationTaskPipelineTests(unittest.IsolatedAsyncioTestCase):
+    async def test_handle_routes_single_process_location_task(self) -> None:
+        dispatcher = _FakeDispatcher()
+        payload = ProcessLocationPayload(
+            task_type="process_location",
+            request_id="request-process",
+            location_id=42,
+            google_place_id="",
+            source="expanded-card-open",
+        )
+
+        with patch.object(location_tasks, "process_location_task", new=AsyncMock()) as process:
+            await location_tasks.handle_location_task(payload, dispatcher=dispatcher)
+
+        process.assert_awaited_once_with(payload)
+
     async def test_magic_search_open_existing_location_runs_full_enrichment(self) -> None:
         dispatcher = _FakeDispatcher()
         payload = PipelinePayload(

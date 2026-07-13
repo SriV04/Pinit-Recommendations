@@ -13,13 +13,20 @@ from pinit.api.schemas_location_tasks import (
     MenuVibePayload,
     PhotosPayload,
     PipelinePayload,
+    ProcessLocationPayload,
     VibeReprocessPayload,
 )
 from pinit.api.services.background_jobs import get_background_job_runner
+from pinit.api.services.location_completeness import (
+    LocationProcessingPlan,
+    build_location_processing_plan,
+)
+from pinit.api.services.location_content_fallback import fill_missing_location_content
 from pinit.api.services.menu_processing import process_menu_for_location
 from pinit.api.services.proximal_service import (
     add_location_emoji,
     refresh_location_from_google_place_details,
+    resolve_google_place_id_for_location,
 )
 from pinit.api.services.vibe_tagging import generate_vibe_tags_for_location
 from pinit.config.secrets import GOOGLE_PLACE_API_KEY
@@ -80,6 +87,16 @@ async def handle_location_task(payload: LocationTaskPayload, *, dispatcher: Loca
         payload.request_id,
         payload.source,
     )
+    if payload.task_type == "process_location":
+        await process_location_task(payload)
+        logger.info(
+            "Task done: %s (location_id=%s request_id=%s duration_ms=%d)",
+            payload.task_type,
+            payload.location_id,
+            payload.request_id,
+            int((time.monotonic() - started) * 1000),
+        )
+        return
     if payload.task_type == "pipeline":
         await pipeline_task(payload, dispatcher=dispatcher)
         logger.info(
@@ -148,6 +165,172 @@ async def _get_location(location_id: int) -> Dict[str, Any]:
     supabase = get_supabase_service()
     row = await asyncio.to_thread(supabase.get_location, location_id)
     return row or {}
+
+
+def _log_processing_plan(
+    payload: ProcessLocationPayload,
+    plan: LocationProcessingPlan,
+    *,
+    checkpoint: str,
+) -> None:
+    logger.info(
+        "process_location: plan checkpoint=%s complete=%s reasons=%s "
+        "(location_id=%s request_id=%s)",
+        checkpoint,
+        plan.is_complete,
+        list(plan.reasons),
+        payload.location_id,
+        payload.request_id,
+    )
+
+
+async def _persist_google_place_id(location_id: int, google_place_id: str) -> None:
+    def _update() -> Any:
+        return get_supabase_service().update_location(
+            location_id,
+            google_place_id=google_place_id,
+        )
+
+    saved = await asyncio.to_thread(_update)
+    if not saved:
+        raise RuntimeError(f"Failed to persist Google Place ID for location {location_id}")
+
+
+async def _generate_vibe_for_process_location(
+    payload: ProcessLocationPayload,
+    row: Dict[str, Any],
+) -> None:
+    if not await _claim_vibe_processing(
+        payload.location_id,
+        payload.request_id,
+        task_type="process_location",
+    ):
+        return
+
+    has_summary = _truthy(row.get("generated_summary"))
+    blend_social = (payload.source or "").lower().strip() in {"tiktok", "instagram"}
+    try:
+        vibe_vector = await generate_vibe_tags_for_location(
+            payload.location_id,
+            num_runs=5 if has_summary else 1,
+            blend_tiktok=blend_social,
+        )
+        if vibe_vector is None:
+            raise RuntimeError(
+                f"process_location vibe tagging returned None for location {payload.location_id}"
+            )
+    except Exception:
+        await _clear_vibe_processing(
+            payload.location_id,
+            payload.request_id,
+            task_type="process_location",
+        )
+        raise
+    else:
+        await _clear_vibe_processing(
+            payload.location_id,
+            payload.request_id,
+            task_type="process_location",
+        )
+
+
+async def process_location_task(payload: ProcessLocationPayload) -> None:
+    """Process every currently missing location field in dependency order.
+
+    The canonical Supabase row is reloaded after every group that can change
+    downstream decisions. Pub/Sub retries therefore resume from persisted state
+    instead of replaying already-complete work.
+    """
+    row = await _get_location(payload.location_id)
+    if not row:
+        raise RuntimeError(f"Location {payload.location_id} was not found")
+
+    plan = build_location_processing_plan(row)
+    _log_processing_plan(payload, plan, checkpoint="initial")
+    if plan.is_complete:
+        return
+
+    if plan.google_due:
+        google_place_id = str(
+            row.get("google_place_id") or payload.google_place_id or ""
+        ).strip()
+        if not google_place_id:
+            google_place_id = str(
+                await asyncio.to_thread(resolve_google_place_id_for_location, row) or ""
+            ).strip()
+        if not google_place_id:
+            raise RuntimeError(
+                f"Could not safely resolve a Google Place ID for location {payload.location_id}"
+            )
+
+        if str(row.get("google_place_id") or "").strip() != google_place_id:
+            await _persist_google_place_id(payload.location_id, google_place_id)
+
+        refreshed = await asyncio.to_thread(
+            refresh_location_from_google_place_details,
+            payload.location_id,
+            google_place_id,
+        )
+        if not refreshed:
+            raise RuntimeError(
+                f"Google details refresh failed for location {payload.location_id} ({google_place_id})"
+            )
+
+        row = await _get_location(payload.location_id)
+        plan = build_location_processing_plan(row)
+        _log_processing_plan(payload, plan, checkpoint="after_google")
+
+    ran_basic_stage = False
+    if plan.photo_due:
+        await photos_task(
+            PhotosPayload(
+                task_type="photos",
+                **payload.model_dump(exclude={"task_type"}),
+            )
+        )
+        ran_basic_stage = True
+    if plan.emoji_due:
+        await emoji_task(
+            EmojiPayload(
+                task_type="emoji",
+                **payload.model_dump(exclude={"task_type"}),
+            )
+        )
+        ran_basic_stage = True
+    if ran_basic_stage:
+        row = await _get_location(payload.location_id)
+        plan = build_location_processing_plan(row)
+        _log_processing_plan(payload, plan, checkpoint="after_photo_emoji")
+
+    if plan.menu_due:
+        await process_menu_for_location(
+            location_id=payload.location_id,
+            google_place_id=str(row.get("google_place_id") or payload.google_place_id or ""),
+            website=str(row["website"]),
+            restaurant_name=str(row.get("name") or ""),
+            cuisine_hint=str(row.get("cuisine_primary") or ""),
+            detect_cuisine=not _truthy(row.get("cuisine_primary")),
+        )
+        row = await _get_location(payload.location_id)
+        plan = build_location_processing_plan(row)
+        _log_processing_plan(payload, plan, checkpoint="after_menu")
+
+    if plan.content_fallback_due:
+        await fill_missing_location_content(row)
+        row = await _get_location(payload.location_id)
+        plan = build_location_processing_plan(row)
+        _log_processing_plan(payload, plan, checkpoint="after_fallback")
+
+    if plan.vibe_due:
+        await _generate_vibe_for_process_location(payload, row)
+        row = await _get_location(payload.location_id)
+        plan = build_location_processing_plan(row)
+        _log_processing_plan(payload, plan, checkpoint="after_vibe")
+
+    if not plan.is_complete:
+        raise RuntimeError(
+            f"Location {payload.location_id} remains incomplete after processing: {', '.join(plan.reasons)}"
+        )
 
 
 def _truthy(value: Any) -> bool:
