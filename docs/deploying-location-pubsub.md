@@ -59,7 +59,7 @@ The deployment creates or updates:
 
 - `location-tasks`
 - `location-tasks-dead-letter`
-- six filtered authenticated push subscriptions
+- seven filtered authenticated push subscriptions, including `process_location`
 - `location-tasks-dead-letter-inspect`
 - `pinit-location-worker`
 - `pinit-location-worker-menu`
@@ -124,7 +124,7 @@ Then inspect recent API and worker logs. The API response does not currently ech
 
 ```bash
 gcloud logging read \
-  'resource.type="cloud_run_revision" AND resource.labels.service_name="pinit-recommendations-api" AND textPayload:"Published Pub/Sub task pipeline"' \
+  'resource.type="cloud_run_revision" AND resource.labels.service_name="pinit-recommendations-api" AND textPayload:"Published Pub/Sub task process_location"' \
   --project pinit-494520 \
   --freshness 15m \
   --limit 20 \
@@ -132,7 +132,7 @@ gcloud logging read \
   --format='value(timestamp,textPayload)'
 
 gcloud logging read \
-  'resource.type="cloud_run_revision" AND resource.labels.service_name="pinit-location-worker" AND (textPayload:"Consumed Pub/Sub message" OR textPayload:"Ack Pub/Sub message")' \
+  'resource.type="cloud_run_revision" AND resource.labels.service_name="pinit-location-worker-menu" AND (textPayload:"Consumed Pub/Sub message" OR textPayload:"Ack Pub/Sub message")' \
   --project pinit-494520 \
   --freshness 15m \
   --limit 40 \
@@ -166,10 +166,10 @@ gcloud run services update pinit-recommendations-api \
   --min-instances 0
 ```
 
-Then convert the six source subscriptions from push to pull. Messages remain retained instead of repeatedly invoking workers:
+Then convert the seven source subscriptions from push to pull. Messages remain retained instead of repeatedly invoking workers:
 
 ```bash
-for task in pipeline details_enrich emoji photos menu_vibe vibe_reprocess; do
+for task in process_location pipeline details_enrich emoji photos menu_vibe vibe_reprocess; do
   gcloud pubsub subscriptions modify-push-config "location-tasks-$task" \
     --project pinit-494520 \
     --clear-push-config

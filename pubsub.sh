@@ -24,7 +24,7 @@ MENU_MEMORY="${MENU_MEMORY:-4Gi}"
 MENU_CONCURRENCY="${MENU_CONCURRENCY:-1}"
 MENU_MAX_INSTANCES="${MENU_MAX_INSTANCES:-2}"
 
-TASKS=(pipeline details_enrich emoji photos menu_vibe vibe_reprocess)
+TASKS=(process_location pipeline details_enrich emoji photos menu_vibe vibe_reprocess)
 FAST_TASKS=(pipeline details_enrich emoji photos vibe_reprocess)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -314,6 +314,7 @@ for TASK in "${FAST_TASKS[@]}"; do
   configure_task_subscription "${TASK}" "${FAST_WORKER_URL}" "${PUSH_SA}" "${PUBSUB_SERVICE_AGENT}"
 done
 configure_task_subscription "menu_vibe" "${MENU_WORKER_URL}" "${PUSH_SA}" "${PUBSUB_SERVICE_AGENT}"
+configure_task_subscription "process_location" "${MENU_WORKER_URL}" "${PUSH_SA}" "${PUBSUB_SERVICE_AGENT}"
 
 if ! gcloud pubsub subscriptions describe "${DEAD_LETTER_SUBSCRIPTION}" --project "${PROJECT}" >/dev/null 2>&1; then
   gcloud pubsub subscriptions create "${DEAD_LETTER_SUBSCRIPTION}" \

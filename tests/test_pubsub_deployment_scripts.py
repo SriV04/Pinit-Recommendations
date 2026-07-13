@@ -51,6 +51,21 @@ def test_pubsub_provisions_retry_and_dead_letter_policy_before_enabling_api() ->
     assert 'PUBSUB_ENABLED="false"' in DEPLOY_SCRIPT
 
 
+def test_process_location_subscription_routes_to_menu_worker_during_cutover() -> None:
+    assert "process_location" in PUBSUB_SCRIPT
+    assert (
+        'configure_task_subscription "process_location" "${MENU_WORKER_URL}"'
+        in PUBSUB_SCRIPT
+    )
+
+    verification_script = (REPO_ROOT / "verify_pubsub.sh").read_text(encoding="utf-8")
+    assert "process_location" in verification_script
+    assert (
+        'verify_subscription "process_location" "${MENU_WORKER_URL}"'
+        in verification_script
+    )
+
+
 def test_pubsub_worker_deployments_are_private_and_request_driven() -> None:
     for marker in (
         'gcloud run deploy "${WORKER_FAST_SERVICE}"',

@@ -15,7 +15,7 @@ MAX_DELIVERY_ATTEMPTS="${PUBSUB_MAX_DELIVERY_ATTEMPTS:-10}"
 ACK_DEADLINE_SECONDS="${PUBSUB_ACK_DEADLINE_SECONDS:-600}"
 EXPECT_API_PUBSUB="${EXPECT_API_PUBSUB:-true}"
 
-TASKS=(pipeline details_enrich emoji photos menu_vibe vibe_reprocess)
+TASKS=(process_location pipeline details_enrich emoji photos menu_vibe vibe_reprocess)
 FAST_TASKS=(pipeline details_enrich emoji photos vibe_reprocess)
 
 fail() {
@@ -221,6 +221,7 @@ for TASK in "${FAST_TASKS[@]}"; do
   verify_subscription "${TASK}" "${FAST_WORKER_URL}" "${PUSH_SA}"
 done
 verify_subscription "menu_vibe" "${MENU_WORKER_URL}" "${PUSH_SA}"
+verify_subscription "process_location" "${MENU_WORKER_URL}" "${PUSH_SA}"
 
 for TASK in "${TASKS[@]}"; do
   SUBSCRIPTION="${TOPIC}-${TASK}"
