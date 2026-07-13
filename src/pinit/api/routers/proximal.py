@@ -36,6 +36,8 @@ from pinit.api.schemas import (
     MagicSearchSection,
     ProximalRequest,
     ProximalResponse,
+    ProcessLocationRequest,
+    ProcessLocationResponse,
     TagMatch,
     UserVibeScore,
 )
@@ -54,8 +56,12 @@ from pinit.api.services.magic_google_service import (
 from pinit.api.services.magic_ai_enrichment import build_magic_ai_enrichment_payload
 from pinit.api.services.magic_ai_signature import build_magic_ai_signature
 from pinit.api.services.magic_intent_parser import normalise_prompt, parse_magic_intent
-from pinit.api.schemas_location_tasks import PipelinePayload
-from pinit.api.services.location_tasks import InProcessDispatcher, PubSubDispatcher, run_pipeline_inline
+from pinit.api.schemas_location_tasks import ProcessLocationPayload
+from pinit.api.services.location_tasks import (
+    InProcessDispatcher,
+    PubSubDispatcher,
+    process_location_task,
+)
 from pinit.api.services.cache_service import get_cache_service
 from pinit.core.recommendation.magic_explanations import build_magic_sections
 from pinit.core.recommendation.magic_ranking import (
@@ -1644,25 +1650,67 @@ async def _run_vibe_reprocessing(
     )
 
 
+async def _dispatch_location_processing(payload: ProcessLocationPayload) -> None:
+    pubsub_cfg = get_pubsub_config()
+    dispatcher = PubSubDispatcher() if pubsub_cfg.enabled else InProcessDispatcher()
+    logger.info(
+        "locations/process: dispatch %s via %s "
+        "(pubsub_enabled=%s project_id=%s topic=%s location_id=%s request_id=%s source=%s)",
+        payload.task_type,
+        dispatcher.__class__.__name__,
+        pubsub_cfg.enabled,
+        pubsub_cfg.project_id,
+        pubsub_cfg.topic,
+        payload.location_id,
+        payload.request_id,
+        payload.source,
+    )
+    await dispatcher.dispatch(payload)
+
+
+@router.post(
+    "/locations/process",
+    response_model=ProcessLocationResponse,
+    status_code=202,
+)
+async def process_canonical_location(
+    request: ProcessLocationRequest,
+) -> ProcessLocationResponse:
+    """Queue completeness-driven processing for one canonical location row."""
+    supabase = get_supabase_service()
+    row = await asyncio.to_thread(supabase.get_location, request.location_id)
+    if not row:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Location {request.location_id} was not found",
+        )
+
+    request_id = str(uuid4())
+    payload = ProcessLocationPayload(
+        task_type="process_location",
+        request_id=request_id,
+        location_id=request.location_id,
+        google_place_id=str(
+            request.google_place_id or row.get("google_place_id") or ""
+        ).strip(),
+        source=(request.source or "expanded-card-open").lower().strip(),
+    )
+    await _dispatch_location_processing(payload)
+    return ProcessLocationResponse(
+        queued=True,
+        location_id=request.location_id,
+        request_id=request_id,
+    )
+
+
 @router.post("/locations/add", response_model=AddLocationResponse)
 async def add_location_by_place_id(request: AddLocationRequest) -> AddLocationResponse:
     """
     Add or process a location by Google Place ID, with source-aware behaviour.
 
-    Source-aware flow:
-    - **New location** (not in DB): Default path fetches basic Google Place
-      details, creates a row quickly, then queues the heavy enrichment work on
-      background workers. If ``process_synchronously=true``, it instead runs the
-      full enrichment pipeline inline before returning.
-    - **Existing + source='tiktok'**: Always re-process vibe tagging with
-      TikTok vibe blending (aggregates ALL video_insights rows for this
-      location). Also updates reccomended_dishes with top 3 key_dishes.
-      Skips Google Places API entirely.
-    - **Existing + source='magic-search-open'**: Re-run full enrichment fan-out
-      asynchronously so temporary magic-search cards become canonical records
-      with details, emoji, photos, menu analysis, and vibe tags.
-    - **Existing + source='in-app'/'instagram'**: Re-process vibe tagging
-      ONLY if updated_vibe is False or NULL. Skips Google Places API.
+    New places are inserted from basic Google data first. New and existing
+    rows then use the same completeness-driven processor, which reads the full
+    canonical row and performs only work that is missing or stale.
     """
     supabase = get_supabase_service()
     source = (request.source or "in-app").lower().strip()
@@ -1678,11 +1726,9 @@ async def add_location_by_place_id(request: AddLocationRequest) -> AddLocationRe
     if existing_location:
         location_id = existing_location["location_id"]
         already_existed = True
-        updated_vibe = bool(existing_location.get("updated_vibe") or False)
         existing_name = existing_location.get("name")
     else:
         already_existed = False
-        updated_vibe = False
         existing_name = None
         basic_place_details = await asyncio.to_thread(
             fetch_google_place_basic_details,
@@ -1715,8 +1761,8 @@ async def add_location_by_place_id(request: AddLocationRequest) -> AddLocationRe
         except Exception as exc:
             logger.warning("video_insights upsert failed for %s: %s", location_id, exc)
 
-    pipeline_payload = PipelinePayload(
-        task_type="pipeline",
+    processing_payload = ProcessLocationPayload(
+        task_type="process_location",
         request_id=request_id,
         location_id=location_id,
         google_place_id=request.google_place_id,
@@ -1727,7 +1773,7 @@ async def add_location_by_place_id(request: AddLocationRequest) -> AddLocationRe
     )
 
     if process_synchronously:
-        await run_pipeline_inline(pipeline_payload)
+        await process_location_task(processing_payload)
         updated_location = await asyncio.to_thread(supabase.get_location, location_id) or {}
         return AddLocationResponse(
             success=True,
@@ -1740,30 +1786,13 @@ async def add_location_by_place_id(request: AddLocationRequest) -> AddLocationRe
             emoji=updated_location.get("emoji"),
         )
 
-    # Async mode: publish to Pub/Sub (or fallback to in-process worker for local dev).
-    pubsub_cfg = get_pubsub_config()
-    dispatcher = PubSubDispatcher() if pubsub_cfg.enabled else InProcessDispatcher()
-    logger.info(
-        "locations/add: dispatch %s via %s (pubsub_enabled=%s project_id=%s topic=%s) (location_id=%s request_id=%s source=%s)",
-        pipeline_payload.task_type,
-        dispatcher.__class__.__name__,
-        pubsub_cfg.enabled,
-        pubsub_cfg.project_id,
-        pubsub_cfg.topic,
-        location_id,
-        request_id,
-        source,
-    )
-    await dispatcher.dispatch(pipeline_payload)
+    # Async mode: publish one canonical task (or use the local in-process fallback).
+    await _dispatch_location_processing(processing_payload)
 
     if created_new:
         message = "Location successfully added; enrichment queued"
-    elif source in ("tiktok", "instagram"):
-        message = "Location exists; vibe reprocessing queued"
-    elif not updated_vibe:
-        message = "Location exists; vibe reprocessing queued"
     else:
-        message = "Location already exists in database"
+        message = "Location exists; processing queued"
 
     return AddLocationResponse(
         success=True,

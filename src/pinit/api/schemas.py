@@ -225,6 +225,24 @@ class AddLocationResponse(BaseModel):
     emoji: Optional[str] = None
 
 
+class ProcessLocationRequest(BaseModel):
+    location_id: int = Field(..., gt=0, description="Canonical Supabase location ID")
+    google_place_id: Optional[str] = Field(
+        None,
+        description="Known Google Place ID; the worker resolves it safely when omitted",
+    )
+    source: str = Field(
+        "expanded-card-open",
+        description="Trigger source used for observability and social insight blending",
+    )
+
+
+class ProcessLocationResponse(BaseModel):
+    queued: bool
+    location_id: int
+    request_id: str
+
+
 class MagicSearchRequest(BaseModel):
     user_id: str = Field(..., description="User identifier")
     latitude: float = Field(..., description="Center point latitude", ge=-90, le=90)

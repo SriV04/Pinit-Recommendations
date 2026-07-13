@@ -416,7 +416,7 @@ class ProximalApiEndpointTests(unittest.TestCase):
         self.assertEqual(response.status_code, 404)
         self.assertIn("missing-user", response.json()["detail"])
 
-    def test_locations_add_existing_location_queues_pipeline(self) -> None:
+    def test_locations_add_existing_location_queues_single_processing_task(self) -> None:
         _FakeDispatcher.dispatched = []
         with patch.object(proximal, "get_supabase_service", return_value=self.supabase), patch.object(
             proximal,
@@ -439,8 +439,96 @@ class ProximalApiEndpointTests(unittest.TestCase):
         self.assertTrue(body["already_existed"])
         self.assertEqual(body["location_id"], 3001)
         self.assertEqual(len(_FakeDispatcher.dispatched), 1)
-        self.assertEqual(_FakeDispatcher.dispatched[0].task_type, "pipeline")
+        self.assertEqual(_FakeDispatcher.dispatched[0].task_type, "process_location")
         self.assertEqual(_FakeDispatcher.dispatched[0].location_id, 3001)
+
+    def test_locations_add_new_location_queues_single_processing_task(self) -> None:
+        _FakeDispatcher.dispatched = []
+        with (
+            patch.object(proximal, "get_supabase_service", return_value=self.supabase),
+            patch.object(
+                proximal,
+                "get_pubsub_config",
+                return_value=SimpleNamespace(enabled=False, project_id="", topic=""),
+            ),
+            patch.object(proximal, "InProcessDispatcher", _FakeDispatcher),
+            patch.object(
+                proximal,
+                "fetch_google_place_basic_details",
+                return_value={"name": "New Place", "google_place_id": "new-google-place"},
+            ),
+            patch.object(
+                proximal,
+                "create_location_from_place_details",
+                return_value={"location_id": 3002, "name": "New Place"},
+            ),
+        ):
+            response = self.client.post(
+                "/locations/add",
+                json={"google_place_id": "new-google-place", "source": "in-app"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["location_id"], 3002)
+        self.assertEqual(len(_FakeDispatcher.dispatched), 1)
+        self.assertEqual(_FakeDispatcher.dispatched[0].task_type, "process_location")
+        self.assertEqual(_FakeDispatcher.dispatched[0].location_id, 3002)
+
+    def test_locations_process_queues_canonical_location(self) -> None:
+        _FakeDispatcher.dispatched = []
+        with (
+            patch.object(proximal, "get_supabase_service", return_value=self.supabase),
+            patch.object(
+                proximal,
+                "get_pubsub_config",
+                return_value=SimpleNamespace(enabled=False, project_id="", topic=""),
+            ),
+            patch.object(proximal, "InProcessDispatcher", _FakeDispatcher),
+        ):
+            response = self.client.post(
+                "/locations/process",
+                json={
+                    "location_id": 3001,
+                    "google_place_id": "known-google-place",
+                    "source": "expanded-card-open",
+                },
+            )
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(
+            response.json(),
+            {"queued": True, "location_id": 3001, "request_id": response.json()["request_id"]},
+        )
+        self.assertEqual(len(_FakeDispatcher.dispatched), 1)
+        self.assertEqual(_FakeDispatcher.dispatched[0].task_type, "process_location")
+        self.assertEqual(_FakeDispatcher.dispatched[0].location_id, 3001)
+
+    def test_locations_process_rejects_non_positive_location_id(self) -> None:
+        _FakeDispatcher.dispatched = []
+        response = self.client.post(
+            "/locations/process",
+            json={"location_id": 0, "source": "expanded-card-open"},
+        )
+
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(_FakeDispatcher.dispatched, [])
+
+    def test_locations_process_returns_not_found_without_dispatch(self) -> None:
+        _FakeDispatcher.dispatched = []
+        missing_supabase = _FakeSupabase()
+        missing_supabase.get_location = lambda _location_id: None
+        with patch.object(
+            proximal,
+            "get_supabase_service",
+            return_value=missing_supabase,
+        ):
+            response = self.client.post(
+                "/locations/process",
+                json={"location_id": 9999, "source": "expanded-card-open"},
+            )
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(_FakeDispatcher.dispatched, [])
 
     def test_magic_search_ranks_food_places(self) -> None:
         google_result = MagicGoogleSearchResult(
