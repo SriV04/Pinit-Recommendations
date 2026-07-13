@@ -108,6 +108,12 @@ ENV_VARS="$(build_env_vars_from_dotenv)"
 : "${WARM_CACHE_TIMEZONE:=Europe/London}"
 : "${CACHE_UNFILTERED_TTL:=3600}"
 
+# Keep the API on its in-process fallback until pubsub.sh has deployed and
+# verified workers, subscriptions, retry policy, dead-lettering, and IAM.
+if [ "${DEPLOY_PUBSUB:-false}" = "true" ]; then
+  PUBSUB_ENABLED="false"
+fi
+
 # Ensure Pub/Sub + project vars are always set explicitly (even if not in .env)
 ENV_VARS+="${ENV_VARS:+,}GOOGLE_CLOUD_PROJECT=${PROJECT_ID}"
 ENV_VARS+=",PUBSUB_ENABLED=${PUBSUB_ENABLED}"
@@ -166,6 +172,7 @@ gcloud run deploy $SERVICE_NAME \
   --allow-unauthenticated \
   --set-env-vars "$ENV_VARS" \
   --set-secrets "$SECRETS" \
+  --cpu-throttling \
   --memory "${API_MEMORY}" \
   --timeout 540 \
   --max-instances "${API_MAX_INSTANCES}" \

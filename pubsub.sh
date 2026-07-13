@@ -1,5 +1,5 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
 PROJECT="${PROJECT:-pinit-494520}"
 REGION="${REGION:-europe-west2}"
@@ -7,8 +7,13 @@ API_SERVICE="${API_SERVICE:-pinit-recommendations-api}"
 WORKER_FAST_SERVICE="${WORKER_FAST_SERVICE:-pinit-location-worker}"
 WORKER_MENU_SERVICE="${WORKER_MENU_SERVICE:-pinit-location-worker-menu}"
 TOPIC="${PUBSUB_TOPIC_LOCATION_TASKS:-location-tasks}"
+DEAD_LETTER_TOPIC="${PUBSUB_DEAD_LETTER_TOPIC:-${TOPIC}-dead-letter}"
+DEAD_LETTER_SUBSCRIPTION="${PUBSUB_DEAD_LETTER_SUBSCRIPTION:-${DEAD_LETTER_TOPIC}-inspect}"
+MIN_RETRY_DELAY="${PUBSUB_MIN_RETRY_DELAY:-10s}"
+MAX_RETRY_DELAY="${PUBSUB_MAX_RETRY_DELAY:-600s}"
+MAX_DELIVERY_ATTEMPTS="${PUBSUB_MAX_DELIVERY_ATTEMPTS:-10}"
+ACK_DEADLINE_SECONDS="${PUBSUB_ACK_DEADLINE_SECONDS:-600}"
 
-# Cloud Run sizing knobs (defaults chosen to fit common regional quotas; override via env)
 FAST_CPU="${FAST_CPU:-1}"
 FAST_MEMORY="${FAST_MEMORY:-1Gi}"
 FAST_CONCURRENCY="${FAST_CONCURRENCY:-1}"
@@ -19,57 +24,62 @@ MENU_MEMORY="${MENU_MEMORY:-4Gi}"
 MENU_CONCURRENCY="${MENU_CONCURRENCY:-1}"
 MENU_MAX_INSTANCES="${MENU_MAX_INSTANCES:-2}"
 
-# Load environment variables from .env file (required for SUPABASE_URL and optional keys).
-if [ -f .env ]; then
-  source .env
+TASKS=(pipeline details_enrich emoji photos menu_vibe vibe_reprocess)
+FAST_TASKS=(pipeline details_enrich emoji photos vibe_reprocess)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+if [ -f "${SCRIPT_DIR}/.env" ]; then
+  # shellcheck disable=SC1091
+  source "${SCRIPT_DIR}/.env"
 else
-  echo "❌ Error: .env file not found"
+  echo "❌ Error: .env file not found at ${SCRIPT_DIR}/.env"
   exit 1
 fi
 
-if [ -z "$SUPABASE_URL" ]; then
+if [ -z "${SUPABASE_URL:-}" ]; then
   echo "❌ Error: SUPABASE_URL is not set in .env"
   exit 1
 fi
 
-# Ensure Pub/Sub resources exist before enabling Pub/Sub on services.
-gcloud services enable pubsub.googleapis.com --project "${PROJECT}" >/dev/null 2>&1 || true
-
-if ! gcloud pubsub topics describe "${TOPIC}" --project "${PROJECT}" >/dev/null 2>&1; then
-  echo "ℹ️  Creating Pub/Sub topic: ${TOPIC}"
-  gcloud pubsub topics create "${TOPIC}" --project "${PROJECT}"
+case "${MAX_DELIVERY_ATTEMPTS}" in
+  ''|*[!0-9]*)
+    echo "❌ PUBSUB_MAX_DELIVERY_ATTEMPTS must be an integer between 5 and 100."
+    exit 1
+    ;;
+esac
+if [ "${MAX_DELIVERY_ATTEMPTS}" -lt 5 ] || [ "${MAX_DELIVERY_ATTEMPTS}" -gt 100 ]; then
+  echo "❌ PUBSUB_MAX_DELIVERY_ATTEMPTS must be between 5 and 100."
+  exit 1
 fi
 
-# Ensure subscriptions exist (one per task_type with attribute filter).
-for TASK in pipeline details_enrich emoji photos menu_vibe vibe_reprocess; do
-  SUB="${TOPIC}-${TASK}"
-  if ! gcloud pubsub subscriptions describe "${SUB}" --project "${PROJECT}" >/dev/null 2>&1; then
-    echo "ℹ️  Creating Pub/Sub subscription: ${SUB}"
-    create_args=(
-      gcloud pubsub subscriptions create "${SUB}"
-      --project "${PROJECT}"
-      --topic "${TOPIC}"
-      --message-filter="attributes.task_type=\"${TASK}\""
-      --enable-message-ordering
-    )
-    if [ "${TASK}" = "menu_vibe" ]; then
-      create_args+=(--ack-deadline 600)
-    fi
-    "${create_args[@]}"
+ensure_topic() {
+  local topic="$1"
+  if ! gcloud pubsub topics describe "${topic}" --project "${PROJECT}" >/dev/null 2>&1; then
+    echo "ℹ️  Creating Pub/Sub topic: ${topic}"
+    gcloud pubsub topics create "${topic}" --project "${PROJECT}"
   fi
-done
+}
+
+has_enabled_secret_version() {
+  local secret_name="$1"
+  gcloud secrets versions list "${secret_name}" \
+    --project "${PROJECT}" \
+    --filter='state:ENABLED' \
+    --format='value(name)' \
+    --limit=1 | grep -q .
+}
 
 build_env_vars_from_dotenv() {
   local out=""
-  while IFS= read -r line || [ -n "$line" ]; do
-    case "$line" in
+  while IFS= read -r line || [ -n "${line}" ]; do
+    case "${line}" in
       ""|\#*) continue ;;
     esac
     line="${line#export }"
 
-    if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)= ]]; then
+    if [[ "${line}" =~ ^([A-Za-z_][A-Za-z0-9_]*)= ]]; then
       local key="${BASH_REMATCH[1]}"
-      case "$key" in
+      case "${key}" in
         SUPABASE_SERVICE_KEY|SUPABASE_SERVICE_ROLE_KEY|SUPABASE_SECRET_KEY|GOOGLE_PLACE_API_KEY|REDIS_PASSWORD|XAI_API_KEY)
           continue
           ;;
@@ -78,14 +88,145 @@ build_env_vars_from_dotenv() {
           ;;
       esac
 
-      local value="${!key}"
+      local value="${!key:-}"
       value="${value//\\/\\\\}"
       value="${value//,/\\,}"
       out+="${out:+,}${key}=${value}"
     fi
-  done < .env
-  echo "$out"
+  done < "${SCRIPT_DIR}/.env"
+  echo "${out}"
 }
+
+validate_existing_subscription() {
+  local subscription="$1"
+  local task="$2"
+  local expected_filter="attributes.task_type=\"${task}\""
+  local actual_filter
+  local ordering
+
+  actual_filter="$(gcloud pubsub subscriptions describe "${subscription}" \
+    --project "${PROJECT}" --format='value(filter)')"
+  ordering="$(gcloud pubsub subscriptions describe "${subscription}" \
+    --project "${PROJECT}" --format='value(enableMessageOrdering)')"
+
+  if [ "${actual_filter}" != "${expected_filter}" ]; then
+    echo "❌ Existing subscription ${subscription} has filter '${actual_filter}'; expected '${expected_filter}'."
+    echo "   Filters are immutable; inspect this subscription before recreating it."
+    exit 1
+  fi
+  if [ "${ordering}" != "True" ] && [ "${ordering}" != "true" ]; then
+    echo "❌ Existing subscription ${subscription} does not have message ordering enabled."
+    echo "   Ordering is fixed at creation; inspect this subscription before recreating it."
+    exit 1
+  fi
+}
+
+configure_task_subscription() {
+  local task="$1"
+  local worker_url="$2"
+  local push_service_account="$3"
+  local pubsub_service_agent="$4"
+  local subscription="${TOPIC}-${task}"
+  local endpoint="${worker_url}/internal/pubsub/location-tasks"
+  local filter="attributes.task_type=\"${task}\""
+
+  if gcloud pubsub subscriptions describe "${subscription}" --project "${PROJECT}" >/dev/null 2>&1; then
+    validate_existing_subscription "${subscription}" "${task}"
+    echo "ℹ️  Updating Pub/Sub subscription: ${subscription}"
+    gcloud pubsub subscriptions update "${subscription}" \
+      --project "${PROJECT}" \
+      --ack-deadline "${ACK_DEADLINE_SECONDS}" \
+      --expiration-period never \
+      --min-retry-delay "${MIN_RETRY_DELAY}" \
+      --max-retry-delay "${MAX_RETRY_DELAY}" \
+      --dead-letter-topic "${DEAD_LETTER_TOPIC}" \
+      --max-delivery-attempts "${MAX_DELIVERY_ATTEMPTS}" \
+      --push-endpoint "${endpoint}" \
+      --push-auth-service-account "${push_service_account}" \
+      --push-auth-token-audience "${worker_url}"
+  else
+    echo "ℹ️  Creating Pub/Sub subscription: ${subscription}"
+    gcloud pubsub subscriptions create "${subscription}" \
+      --project "${PROJECT}" \
+      --topic "${TOPIC}" \
+      --message-filter "${filter}" \
+      --enable-message-ordering \
+      --ack-deadline "${ACK_DEADLINE_SECONDS}" \
+      --expiration-period never \
+      --min-retry-delay "${MIN_RETRY_DELAY}" \
+      --max-retry-delay "${MAX_RETRY_DELAY}" \
+      --dead-letter-topic "${DEAD_LETTER_TOPIC}" \
+      --max-delivery-attempts "${MAX_DELIVERY_ATTEMPTS}" \
+      --push-endpoint "${endpoint}" \
+      --push-auth-service-account "${push_service_account}" \
+      --push-auth-token-audience "${worker_url}"
+  fi
+
+  gcloud pubsub subscriptions add-iam-policy-binding "${subscription}" \
+    --project "${PROJECT}" \
+    --member "serviceAccount:${pubsub_service_agent}" \
+    --role "roles/pubsub.subscriber" >/dev/null
+}
+
+echo "🔧 Enabling Pub/Sub API and provisioning topics..."
+gcloud services enable pubsub.googleapis.com --project "${PROJECT}"
+ensure_topic "${TOPIC}"
+ensure_topic "${DEAD_LETTER_TOPIC}"
+
+PROJECT_NUMBER="$(gcloud projects describe "${PROJECT}" --format='value(projectNumber)')"
+PUBSUB_SERVICE_AGENT="service-${PROJECT_NUMBER}@gcp-sa-pubsub.iam.gserviceaccount.com"
+
+gcloud projects add-iam-policy-binding "${PROJECT}" \
+  --member "serviceAccount:${PUBSUB_SERVICE_AGENT}" \
+  --role "roles/iam.serviceAccountTokenCreator" >/dev/null
+gcloud pubsub topics add-iam-policy-binding "${DEAD_LETTER_TOPIC}" \
+  --project "${PROJECT}" \
+  --member "serviceAccount:${PUBSUB_SERVICE_AGENT}" \
+  --role "roles/pubsub.publisher" >/dev/null
+
+API_SA="$(gcloud run services describe "${API_SERVICE}" \
+  --project "${PROJECT}" --region "${REGION}" \
+  --format='value(spec.template.spec.serviceAccountName)')"
+if [ -z "${API_SA}" ]; then
+  echo "❌ Could not resolve the API Cloud Run service account."
+  exit 1
+fi
+
+gcloud pubsub topics add-iam-policy-binding "${TOPIC}" \
+  --project "${PROJECT}" \
+  --member "serviceAccount:${API_SA}" \
+  --role "roles/pubsub.publisher" >/dev/null
+
+if gcloud secrets describe "supabase-service-key" --project "${PROJECT}" >/dev/null 2>&1 && has_enabled_secret_version "supabase-service-key"; then
+  SUPABASE_SERVICE_SECRET_NAME="supabase-service-key"
+elif gcloud secrets describe "supabase-service-role-key" --project "${PROJECT}" >/dev/null 2>&1 && has_enabled_secret_version "supabase-service-role-key"; then
+  SUPABASE_SERVICE_SECRET_NAME="supabase-service-role-key"
+else
+  echo "❌ No enabled Supabase service-key secret was found."
+  exit 1
+fi
+
+FAST_SECRETS="SUPABASE_SERVICE_KEY=${SUPABASE_SERVICE_SECRET_NAME}:latest"
+FAST_SECRETS+=",GOOGLE_PLACE_API_KEY=google-place-api-key:latest"
+FAST_SECRETS+=",REDIS_PASSWORD=redis-password:latest"
+MENU_SECRETS="${FAST_SECRETS}"
+
+for required_secret in google-place-api-key redis-password; do
+  if ! gcloud secrets describe "${required_secret}" --project "${PROJECT}" >/dev/null 2>&1 || ! has_enabled_secret_version "${required_secret}"; then
+    echo "❌ Secret ${required_secret} has no enabled version."
+    exit 1
+  fi
+done
+
+XAI_SECRET_ENABLED="false"
+if gcloud secrets describe "xai-api-key" --project "${PROJECT}" >/dev/null 2>&1 && has_enabled_secret_version "xai-api-key"; then
+  XAI_SECRET_ENABLED="true"
+  FAST_SECRETS+=",XAI_API_KEY=xai-api-key:latest"
+  MENU_SECRETS+=",XAI_API_KEY=xai-api-key:latest"
+elif [ -z "${XAI_API_KEY:-}" ]; then
+  echo "❌ Secret xai-api-key has no enabled version and XAI_API_KEY is not set."
+  exit 1
+fi
 
 : "${WARM_CACHE_ENABLED:=true}"
 : "${WARM_CACHE_INTERVAL_SECONDS:=900}"
@@ -96,7 +237,10 @@ build_env_vars_from_dotenv() {
 : "${CACHE_UNFILTERED_TTL:=3600}"
 
 ENV_VARS="$(build_env_vars_from_dotenv)"
-ENV_VARS+="${ENV_VARS:+,}GOOGLE_CLOUD_PROJECT=${PROJECT},PUBSUB_ENABLED=true,PUBSUB_TOPIC_LOCATION_TASKS=${TOPIC},PUBSUB_ENABLED=true,PUBSUB_PROJECT_ID=${PROJECT}"
+ENV_VARS+="${ENV_VARS:+,}GOOGLE_CLOUD_PROJECT=${PROJECT}"
+ENV_VARS+=",PUBSUB_ENABLED=true"
+ENV_VARS+=",PUBSUB_TOPIC_LOCATION_TASKS=${TOPIC}"
+ENV_VARS+=",PUBSUB_PROJECT_ID=${PROJECT}"
 ENV_VARS+=",WARM_CACHE_ENABLED=${WARM_CACHE_ENABLED}"
 ENV_VARS+=",WARM_CACHE_INTERVAL_SECONDS=${WARM_CACHE_INTERVAL_SECONDS}"
 ENV_VARS+=",WARM_CACHE_ZONE_SET=${WARM_CACHE_ZONE_SET}"
@@ -105,90 +249,30 @@ ENV_VARS+=",WARM_CACHE_END_HOUR=${WARM_CACHE_END_HOUR}"
 ENV_VARS+=",WARM_CACHE_TIMEZONE=${WARM_CACHE_TIMEZONE}"
 ENV_VARS+=",CACHE_UNFILTERED_TTL=${CACHE_UNFILTERED_TTL}"
 
-gcloud run services update "${API_SERVICE}" \
-  --project "${PROJECT}" \
-  --region "${REGION}" \
-  --set-env-vars "${ENV_VARS}"
-
-API_SA="$(gcloud run services describe "${API_SERVICE}" --project "${PROJECT}" --region "${REGION}" --format='value(spec.template.spec.serviceAccountName)')"
-
-gcloud projects add-iam-policy-binding "${PROJECT}" \
-  --member "serviceAccount:${API_SA}" \
-  --role "roles/pubsub.publisher"
+if [ "${XAI_SECRET_ENABLED}" != "true" ] && [ -n "${XAI_API_KEY:-}" ]; then
+  escaped_xai="${XAI_API_KEY//\\/\\\\}"
+  escaped_xai="${escaped_xai//,/\\,}"
+  ENV_VARS+=",XAI_API_KEY=${escaped_xai}"
+fi
 
 IMAGE="europe-west2-docker.pkg.dev/${PROJECT}/cloud-run-source-deploy/pinit-recommendations:latest"
 RUN_SA="${API_SA}"
 
-WORKER_ENV_VARS="${ENV_VARS}"
-
-# Secret Manager bindings: ENV_VAR=secret-name:version
-has_enabled_secret_version() {
-  local secret_name="$1"
-  gcloud secrets versions list "${secret_name}" \
-    --project "${PROJECT}" \
-    --filter='state:ENABLED' \
-    --format='value(name)' \
-    --limit=1 >/dev/null 2>&1
-}
-
-if gcloud secrets describe "supabase-service-key" --project "${PROJECT}" >/dev/null 2>&1 && has_enabled_secret_version "supabase-service-key"; then
-  SUPABASE_SERVICE_SECRET_NAME="supabase-service-key"
-elif gcloud secrets describe "supabase-service-role-key" --project "${PROJECT}" >/dev/null 2>&1 && has_enabled_secret_version "supabase-service-role-key"; then
-  SUPABASE_SERVICE_SECRET_NAME="supabase-service-role-key"
-elif gcloud secrets describe "supabase-service-key" --project "${PROJECT}" >/dev/null 2>&1; then
-  echo "❌ Error: Secret 'supabase-service-key' exists but has no ENABLED versions."
-  echo "   Add a version, e.g.:"
-  echo "     printf \"<SUPABASE_SERVICE_KEY>\" | gcloud secrets versions add supabase-service-key --data-file=- --project \"${PROJECT}\""
-  exit 1
-elif gcloud secrets describe "supabase-service-role-key" --project "${PROJECT}" >/dev/null 2>&1; then
-  echo "❌ Error: Secret 'supabase-service-role-key' exists but has no ENABLED versions."
-  echo "   Add a version, e.g.:"
-  echo "     printf \"<SUPABASE_SERVICE_ROLE_KEY>\" | gcloud secrets versions add supabase-service-role-key --data-file=- --project \"${PROJECT}\""
-  exit 1
-else
-  echo "❌ Error: Could not find a Supabase service key secret with an ENABLED version in project '${PROJECT}'."
-  echo "   Expected either 'supabase-service-key' (preferred) or 'supabase-service-role-key' (legacy)."
-  exit 1
-fi
-
-FAST_SECRETS="SUPABASE_SERVICE_KEY=${SUPABASE_SERVICE_SECRET_NAME}:latest"
-FAST_SECRETS+=",GOOGLE_PLACE_API_KEY=google-place-api-key:latest"
-FAST_SECRETS+=",REDIS_PASSWORD=redis-password:latest"
-
-MENU_SECRETS="${FAST_SECRETS}"
-MENU_ENV_VARS="${WORKER_ENV_VARS}"
-
-if gcloud secrets describe "xai-api-key" --project "${PROJECT}" >/dev/null 2>&1; then
-  FAST_SECRETS+=",XAI_API_KEY=xai-api-key:latest"
-  MENU_SECRETS+=",XAI_API_KEY=xai-api-key:latest"
-else
-  # Fallback: if XAI_API_KEY is present in the local environment/.env, pass it as a plain env var.
-  # Prefer Secret Manager for production.
-  if [ -n "${XAI_API_KEY:-}" ]; then
-    escaped="${XAI_API_KEY//\\/\\\\}"
-    escaped="${escaped//,/\\,}"
-    WORKER_ENV_VARS+=",XAI_API_KEY=${escaped}"
-    MENU_ENV_VARS+=",XAI_API_KEY=${escaped}"
-  else
-    echo "❌ Error: Secret 'xai-api-key' not found and XAI_API_KEY not set."
-    echo "   Vibe tagging (menu_vibe/vibe_reprocess) will fail and Pub/Sub will retry forever."
-    echo "   Fix by creating the secret in project '${PROJECT}' or setting XAI_API_KEY in .env."
-    exit 1
-  fi
-fi
-
+echo "🚀 Deploying request-based location workers..."
 gcloud run deploy "${WORKER_FAST_SERVICE}" \
   --project "${PROJECT}" \
   --region "${REGION}" \
   --image "${IMAGE}" \
   --service-account "${RUN_SA}" \
   --no-allow-unauthenticated \
+  --cpu-throttling \
+  --min-instances 0 \
   --timeout 900 \
   --cpu "${FAST_CPU}" \
   --memory "${FAST_MEMORY}" \
   --concurrency "${FAST_CONCURRENCY}" \
   --max-instances "${FAST_MAX_INSTANCES}" \
-  --set-env-vars "${WORKER_ENV_VARS}" \
+  --set-env-vars "${ENV_VARS}" \
   --set-secrets "${FAST_SECRETS}" \
   --command uvicorn \
   --args "pinit.worker.main:app,--host,0.0.0.0,--port,8080"
@@ -199,49 +283,62 @@ gcloud run deploy "${WORKER_MENU_SERVICE}" \
   --image "${IMAGE}" \
   --service-account "${RUN_SA}" \
   --no-allow-unauthenticated \
+  --cpu-throttling \
+  --min-instances 0 \
   --timeout 900 \
   --cpu "${MENU_CPU}" \
   --memory "${MENU_MEMORY}" \
   --concurrency "${MENU_CONCURRENCY}" \
   --max-instances "${MENU_MAX_INSTANCES}" \
-  --set-env-vars "${MENU_ENV_VARS}" \
+  --set-env-vars "${ENV_VARS}" \
   --set-secrets "${MENU_SECRETS}" \
   --command uvicorn \
   --args "pinit.worker.main:app,--host,0.0.0.0,--port,8080"
 
 PUSH_SA="${RUN_SA}"
-
 gcloud run services add-iam-policy-binding "${WORKER_FAST_SERVICE}" \
-  --project "${PROJECT}" \
-  --region "${REGION}" \
+  --project "${PROJECT}" --region "${REGION}" \
   --member "serviceAccount:${PUSH_SA}" \
-  --role "roles/run.invoker"
-
+  --role "roles/run.invoker" >/dev/null
 gcloud run services add-iam-policy-binding "${WORKER_MENU_SERVICE}" \
+  --project "${PROJECT}" --region "${REGION}" \
+  --member "serviceAccount:${PUSH_SA}" \
+  --role "roles/run.invoker" >/dev/null
+
+FAST_WORKER_URL="$(gcloud run services describe "${WORKER_FAST_SERVICE}" \
+  --project "${PROJECT}" --region "${REGION}" --format='value(status.url)')"
+MENU_WORKER_URL="$(gcloud run services describe "${WORKER_MENU_SERVICE}" \
+  --project "${PROJECT}" --region "${REGION}" --format='value(status.url)')"
+
+for TASK in "${FAST_TASKS[@]}"; do
+  configure_task_subscription "${TASK}" "${FAST_WORKER_URL}" "${PUSH_SA}" "${PUBSUB_SERVICE_AGENT}"
+done
+configure_task_subscription "menu_vibe" "${MENU_WORKER_URL}" "${PUSH_SA}" "${PUBSUB_SERVICE_AGENT}"
+
+if ! gcloud pubsub subscriptions describe "${DEAD_LETTER_SUBSCRIPTION}" --project "${PROJECT}" >/dev/null 2>&1; then
+  gcloud pubsub subscriptions create "${DEAD_LETTER_SUBSCRIPTION}" \
+    --project "${PROJECT}" \
+    --topic "${DEAD_LETTER_TOPIC}" \
+    --expiration-period never \
+    --message-retention-duration 14d
+fi
+
+echo "🔎 Verifying workers and subscriptions before enabling API publishing..."
+EXPECT_API_PUBSUB=false "${SCRIPT_DIR}/verify_pubsub.sh"
+
+echo "🔁 Enabling Pub/Sub publishing on the request-based API service..."
+gcloud run services update "${API_SERVICE}" \
   --project "${PROJECT}" \
   --region "${REGION}" \
-  --member "serviceAccount:${PUSH_SA}" \
-  --role "roles/run.invoker"
+  --update-env-vars "PUBSUB_ENABLED=true,PUBSUB_TOPIC_LOCATION_TASKS=${TOPIC},PUBSUB_PROJECT_ID=${PROJECT},GOOGLE_CLOUD_PROJECT=${PROJECT}" \
+  --cpu-throttling \
+  --min-instances 0
 
+EXPECT_API_PUBSUB=true "${SCRIPT_DIR}/verify_pubsub.sh"
 
-FAST_WORKER_URL="$(gcloud run services describe "${WORKER_FAST_SERVICE}" --project "${PROJECT}" --region "${REGION}" --format='value(status.url)')"
-MENU_WORKER_URL="$(gcloud run services describe "${WORKER_MENU_SERVICE}" --project "${PROJECT}" --region "${REGION}" --format='value(status.url)')"
-
-for TASK in pipeline details_enrich emoji photos vibe_reprocess; do
-  gcloud pubsub subscriptions update "${TOPIC}-${TASK}" \
-    --project "${PROJECT}" \
-    --ack-deadline 600 \
-    --push-endpoint "${FAST_WORKER_URL}/internal/pubsub/location-tasks" \
-    --push-auth-service-account "${PUSH_SA}"
-done
-
-gcloud pubsub subscriptions update "${TOPIC}-menu_vibe" \
-  --project "${PROJECT}" \
-  --ack-deadline 600 \
-  --push-endpoint "${MENU_WORKER_URL}/internal/pubsub/location-tasks" \
-  --push-auth-service-account "${PUSH_SA}"
-
-echo "✅ Pub/Sub deployment complete."
+echo "✅ Durable Pub/Sub location processing deployed."
 echo "   Topic: ${TOPIC}"
+echo "   Dead-letter topic: ${DEAD_LETTER_TOPIC}"
+echo "   Dead-letter inspection subscription: ${DEAD_LETTER_SUBSCRIPTION}"
 echo "   Fast worker: ${FAST_WORKER_URL}"
 echo "   Menu worker: ${MENU_WORKER_URL}"
