@@ -3,10 +3,12 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import math
 import os
 import random
 import re
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -609,6 +611,19 @@ def _build_location_write_data(place_details: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _build_location_update_data(place_details: Dict[str, Any]) -> Dict[str, Any]:
+    """Build a non-destructive Places patch for an existing location row."""
+    update_data = _build_location_write_data(place_details)
+    return {
+        key: value
+        for key, value in update_data.items()
+        if value is not None
+        and value != ""
+        and value != []
+        and value != {}
+    }
+
+
 def create_location_from_place_details(place_details: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Insert a new location row from normalized place details."""
     supabase = get_supabase_service()
@@ -632,7 +647,9 @@ def update_location_from_place_details(
 ) -> Optional[Dict[str, Any]]:
     """Update an existing location row from normalized place details."""
     supabase = get_supabase_service()
-    updated = supabase.update_location(location_id, **_build_location_write_data(place_details))
+    update_data = _build_location_update_data(place_details)
+    update_data["google_details_fetched_at"] = datetime.now(timezone.utc).isoformat()
+    updated = supabase.update_location(location_id, **update_data)
     if not updated:
         return None
 
@@ -644,6 +661,106 @@ def update_location_from_place_details(
         place_details.get("name") or "Unknown",
     )
     return result
+
+
+def _normalized_place_name(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+
+
+def _distance_metres(
+    lat_a: float,
+    lng_a: float,
+    lat_b: float,
+    lng_b: float,
+) -> float:
+    radius_m = 6_371_000.0
+    phi_a = math.radians(lat_a)
+    phi_b = math.radians(lat_b)
+    delta_phi = math.radians(lat_b - lat_a)
+    delta_lng = math.radians(lng_b - lng_a)
+    haversine = (
+        math.sin(delta_phi / 2.0) ** 2
+        + math.cos(phi_a)
+        * math.cos(phi_b)
+        * math.sin(delta_lng / 2.0) ** 2
+    )
+    return radius_m * 2.0 * math.atan2(math.sqrt(haversine), math.sqrt(1.0 - haversine))
+
+
+def resolve_google_place_id_for_location(row: Dict[str, Any]) -> Optional[str]:
+    """Resolve a missing Place ID only when Text Search returns one exact nearby match."""
+    existing = str(row.get("google_place_id") or "").strip()
+    if existing:
+        return existing
+
+    name = str(row.get("name") or "").strip()
+    if not name:
+        return None
+
+    api_key = GOOGLE_PLACE_API_KEY
+    if not api_key:
+        raise ValueError("GOOGLE_PLACE_API_KEY not found in environment variables")
+
+    vicinity = str(row.get("vicinity") or "").strip()
+    lat = row.get("lat")
+    lng = row.get("lng")
+    body: Dict[str, Any] = {
+        "textQuery": ", ".join(part for part in (name, vicinity) if part),
+        "maxResultCount": 5,
+    }
+    if lat is not None and lng is not None:
+        body["locationBias"] = {
+            "circle": {
+                "center": {"latitude": float(lat), "longitude": float(lng)},
+                "radius": 500.0,
+            }
+        }
+
+    response = requests.post(
+        "https://places.googleapis.com/v1/places:searchText",
+        headers={
+            "Content-Type": "application/json",
+            "X-Goog-Api-Key": api_key,
+            "X-Goog-FieldMask": (
+                "places.id,places.displayName,places.formattedAddress,places.location"
+            ),
+        },
+        json=body,
+        timeout=10,
+    )
+    response.raise_for_status()
+
+    expected_name = _normalized_place_name(name)
+    candidates: List[str] = []
+    for place in response.json().get("places", []):
+        display_name = place.get("displayName") or {}
+        candidate_name = display_name.get("text") if isinstance(display_name, dict) else display_name
+        if _normalized_place_name(candidate_name) != expected_name:
+            continue
+
+        candidate_location = place.get("location") or {}
+        candidate_lat = candidate_location.get("latitude")
+        candidate_lng = candidate_location.get("longitude")
+        if (
+            lat is not None
+            and lng is not None
+            and candidate_lat is not None
+            and candidate_lng is not None
+            and _distance_metres(
+                float(lat),
+                float(lng),
+                float(candidate_lat),
+                float(candidate_lng),
+            )
+            > 500.0
+        ):
+            continue
+
+        place_id = str(place.get("id") or "").strip()
+        if place_id:
+            candidates.append(place_id)
+
+    return candidates[0] if len(candidates) == 1 else None
 
 
 def fetch_google_place_basic_details(google_place_id: str) -> Optional[Dict[str, Any]]:
