@@ -543,6 +543,56 @@ class SupabaseService:
 
         return response.data[0] if response.data else None
 
+    def claim_location_processing(
+        self,
+        location_id: int,
+        request_id: str,
+        *,
+        cooldown_seconds: int = 30 * 24 * 60 * 60,
+        claim_stale_after_seconds: int = 5 * 60,
+    ) -> bool:
+        """Atomically claim a location when its processing cooldown permits."""
+        response = self.client.rpc(
+            "claim_location_processing",
+            {
+                "p_location_id": location_id,
+                "p_request_id": request_id,
+                "p_cooldown_seconds": cooldown_seconds,
+                "p_claim_stale_after_seconds": claim_stale_after_seconds,
+            },
+        ).execute()
+        return bool(response.data)
+
+    def complete_location_processing_queue(
+        self,
+        location_id: int,
+        request_id: str,
+    ) -> bool:
+        """Persist the cooldown timestamp for an accepted processing request."""
+        response = self.client.rpc(
+            "complete_location_processing_queue",
+            {
+                "p_location_id": location_id,
+                "p_request_id": request_id,
+            },
+        ).execute()
+        return bool(response.data)
+
+    def release_location_processing_claim(
+        self,
+        location_id: int,
+        request_id: str,
+    ) -> bool:
+        """Release an owned processing claim after dispatch fails."""
+        response = self.client.rpc(
+            "release_location_processing_claim",
+            {
+                "p_location_id": location_id,
+                "p_request_id": request_id,
+            },
+        ).execute()
+        return bool(response.data)
+
     def claim_location_vibe_processing(
         self,
         location_id: int,
