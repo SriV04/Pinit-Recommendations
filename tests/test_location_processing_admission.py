@@ -1,5 +1,10 @@
 import unittest
+import sys
+from pathlib import Path
 from unittest.mock import AsyncMock
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from pinit.api.schemas_location_tasks import ProcessLocationPayload
 from pinit.api.services.location_processing_admission import (
@@ -87,4 +92,3 @@ class AdmissionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(supabase.complete_calls, [])
         self.assertEqual(supabase.release_calls, [(42, "request-42")])
-

@@ -88,6 +88,7 @@ async def handle_location_task(payload: LocationTaskPayload, *, dispatcher: Loca
         payload.source,
     )
     if payload.task_type == "process_location":
+        await _repair_location_processing_tracker(payload)
         await process_location_task(payload)
         logger.info(
             "Task done: %s (location_id=%s request_id=%s duration_ms=%d)",
@@ -159,6 +160,32 @@ async def handle_location_task(payload: LocationTaskPayload, *, dispatcher: Loca
         return
 
     raise ValueError(f"Unknown task_type: {payload.task_type}")
+
+
+async def _repair_location_processing_tracker(
+    payload: ProcessLocationPayload,
+) -> None:
+    """Complete an accepted queue tracker if the API could not finalize it."""
+    try:
+        completed = await asyncio.to_thread(
+            get_supabase_service().complete_location_processing_queue,
+            payload.location_id,
+            payload.request_id,
+        )
+        logger.info(
+            "process_location tracker completion=%s "
+            "(location_id=%s request_id=%s)",
+            completed,
+            payload.location_id,
+            payload.request_id,
+        )
+    except Exception:
+        logger.exception(
+            "process_location tracker repair failed "
+            "(location_id=%s request_id=%s)",
+            payload.location_id,
+            payload.request_id,
+        )
 
 
 async def _get_location(location_id: int) -> Dict[str, Any]:

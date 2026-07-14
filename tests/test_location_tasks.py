@@ -33,6 +33,7 @@ class _FakeSupabase:
         self.claimed = claimed
         self.claim_calls = []
         self.clear_calls = []
+        self.complete_calls = []
 
     def claim_location_vibe_processing(self, location_id, request_id, *, stale_after_seconds):
         self.claim_calls.append((location_id, request_id, stale_after_seconds))
@@ -41,10 +42,15 @@ class _FakeSupabase:
     def clear_location_vibe_processing(self, location_id, request_id):
         self.clear_calls.append((location_id, request_id))
 
+    def complete_location_processing_queue(self, location_id, request_id):
+        self.complete_calls.append((location_id, request_id))
+        return True
+
 
 class LocationTaskPipelineTests(unittest.IsolatedAsyncioTestCase):
     async def test_handle_routes_single_process_location_task(self) -> None:
         dispatcher = _FakeDispatcher()
+        supabase = _FakeSupabase()
         payload = ProcessLocationPayload(
             task_type="process_location",
             request_id="request-process",
@@ -53,10 +59,25 @@ class LocationTaskPipelineTests(unittest.IsolatedAsyncioTestCase):
             source="expanded-card-open",
         )
 
-        with patch.object(location_tasks, "process_location_task", new=AsyncMock()) as process:
-            await location_tasks.handle_location_task(payload, dispatcher=dispatcher)
+        with (
+            patch.object(
+                location_tasks,
+                "get_supabase_service",
+                return_value=supabase,
+            ),
+            patch.object(
+                location_tasks,
+                "process_location_task",
+                new=AsyncMock(),
+            ) as process,
+        ):
+            await location_tasks.handle_location_task(
+                payload,
+                dispatcher=dispatcher,
+            )
 
         process.assert_awaited_once_with(payload)
+        self.assertEqual(supabase.complete_calls, [(42, "request-process")])
 
     async def test_magic_search_open_existing_location_runs_full_enrichment(self) -> None:
         dispatcher = _FakeDispatcher()

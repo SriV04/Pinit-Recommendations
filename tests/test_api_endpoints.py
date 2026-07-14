@@ -137,6 +137,31 @@ class _FakeCacheService:
 class _FakeSupabase:
     vibe_tag_order = proximal.VIBE_TAG_ORDER
 
+    def __init__(self) -> None:
+        self.location_processing_claimed = True
+        self.location_processing_claim_calls = []
+        self.location_processing_complete_calls = []
+        self.location_processing_release_calls = []
+
+    def claim_location_processing(
+        self,
+        location_id,
+        request_id,
+        **kwargs,
+    ):
+        self.location_processing_claim_calls.append(
+            (location_id, request_id, kwargs)
+        )
+        return self.location_processing_claimed
+
+    def complete_location_processing_queue(self, location_id, request_id):
+        self.location_processing_complete_calls.append((location_id, request_id))
+        return True
+
+    def release_location_processing_claim(self, location_id, request_id):
+        self.location_processing_release_calls.append((location_id, request_id))
+        return True
+
     def count_locations(self) -> int:
         return 42
 
@@ -474,6 +499,81 @@ class ProximalApiEndpointTests(unittest.TestCase):
         self.assertEqual(_FakeDispatcher.dispatched[0].task_type, "process_location")
         self.assertEqual(_FakeDispatcher.dispatched[0].location_id, 3002)
 
+    def test_locations_add_skips_async_processing_during_cooldown(self) -> None:
+        self.supabase.location_processing_claimed = False
+        _FakeDispatcher.dispatched = []
+        with (
+            patch.object(proximal, "get_supabase_service", return_value=self.supabase),
+            patch.object(
+                proximal,
+                "get_pubsub_config",
+                return_value=SimpleNamespace(enabled=False, project_id="", topic=""),
+            ),
+            patch.object(proximal, "InProcessDispatcher", _FakeDispatcher),
+        ):
+            response = self.client.post(
+                "/locations/add",
+                json={
+                    "google_place_id": "known-google-place",
+                    "source": "in-app",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json()["message"],
+            "Location exists; processing skipped by 30-day cooldown",
+        )
+        self.assertEqual(_FakeDispatcher.dispatched, [])
+
+    def test_locations_add_skips_synchronous_processing_during_cooldown(self) -> None:
+        self.supabase.location_processing_claimed = False
+        with (
+            patch.object(proximal, "get_supabase_service", return_value=self.supabase),
+            patch.object(
+                proximal,
+                "process_location_task",
+                new=AsyncMock(),
+            ) as process,
+        ):
+            response = self.client.post(
+                "/locations/add",
+                json={
+                    "google_place_id": "known-google-place",
+                    "source": "in-app",
+                    "process_synchronously": True,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json()["message"],
+            "Location exists; processing skipped by 30-day cooldown",
+        )
+        process.assert_not_awaited()
+
+    def test_locations_add_synchronous_processing_completes_tracker(self) -> None:
+        with (
+            patch.object(proximal, "get_supabase_service", return_value=self.supabase),
+            patch.object(
+                proximal,
+                "process_location_task",
+                new=AsyncMock(),
+            ) as process,
+        ):
+            response = self.client.post(
+                "/locations/add",
+                json={
+                    "google_place_id": "known-google-place",
+                    "source": "in-app",
+                    "process_synchronously": True,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        process.assert_awaited_once()
+        self.assertEqual(len(self.supabase.location_processing_complete_calls), 1)
+
     def test_locations_process_queues_canonical_location(self) -> None:
         _FakeDispatcher.dispatched = []
         with (
@@ -502,6 +602,27 @@ class ProximalApiEndpointTests(unittest.TestCase):
         self.assertEqual(len(_FakeDispatcher.dispatched), 1)
         self.assertEqual(_FakeDispatcher.dispatched[0].task_type, "process_location")
         self.assertEqual(_FakeDispatcher.dispatched[0].location_id, 3001)
+
+    def test_locations_process_returns_not_queued_during_cooldown(self) -> None:
+        self.supabase.location_processing_claimed = False
+        _FakeDispatcher.dispatched = []
+        with (
+            patch.object(proximal, "get_supabase_service", return_value=self.supabase),
+            patch.object(
+                proximal,
+                "get_pubsub_config",
+                return_value=SimpleNamespace(enabled=False, project_id="", topic=""),
+            ),
+            patch.object(proximal, "InProcessDispatcher", _FakeDispatcher),
+        ):
+            response = self.client.post(
+                "/locations/process",
+                json={"location_id": 3001, "source": "expanded-card-open"},
+            )
+
+        self.assertEqual(response.status_code, 202)
+        self.assertFalse(response.json()["queued"])
+        self.assertEqual(_FakeDispatcher.dispatched, [])
 
     def test_locations_process_rejects_non_positive_location_id(self) -> None:
         _FakeDispatcher.dispatched = []

@@ -57,6 +57,9 @@ from pinit.api.services.magic_ai_enrichment import build_magic_ai_enrichment_pay
 from pinit.api.services.magic_ai_signature import build_magic_ai_signature
 from pinit.api.services.magic_intent_parser import normalise_prompt, parse_magic_intent
 from pinit.api.schemas_location_tasks import ProcessLocationPayload
+from pinit.api.services.location_processing_admission import (
+    admit_location_processing,
+)
 from pinit.api.services.location_tasks import (
     InProcessDispatcher,
     PubSubDispatcher,
@@ -1695,9 +1698,13 @@ async def process_canonical_location(
         ).strip(),
         source=(request.source or "expanded-card-open").lower().strip(),
     )
-    await _dispatch_location_processing(payload)
+    admission = await admit_location_processing(
+        payload,
+        supabase=supabase,
+        dispatch=_dispatch_location_processing,
+    )
     return ProcessLocationResponse(
-        queued=True,
+        queued=admission.queued,
         location_id=request.location_id,
         request_id=request_id,
     )
@@ -1772,8 +1779,34 @@ async def add_location_by_place_id(request: AddLocationRequest) -> AddLocationRe
         created_new=created_new,
     )
 
+    async def _process_now(payload: ProcessLocationPayload) -> None:
+        await process_location_task(payload)
+
+    dispatch = _process_now if process_synchronously else _dispatch_location_processing
+    admission = await admit_location_processing(
+        processing_payload,
+        supabase=supabase,
+        dispatch=dispatch,
+    )
+
+    if not admission.queued:
+        message = (
+            "Location added; processing skipped by 30-day cooldown"
+            if created_new
+            else "Location exists; processing skipped by 30-day cooldown"
+        )
+        return AddLocationResponse(
+            success=True,
+            message=message,
+            location_id=location_id,
+            google_place_id=request.google_place_id,
+            name=existing_name,
+            tags_count=None,
+            already_existed=already_existed,
+            emoji=None,
+        )
+
     if process_synchronously:
-        await process_location_task(processing_payload)
         updated_location = await asyncio.to_thread(supabase.get_location, location_id) or {}
         return AddLocationResponse(
             success=True,
@@ -1785,9 +1818,6 @@ async def add_location_by_place_id(request: AddLocationRequest) -> AddLocationRe
             already_existed=already_existed,
             emoji=updated_location.get("emoji"),
         )
-
-    # Async mode: publish one canonical task (or use the local in-process fallback).
-    await _dispatch_location_processing(processing_payload)
 
     if created_new:
         message = "Location successfully added; enrichment queued"
