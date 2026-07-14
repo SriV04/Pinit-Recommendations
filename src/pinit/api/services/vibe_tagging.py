@@ -555,9 +555,6 @@ async def generate_vibe_tags_for_location(
         logger.error("XAI_API_KEY not configured, skipping vibe tagging for location %s", location_id)
         return None
     
-    logger.info("XAI_API_KEY present: %s", bool(XAI_API_KEY))
-
-
     supabase = get_supabase_service()
 
     # Fetch full restaurant record (with any recently-updated menu fields)
@@ -567,8 +564,14 @@ async def generate_vibe_tags_for_location(
         return None
 
     name = restaurant.get("name", "Unknown")
-    logger.info("Starting vibe tag generation for location %s (%s), num_runs=%d, blend_tiktok=%s, XAI_API_KEY=%s",
-                location_id, name, num_runs, blend_tiktok, XAI_API_KEY[:10] + "..." if XAI_API_KEY else "None")
+    logger.info(
+        "Starting vibe tag generation for location %s (%s), "
+        "num_runs=%d, blend_tiktok=%s",
+        location_id,
+        name,
+        num_runs,
+        blend_tiktok,
+    )
 
     # ── Fetch TikTok video insights (if blending) ────────────────────────
     video_insights: List[Dict] = []
