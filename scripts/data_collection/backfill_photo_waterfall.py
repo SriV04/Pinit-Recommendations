@@ -67,7 +67,7 @@ def fetch_locations_needing_photos(limit: int = BATCH_SIZE):
     # Use a direct query on locations with an inner join filter
     data = (
         supabase.table("locations")
-        .select("location_id, google_place_id, website, name, image_stored, photo_source")
+        .select("location_id, google_place_id, website, name, image_stored, image_unavailable")
         .in_(
             "location_id",
             [
@@ -82,6 +82,7 @@ def fetch_locations_needing_photos(limit: int = BATCH_SIZE):
             ],
         )
         .is_("image_stored", "false")
+        .is_("image_unavailable", "false")  # already tried every source
         .not_.is_("google_place_id", "null")
         .order("location_id")
         .limit(limit)
@@ -234,20 +235,19 @@ def main():
 
                 uploaded = upload_photo(loc_id, result.image_bytes, result.content_type)
                 if uploaded:
-                    update_data = {
-                        "photo_reference": result.source_reference,
-                        "photo_source": result.source,
-                        "image_stored": True,
-                    }
-                    if result.score is not None:
-                        update_data["photo_reference_score"] = str(result.score)
-                    update_location(loc_id, **update_data)
+                    # photo_source / photo_reference_score were dropped from
+                    # locations on 2026-10-01 — nothing read them.
+                    update_location(
+                        loc_id,
+                        photo_reference=result.source_reference,
+                        image_stored=True,
+                    )
                     stats[result.source] += 1
                 else:
                     stats["errors"] += 1
             else:
                 print(f"    → no photo from any source")
-                update_location(loc_id, photo_source="none")
+                update_location(loc_id, image_unavailable=True)
                 stats["none"] += 1
 
             time.sleep(0.5)

@@ -549,17 +549,8 @@ def _build_location_row(place: dict, tile: Tile) -> Optional[dict]:
         "serves_wine": place.get("servesWine"),
         # --- Meta ---
         "updated_at": datetime.now(timezone.utc).isoformat(),
-        "data_version": "v2.2",
-        "derived_attributes": {
-            "stage": "A",
-            "source": "nearby_new",
-            "tier": "enterprise",
-            "tile_radius_m": tile.radius_m,
-            "tile_depth": tile.depth,
-            "tile_center": {"lat": tile.lat, "lng": tile.lng},
-            "tile_id": tile.key,
-            "queried_types": FOOD_TYPES,
-        },
+        # data_version / derived_attributes (tile provenance) were dropped from
+        # locations on 2026-10-01 — nothing read them.
     }
     return row
 
