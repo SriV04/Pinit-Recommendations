@@ -29,6 +29,7 @@ from dotenv import load_dotenv
 from supabase import create_client, Client
 
 from pinit.api.services.photo_pipeline import fetch_photo_waterfall
+from pinit.integrations import r2_photos
 
 load_dotenv()
 
@@ -92,7 +93,16 @@ def fetch_locations_needing_photos(limit: int = BATCH_SIZE):
 
 
 def upload_photo(location_id: int, image_bytes: bytes, content_type: str) -> bool:
-    """Upload photo to Supabase storage bucket."""
+    """Upload photo to R2 (when configured) and, until cutover, Supabase storage."""
+    if r2_photos.is_configured():
+        try:
+            r2_photos.upload_location_photo(location_id, image_bytes, content_type)
+        except Exception as e:
+            print(f"    ⚠ R2 upload failed: {e}")
+            return False
+        if not r2_photos.dual_write_supabase():
+            return True
+
     ext_map = {
         "image/jpeg": ".jpg",
         "image/png": ".png",

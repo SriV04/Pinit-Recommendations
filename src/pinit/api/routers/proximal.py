@@ -1387,6 +1387,7 @@ async def _run_photo_pipeline(
     photos_from_details: List[Dict[str, Any]],
 ) -> None:
     from pinit.api.services.proximal_service import download_photo
+    from pinit.integrations import r2_photos
 
     bg_supabase = get_supabase_service()
 
@@ -1422,7 +1423,10 @@ async def _run_photo_pipeline(
             )
         return
 
-    primary_dl = await asyncio.to_thread(download_photo, primary_name, GOOGLE_PLACE_API_KEY)
+    ingest_px = r2_photos.ingest_max_px()
+    primary_dl = await asyncio.to_thread(
+        download_photo, primary_name, GOOGLE_PLACE_API_KEY, ingest_px, ingest_px
+    )
     if primary_dl is None:
         logger.error(
             "Primary photo download failed for location %s (name=%s)",
@@ -1469,7 +1473,9 @@ async def _run_photo_pipeline(
         if not extra_name:
             continue
 
-        extra_dl = await asyncio.to_thread(download_photo, extra_name, GOOGLE_PLACE_API_KEY)
+        extra_dl = await asyncio.to_thread(
+            download_photo, extra_name, GOOGLE_PLACE_API_KEY, ingest_px, ingest_px
+        )
         if extra_dl is None:
             logger.warning(
                 "Extra photo %d download failed for location %s",

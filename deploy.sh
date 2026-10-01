@@ -74,7 +74,7 @@ build_env_vars_from_dotenv() {
       local key="${BASH_REMATCH[1]}"
       case "$key" in
         # Bound via --set-secrets below (avoid duplicates)
-        SUPABASE_SERVICE_KEY|SUPABASE_SERVICE_ROLE_KEY|SUPABASE_SECRET_KEY|GOOGLE_PLACE_API_KEY|REDIS_PASSWORD)
+        SUPABASE_SERVICE_KEY|SUPABASE_SERVICE_ROLE_KEY|SUPABASE_SECRET_KEY|GOOGLE_PLACE_API_KEY|REDIS_PASSWORD|R2_ACCESS_KEY_ID|R2_SECRET_ACCESS_KEY)
           continue
           ;;
         # These are set explicitly per deploy (avoid duplicates)
@@ -164,6 +164,26 @@ fi
 SECRETS="SUPABASE_SERVICE_KEY=${SUPABASE_SERVICE_SECRET_NAME}:latest"
 SECRETS+=",GOOGLE_PLACE_API_KEY=google-place-api-key:latest"
 SECRETS+=",REDIS_PASSWORD=redis-password:latest"
+
+# Cloudflare R2 photo storage (optional). When R2_SECRET_ACCESS_KEY is set in .env the
+# two credentials must live in Secret Manager; they are never passed as plain env vars.
+# R2_ACCOUNT_ID, R2_BUCKET_NAME and PHOTO_CDN_BASE_URL are not secret and pass through .env.
+if [ -n "${R2_SECRET_ACCESS_KEY:-}" ]; then
+  for r2_pair in "R2_ACCESS_KEY_ID:r2-access-key-id" "R2_SECRET_ACCESS_KEY:r2-secret-access-key"; do
+    r2_env_name="${r2_pair%%:*}"
+    r2_secret_name="${r2_pair##*:}"
+    if gcloud secrets describe "${r2_secret_name}" --project "${PROJECT_ID}" >/dev/null 2>&1 && has_enabled_secret_version "${r2_secret_name}"; then
+      SECRETS+=",${r2_env_name}=${r2_secret_name}:latest"
+    else
+      echo "❌ Error: R2 is configured in .env but secret '${r2_secret_name}' has no ENABLED version in project '${PROJECT_ID}'."
+      echo "   Create it (value is read from stdin, not shown), e.g.:"
+      echo "     gcloud secrets create ${r2_secret_name} --project \"${PROJECT_ID}\" --replication-policy=automatic 2>/dev/null || true"
+      echo "     printf \"<${r2_env_name}>\" | gcloud secrets versions add ${r2_secret_name} --data-file=- --project \"${PROJECT_ID}\""
+      echo "   Then grant the Cloud Run service account roles/secretmanager.secretAccessor on it."
+      exit 1
+    fi
+  done
+fi
 
 gcloud run deploy $SERVICE_NAME \
   --image $AR_IMAGE \

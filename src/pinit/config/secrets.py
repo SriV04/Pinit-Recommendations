@@ -114,3 +114,10 @@ SUPABASE_ANON_KEY = get_secret("supabase-anon-key")
 GEMINI_API_KEY = get_secret("gemini-api-key")
 GOOGLE_PLACE_API_KEY = get_secret("google-place-api-key")
 XAI_API_KEY = get_secret("xai-api-key")
+
+# Cloudflare R2 (location photo storage). All empty => photos stay on Supabase Storage.
+R2_ACCOUNT_ID = get_secret("r2-account-id")
+R2_ACCESS_KEY_ID = get_secret("r2-access-key-id")
+R2_SECRET_ACCESS_KEY = get_secret("r2-secret-access-key")
+R2_BUCKET_NAME = get_secret("r2-bucket-name")
+PHOTO_CDN_BASE_URL = get_secret("photo-cdn-base-url")

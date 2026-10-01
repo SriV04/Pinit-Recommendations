@@ -11,6 +11,13 @@ services:
       - SUPABASE_URL=${SUPABASE_URL}
       - SUPABASE_SERVICE_KEY=${SUPABASE_SERVICE_KEY:-${SUPABASE_SERVICE_ROLE_KEY}}
       - GOOGLE_PLACE_API_KEY=${GOOGLE_PLACE_API_KEY}
+      # Cloudflare R2 photo storage (optional; empty keeps Supabase Storage)
+      - R2_ACCOUNT_ID=${R2_ACCOUNT_ID:-}
+      - R2_ACCESS_KEY_ID=${R2_ACCESS_KEY_ID:-}
+      - R2_SECRET_ACCESS_KEY=${R2_SECRET_ACCESS_KEY:-}
+      - R2_BUCKET_NAME=${R2_BUCKET_NAME:-}
+      - PHOTO_CDN_BASE_URL=${PHOTO_CDN_BASE_URL:-}
+      - PHOTO_DUAL_WRITE_SUPABASE=${PHOTO_DUAL_WRITE_SUPABASE:-true}
       # Pub/Sub async task pipeline (optional)
       - PUBSUB_ENABLED=${PUBSUB_ENABLED:-false}
       - PUBSUB_PROJECT_ID=${PUBSUB_PROJECT_ID}

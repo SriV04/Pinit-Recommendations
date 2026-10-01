@@ -30,6 +30,7 @@ from pinit.api.services.proximal_service import (
 )
 from pinit.api.services.vibe_tagging import generate_vibe_tags_for_location
 from pinit.config.secrets import GOOGLE_PLACE_API_KEY
+from pinit.integrations import r2_photos
 from pinit.integrations.supabase import get_supabase_service
 
 logger = logging.getLogger(__name__)
@@ -787,7 +788,8 @@ async def _run_photo_pipeline(location_id: int, photos_from_details: List[Dict[s
             logger.error("photos: mark_location_image_unavailable failed for %s: %s", location_id, exc)
         return
 
-    primary_dl = await asyncio.to_thread(download_photo, primary_name, api_key)
+    ingest_px = r2_photos.ingest_max_px()
+    primary_dl = await asyncio.to_thread(download_photo, primary_name, api_key, ingest_px, ingest_px)
     if primary_dl is None:
         logger.error(
             "photos: primary photo download failed for location %s (name=%s)",
@@ -820,7 +822,7 @@ async def _run_photo_pipeline(location_id: int, photos_from_details: List[Dict[s
         if not extra_name:
             continue
 
-        extra_dl = await asyncio.to_thread(download_photo, extra_name, api_key)
+        extra_dl = await asyncio.to_thread(download_photo, extra_name, api_key, ingest_px, ingest_px)
         if extra_dl is None:
             logger.warning("photos: extra photo %d download failed for location %s", idx, location_id)
             continue

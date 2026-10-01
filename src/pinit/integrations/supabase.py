@@ -7,6 +7,7 @@ import base64
 import json
 from supabase import create_client, Client, ClientOptions
 from pinit.config.secrets import SUPABASE_URL, SUPABASE_SERVICE_KEY
+from pinit.integrations import r2_photos
 
 # Import cache service (with lazy loading to avoid circular imports)
 _cache_service = None
@@ -643,9 +644,16 @@ class SupabaseService:
         content_type: Optional[str] = None,
         index: Optional[int] = None,
     ) -> Any:
-        """Upload a location photo to the location_photos bucket.
+        """Upload a location photo.
 
-        Object naming follows the photo-pipeline contract:
+        When Cloudflare R2 is configured the photo goes to R2 first (original
+        plus thumb/card/hero WebP variants, see ``r2_photos``); an R2 failure
+        raises. The Supabase ``location_photos`` bucket is still written
+        unless ``PHOTO_DUAL_WRITE_SUPABASE`` is false, because installed app
+        builds read from it until cutover. Without R2 config this is the
+        legacy Supabase-only upload.
+
+        Supabase object naming follows the photo-pipeline contract:
           * ``index is None`` → primary photo: ``{location_id}.jpg``
           * ``index >= 1``    → extras:       ``{location_id}_{index}.jpg``
 
@@ -657,6 +665,11 @@ class SupabaseService:
         """
         import logging
         logger = logging.getLogger(__name__)
+
+        if r2_photos.is_configured():
+            r2_photos.upload_location_photo(location_id, image_bytes, content_type, index)
+            if not r2_photos.dual_write_supabase():
+                return None
 
         file_options = {
             "content-type": content_type or "image/jpeg",
