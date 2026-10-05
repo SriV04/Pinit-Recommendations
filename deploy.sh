@@ -21,6 +21,7 @@ AR_REPO="cloud-run-source-deploy"  # Artifact Registry repository
 #                        legacy "replace everything from .env" mode needs PRESERVE_LIVE_CONFIG=false.
 #   DEPLOY_PHOTO_DUAL_WRITE  value for PHOTO_DUAL_WRITE_SUPABASE (default true: the previous app
 #                        version still reads photos from Supabase Storage)
+#   DRY_RUN=true         print what would be deployed (env keys, secrets, flags) and exit; changes nothing
 #   CONFIRM_FULL_ROLLOUT=yes
 #                        required to deploy the live service straight to 100% traffic
 IMAGE_TAG="${IMAGE_TAG:-$(git rev-parse --short HEAD 2>/dev/null || echo manual)}"
@@ -223,12 +224,36 @@ if [ "${PRESERVE_LIVE_CONFIG}" = "true" ]; then
       exit 1
     fi
   done
-  # Everything already on the service (Redis, caching, Pub/Sub, warm cache, secrets) is kept.
-  CONFIG_ARGS=(
-    --update-env-vars "R2_ACCOUNT_ID=${R2_ACCOUNT_ID},R2_BUCKET_NAME=${R2_BUCKET_NAME},PHOTO_CDN_BASE_URL=${PHOTO_CDN_BASE_URL},PHOTO_DUAL_WRITE_SUPABASE=${DEPLOY_PHOTO_DUAL_WRITE:-true}"
-    --update-secrets "R2_ACCESS_KEY_ID=r2-access-key-id:latest,R2_SECRET_ACCESS_KEY=r2-secret-access-key:latest"
-  )
-  echo "🔒 PRESERVE_LIVE_CONFIG=true: keeping the service's existing env vars and secrets; adding R2/photo settings only."
+  # Copy env vars and secrets from the revision that is SERVING TRAFFIC, not from the service
+  # template: after a --no-traffic deploy the template is the canary's config, which may differ.
+  LIVE_REV="$(gcloud run services describe "${SERVICE_NAME}" --project "${PROJECT_ID}" --region "${REGION}" --format=json \
+    | python3 -c 'import json,sys; t=[x for x in json.load(sys.stdin)["status"]["traffic"] if x.get("revisionName")]; print(max(t,key=lambda x:x.get("percent",0))["revisionName"])')"
+  echo "🔒 Copying live config from serving revision ${LIVE_REV}"
+  LIVE_JSON="$(gcloud run revisions describe "${LIVE_REV}" --project "${PROJECT_ID}" --region "${REGION}" --format=json)"
+  ADD_ENV="R2_ACCOUNT_ID=${R2_ACCOUNT_ID}|R2_BUCKET_NAME=${R2_BUCKET_NAME}|PHOTO_CDN_BASE_URL=${PHOTO_CDN_BASE_URL}|PHOTO_DUAL_WRITE_SUPABASE=${DEPLOY_PHOTO_DUAL_WRITE:-true}"
+  ADD_SECRETS="R2_ACCESS_KEY_ID=r2-access-key-id:latest,R2_SECRET_ACCESS_KEY=r2-secret-access-key:latest"
+  LIVE_ENV="$(printf '%s' "${LIVE_JSON}" | ADD_ENV="${ADD_ENV}" python3 -c '
+import json, os, sys
+c = json.load(sys.stdin)["spec"]["containers"][0]
+add = dict(p.split("=", 1) for p in os.environ["ADD_ENV"].split("|"))
+env = {e["name"]: e["value"] for e in c.get("env", []) if "value" in e and e["name"] not in add}
+env.update(add)
+print("^|^" + "|".join(f"{k}={v}" for k, v in env.items()))
+')"
+  LIVE_SECRETS="$(printf '%s' "${LIVE_JSON}" | ADD_SECRETS="${ADD_SECRETS}" python3 -c '
+import json, os, sys
+c = json.load(sys.stdin)["spec"]["containers"][0]
+add = dict(p.split("=", 1) for p in os.environ["ADD_SECRETS"].split(","))
+sec = {}
+for e in c.get("env", []):
+    ref = e.get("valueFrom", {}).get("secretKeyRef")
+    if ref and e["name"] not in add:
+        sec[e["name"]] = ref["name"] + ":" + ref.get("key", "latest")
+sec.update(add)
+print(",".join(f"{k}={v}" for k, v in sec.items()))
+')"
+  CONFIG_ARGS=(--set-env-vars "${LIVE_ENV}" --set-secrets "${LIVE_SECRETS}")
+  echo "🔒 PRESERVE_LIVE_CONFIG=true: env vars and secrets copied from ${LIVE_REV}; only the R2/photo settings are added."
 else
   CONFIG_ARGS=(--set-env-vars "$ENV_VARS" --set-secrets "$SECRETS")
 fi
@@ -237,6 +262,21 @@ TRAFFIC_ARGS=()
 if [ "${NO_TRAFFIC:-false}" = "true" ]; then
   TRAFFIC_ARGS=(--no-traffic --tag "${TRAFFIC_TAG}")
   echo "🐤 Canary deploy: new revision gets 0% traffic, tagged '${TRAFFIC_TAG}'."
+fi
+
+if [ "${DRY_RUN:-false}" = "true" ]; then
+  echo "🧪 DRY_RUN=true: nothing will be deployed. Would deploy:"
+  echo "   service: ${SERVICE_NAME}   image: ${AR_IMAGE}   traffic args: ${TRAFFIC_ARGS[*]:-<100% to the new revision>}"
+  echo "   min-instances: 0   max-instances: ${API_MAX_INSTANCES}   cpu: ${API_CPU}   memory: ${API_MEMORY}"
+  if [ "${PRESERVE_LIVE_CONFIG}" = "true" ]; then
+    echo "   env keys:    $(printf '%s' "${LIVE_ENV#^|^}" | tr '|' '\n' | cut -d= -f1 | sort | tr '\n' ' ')"
+    echo "   secrets:     $(printf '%s' "${LIVE_SECRETS}" | tr ',' '\n' | sort | tr '\n' ' ')"
+    echo "   key values that differ from local .env (non-secret only):"
+    for k in CACHING_ENABLED PUBSUB_ENABLED PUBSUB_PROJECT_ID PHOTO_DUAL_WRITE_SUPABASE WARM_CACHE_ENABLED; do
+      printf '     %s=%s\n' "$k" "$(printf '%s' "${LIVE_ENV#^|^}" | tr '|' '\n' | grep "^${k}=" | cut -d= -f2-)"
+    done
+  fi
+  exit 0
 fi
 
 gcloud run deploy $SERVICE_NAME \

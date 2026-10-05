@@ -136,7 +136,8 @@ def test_workers_deploy_the_same_image_tag_deploy_sh_pushes() -> None:
 def test_deploy_script_preserves_live_config_instead_of_trusting_local_env() -> None:
     # A shared live service must not be reconfigured from a developer's .env.
     assert 'PRESERVE_LIVE_CONFIG="${PRESERVE_LIVE_CONFIG:-true}"' in DEPLOY_SCRIPT
-    assert "--update-env-vars" in DEPLOY_SCRIPT and "--update-secrets" in DEPLOY_SCRIPT
+    assert "serving revision" in DEPLOY_SCRIPT.lower() or "SERVING TRAFFIC" in DEPLOY_SCRIPT
+    assert "DRY_RUN" in DEPLOY_SCRIPT
     assert "PHOTO_DUAL_WRITE_SUPABASE=${DEPLOY_PHOTO_DUAL_WRITE:-true}" in DEPLOY_SCRIPT
     assert 'SKIP_BUILD' in DEPLOY_SCRIPT
     block = _command_block(DEPLOY_SCRIPT, "gcloud run deploy $SERVICE_NAME")
