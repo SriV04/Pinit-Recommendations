@@ -14,6 +14,13 @@ AR_REPO="cloud-run-source-deploy"  # Artifact Registry repository
 #                        (https://${TRAFFIC_TAG}---<service-url-host>) for testing; shift
 #                        traffic afterwards with `gcloud run services update-traffic`.
 #   TRAFFIC_TAG          tag for the no-traffic revision (default: canary)
+#   SKIP_BUILD=true      reuse the image already pushed for IMAGE_TAG (no docker build/push)
+#   PRESERVE_LIVE_CONFIG (default true) keep the service's existing env vars and secrets and only
+#                        add the R2/photo settings. The local .env is NOT the source of truth for
+#                        a shared live service (it differs: caching, Pub/Sub, dual-write), so the
+#                        legacy "replace everything from .env" mode needs PRESERVE_LIVE_CONFIG=false.
+#   DEPLOY_PHOTO_DUAL_WRITE  value for PHOTO_DUAL_WRITE_SUPABASE (default true: the previous app
+#                        version still reads photos from Supabase Storage)
 #   CONFIRM_FULL_ROLLOUT=yes
 #                        required to deploy the live service straight to 100% traffic
 IMAGE_TAG="${IMAGE_TAG:-$(git rev-parse --short HEAD 2>/dev/null || echo manual)}"
@@ -57,11 +64,15 @@ gcloud auth configure-docker ${REGION}-docker.pkg.dev --quiet
 
 AR_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_REPO}/${IMAGE_NAME}:${IMAGE_TAG}"
 
-echo "🔨 Building Docker image for linux/amd64..."
-docker build --platform linux/amd64 -t $AR_IMAGE .
+if [ "${SKIP_BUILD:-false}" = "true" ]; then
+  echo "⏭️  SKIP_BUILD=true: reusing ${AR_IMAGE}"
+else
+  echo "🔨 Building Docker image for linux/amd64..."
+  docker build --platform linux/amd64 -t $AR_IMAGE .
 
-echo "📤 Pushing to Artifact Registry..."
-docker push $AR_IMAGE
+  echo "📤 Pushing to Artifact Registry..."
+  docker push $AR_IMAGE
+fi
 
 echo "🚀 Deploying to Cloud Run..."
 
@@ -204,6 +215,24 @@ if [ -n "${R2_SECRET_ACCESS_KEY:-}" ]; then
   done
 fi
 
+PRESERVE_LIVE_CONFIG="${PRESERVE_LIVE_CONFIG:-true}"
+if [ "${PRESERVE_LIVE_CONFIG}" = "true" ]; then
+  for required in R2_ACCOUNT_ID R2_BUCKET_NAME PHOTO_CDN_BASE_URL; do
+    if [ -z "${!required:-}" ]; then
+      echo "❌ ${required} is not set in .env (needed for the R2 photo settings)."
+      exit 1
+    fi
+  done
+  # Everything already on the service (Redis, caching, Pub/Sub, warm cache, secrets) is kept.
+  CONFIG_ARGS=(
+    --update-env-vars "R2_ACCOUNT_ID=${R2_ACCOUNT_ID},R2_BUCKET_NAME=${R2_BUCKET_NAME},PHOTO_CDN_BASE_URL=${PHOTO_CDN_BASE_URL},PHOTO_DUAL_WRITE_SUPABASE=${DEPLOY_PHOTO_DUAL_WRITE:-true}"
+    --update-secrets "R2_ACCESS_KEY_ID=r2-access-key-id:latest,R2_SECRET_ACCESS_KEY=r2-secret-access-key:latest"
+  )
+  echo "🔒 PRESERVE_LIVE_CONFIG=true: keeping the service's existing env vars and secrets; adding R2/photo settings only."
+else
+  CONFIG_ARGS=(--set-env-vars "$ENV_VARS" --set-secrets "$SECRETS")
+fi
+
 TRAFFIC_ARGS=()
 if [ "${NO_TRAFFIC:-false}" = "true" ]; then
   TRAFFIC_ARGS=(--no-traffic --tag "${TRAFFIC_TAG}")
@@ -216,8 +245,7 @@ gcloud run deploy $SERVICE_NAME \
   --platform managed \
   --region $REGION \
   --allow-unauthenticated \
-  --set-env-vars "$ENV_VARS" \
-  --set-secrets "$SECRETS" \
+  "${CONFIG_ARGS[@]}" \
   --cpu-throttling \
   --memory "${API_MEMORY}" \
   --timeout 540 \
@@ -229,7 +257,10 @@ echo "✅ Deployment complete!"
 echo "📍 Service URL:"
 gcloud run services describe $SERVICE_NAME --region $REGION --format 'value(status.url)'
 echo ""
-echo "ℹ️  Redis Caching: ${CACHING_ENABLED:-true}"
+if [ "${PRESERVE_LIVE_CONFIG}" = "true" ]; then
+  echo "ℹ️  Service config preserved from the live revision (not read from .env)."
+fi
+echo "ℹ️  Redis Caching (from local .env, informational only when config is preserved): ${CACHING_ENABLED:-true}"
 if [ -n "$REDIS_HOST" ]; then
   echo "   Redis Host: ${REDIS_HOST}"
 else
