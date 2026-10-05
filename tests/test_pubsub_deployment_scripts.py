@@ -94,3 +94,34 @@ def test_verification_script_checks_runtime_and_subscription_contract() -> None:
         "roles/pubsub.subscriber",
     ):
         assert fragment in verification_script
+
+
+def test_deploy_script_refuses_to_ship_the_live_service_to_full_traffic_by_default() -> None:
+    import subprocess
+
+    # The guard runs before any docker/gcloud call, so this is safe to execute.
+    result = subprocess.run(
+        ["bash", str(REPO_ROOT / "deploy.sh")],
+        capture_output=True,
+        text=True,
+        env={"PATH": "/usr/bin:/bin"},
+        cwd=REPO_ROOT,
+    )
+
+    assert result.returncode != 0
+    assert "Refusing to deploy the live service" in result.stdout
+    assert "NO_TRAFFIC=true" in result.stdout
+
+
+def test_deploy_script_supports_a_zero_traffic_canary_revision() -> None:
+    assert '--no-traffic --tag "${TRAFFIC_TAG}"' in DEPLOY_SCRIPT
+    assert "IMAGE_TAG" in DEPLOY_SCRIPT
+    assert "--min-instances 0" in DEPLOY_SCRIPT
+
+
+def test_workers_receive_r2_credentials_from_secret_manager_only() -> None:
+    assert "R2_ACCESS_KEY_ID=${r2_secret_name}" not in PUBSUB_SCRIPT  # bound per pair below
+    assert 'FAST_SECRETS+=",${r2_env_name}=${r2_secret_name}:latest"' in PUBSUB_SCRIPT
+    assert 'MENU_SECRETS+=",${r2_env_name}=${r2_secret_name}:latest"' in PUBSUB_SCRIPT
+    # Never copied into plain env vars by the .env passthrough.
+    assert "R2_ACCESS_KEY_ID|R2_SECRET_ACCESS_KEY)" in PUBSUB_SCRIPT

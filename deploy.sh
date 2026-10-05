@@ -5,8 +5,27 @@ set -e
 PROJECT_ID="pinit-494520"
 IMAGE_NAME="pinit-recommendations"
 REGION="europe-west2"
-SERVICE_NAME="pinit-recommendations-api"
+SERVICE_NAME="${SERVICE_NAME:-pinit-recommendations-api}"
 AR_REPO="cloud-run-source-deploy"  # Artifact Registry repository
+
+# Rollout knobs (override via env)
+#   IMAGE_TAG            image tag to build/push (default: current git short SHA)
+#   NO_TRAFFIC=true      deploy a new revision with 0% traffic, reachable at a tag URL
+#                        (https://${TRAFFIC_TAG}---<service-url-host>) for testing; shift
+#                        traffic afterwards with `gcloud run services update-traffic`.
+#   TRAFFIC_TAG          tag for the no-traffic revision (default: canary)
+#   CONFIRM_FULL_ROLLOUT=yes
+#                        required to deploy the live service straight to 100% traffic
+IMAGE_TAG="${IMAGE_TAG:-$(git rev-parse --short HEAD 2>/dev/null || echo manual)}"
+TRAFFIC_TAG="${TRAFFIC_TAG:-canary}"
+
+if [ "${NO_TRAFFIC:-false}" != "true" ] && [ "${SERVICE_NAME}" = "pinit-recommendations-api" ] \
+   && [ "${CONFIRM_FULL_ROLLOUT:-}" != "yes" ]; then
+  echo "❌ Refusing to deploy the live service '${SERVICE_NAME}' straight to 100% traffic."
+  echo "   Canary first:  NO_TRAFFIC=true ./deploy.sh"
+  echo "   Or, knowingly: CONFIRM_FULL_ROLLOUT=yes ./deploy.sh"
+  exit 1
+fi
 
 # Cloud Run sizing knobs (override via env)
 API_CPU="${API_CPU:-2}"
@@ -36,7 +55,7 @@ gcloud artifacts repositories describe $AR_REPO --location=$REGION 2>/dev/null |
 # Configure Docker auth for Artifact Registry
 gcloud auth configure-docker ${REGION}-docker.pkg.dev --quiet
 
-AR_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_REPO}/${IMAGE_NAME}:latest"
+AR_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_REPO}/${IMAGE_NAME}:${IMAGE_TAG}"
 
 echo "🔨 Building Docker image for linux/amd64..."
 docker build --platform linux/amd64 -t $AR_IMAGE .
@@ -185,8 +204,15 @@ if [ -n "${R2_SECRET_ACCESS_KEY:-}" ]; then
   done
 fi
 
+TRAFFIC_ARGS=()
+if [ "${NO_TRAFFIC:-false}" = "true" ]; then
+  TRAFFIC_ARGS=(--no-traffic --tag "${TRAFFIC_TAG}")
+  echo "🐤 Canary deploy: new revision gets 0% traffic, tagged '${TRAFFIC_TAG}'."
+fi
+
 gcloud run deploy $SERVICE_NAME \
   --image $AR_IMAGE \
+  "${TRAFFIC_ARGS[@]}" \
   --platform managed \
   --region $REGION \
   --allow-unauthenticated \

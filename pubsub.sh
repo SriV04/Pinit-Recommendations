@@ -80,7 +80,7 @@ build_env_vars_from_dotenv() {
     if [[ "${line}" =~ ^([A-Za-z_][A-Za-z0-9_]*)= ]]; then
       local key="${BASH_REMATCH[1]}"
       case "${key}" in
-        SUPABASE_SERVICE_KEY|SUPABASE_SERVICE_ROLE_KEY|SUPABASE_SECRET_KEY|GOOGLE_PLACE_API_KEY|REDIS_PASSWORD|XAI_API_KEY)
+        SUPABASE_SERVICE_KEY|SUPABASE_SERVICE_ROLE_KEY|SUPABASE_SECRET_KEY|GOOGLE_PLACE_API_KEY|REDIS_PASSWORD|XAI_API_KEY|R2_ACCESS_KEY_ID|R2_SECRET_ACCESS_KEY)
           continue
           ;;
         GOOGLE_CLOUD_PROJECT|PUBSUB_ENABLED|PUBSUB_TOPIC_LOCATION_TASKS|PUBSUB_PROJECT_ID)
@@ -226,6 +226,24 @@ if gcloud secrets describe "xai-api-key" --project "${PROJECT}" >/dev/null 2>&1 
 elif [ -z "${XAI_API_KEY:-}" ]; then
   echo "❌ Secret xai-api-key has no enabled version and XAI_API_KEY is not set."
   exit 1
+fi
+
+# Cloudflare R2 photo storage. The photo tasks run in these workers, so they need the same
+# credentials as the API. They must live in Secret Manager and are never passed as plain env
+# vars (R2_ACCOUNT_ID, R2_BUCKET_NAME and PHOTO_CDN_BASE_URL are not secret and pass through .env).
+if [ -n "${R2_SECRET_ACCESS_KEY:-}" ]; then
+  for r2_pair in "R2_ACCESS_KEY_ID:r2-access-key-id" "R2_SECRET_ACCESS_KEY:r2-secret-access-key"; do
+    r2_env_name="${r2_pair%%:*}"
+    r2_secret_name="${r2_pair##*:}"
+    if gcloud secrets describe "${r2_secret_name}" --project "${PROJECT}" >/dev/null 2>&1 && has_enabled_secret_version "${r2_secret_name}"; then
+      FAST_SECRETS+=",${r2_env_name}=${r2_secret_name}:latest"
+      MENU_SECRETS+=",${r2_env_name}=${r2_secret_name}:latest"
+    else
+      echo "❌ R2 is configured in .env but secret '${r2_secret_name}' has no ENABLED version in project '${PROJECT}'."
+      echo "   Create it first (see deploy.sh for the exact commands) and grant the worker service account secretmanager.secretAccessor."
+      exit 1
+    fi
+  done
 fi
 
 : "${WARM_CACHE_ENABLED:=true}"
