@@ -273,7 +273,9 @@ if [ "${XAI_SECRET_ENABLED}" != "true" ] && [ -n "${XAI_API_KEY:-}" ]; then
   ENV_VARS+=",XAI_API_KEY=${escaped_xai}"
 fi
 
-IMAGE="europe-west2-docker.pkg.dev/${PROJECT}/cloud-run-source-deploy/pinit-recommendations:latest"
+# Must match the tag deploy.sh pushed (default: current git short SHA).
+IMAGE_TAG="${IMAGE_TAG:-$(git -C "${SCRIPT_DIR}" rev-parse --short HEAD 2>/dev/null || echo latest)}"
+IMAGE="europe-west2-docker.pkg.dev/${PROJECT}/cloud-run-source-deploy/pinit-recommendations:${IMAGE_TAG}"
 RUN_SA="${API_SA}"
 
 echo "🚀 Deploying request-based location workers..."

@@ -125,3 +125,9 @@ def test_workers_receive_r2_credentials_from_secret_manager_only() -> None:
     assert 'MENU_SECRETS+=",${r2_env_name}=${r2_secret_name}:latest"' in PUBSUB_SCRIPT
     # Never copied into plain env vars by the .env passthrough.
     assert "R2_ACCESS_KEY_ID|R2_SECRET_ACCESS_KEY)" in PUBSUB_SCRIPT
+
+
+def test_workers_deploy_the_same_image_tag_deploy_sh_pushes() -> None:
+    assert 'pinit-recommendations:${IMAGE_TAG}"' in PUBSUB_SCRIPT
+    assert "pinit-recommendations:latest" not in PUBSUB_SCRIPT
+    assert "pinit-recommendations:${IMAGE_TAG}" in DEPLOY_SCRIPT or "${IMAGE_NAME}:${IMAGE_TAG}" in DEPLOY_SCRIPT
