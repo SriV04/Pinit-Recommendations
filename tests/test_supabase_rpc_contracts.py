@@ -13,9 +13,9 @@ install_optional_dependency_stubs()
 from pinit.api.services.cache_service import ProximalCacheService
 from pinit.config.settings import CacheConfig
 
-V6_MIGRATION = REPO_ROOT / "supabase/migrations/20260427000000_v6_quality_score_bias.sql"
-KNN_FIX_MIGRATION = REPO_ROOT / "supabase/migrations/20260427002000_optimize_get_locations_with_pillars_knn.sql"
-FILL_LOCATIONS_MIGRATION = REPO_ROOT / "supabase/migrations/20260501170000_add_get_fill_locations_rpc.sql"
+V6_MIGRATION = REPO_ROOT / "supabase/_archive/migrations/20260427000000_v6_quality_score_bias.sql"
+KNN_FIX_MIGRATION = REPO_ROOT / "supabase/_archive/migrations/20260427002000_optimize_get_locations_with_pillars_knn.sql"
+FILL_LOCATIONS_MIGRATION = REPO_ROOT / "supabase/_archive/migrations/20260501170000_add_get_fill_locations_rpc.sql"
 PROXIMAL_ROUTER = REPO_ROOT / "src/pinit/api/routers/proximal.py"
 
 

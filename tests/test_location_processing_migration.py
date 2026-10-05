@@ -1,7 +1,9 @@
 from pathlib import Path
 
 
-MIGRATIONS = Path(__file__).resolve().parents[1] / "supabase" / "migrations"
+# The live schema now lives in the login repo; this repo keeps its history in
+# supabase/_archive (see supabase/README.md).
+MIGRATIONS = Path(__file__).resolve().parents[1] / "supabase" / "_archive" / "migrations"
 
 
 def _cooldown_sql() -> str:

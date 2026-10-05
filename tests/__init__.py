@@ -7,6 +7,7 @@ are enough to make imports deterministic in a local unit-test environment.
 
 from __future__ import annotations
 
+import importlib.util
 import sys
 import types
 
@@ -79,7 +80,9 @@ def install_optional_dependency_stubs() -> None:
         openai_module.AsyncOpenAI = AsyncOpenAI
         sys.modules["openai"] = openai_module
 
-    if "pandas" not in sys.modules:
+    # Only stub pandas when it is genuinely not installed; shadowing a real
+    # install breaks the endpoint tests that build DataFrames.
+    if "pandas" not in sys.modules and importlib.util.find_spec("pandas") is None:
         pandas_module = types.ModuleType("pandas")
 
         def isna(value):
