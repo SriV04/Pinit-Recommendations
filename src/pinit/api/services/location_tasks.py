@@ -4,7 +4,7 @@ import asyncio
 import logging
 import math
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from pinit.api.schemas_location_tasks import (
     DetailsEnrichPayload,
@@ -29,8 +29,6 @@ from pinit.api.services.proximal_service import (
     resolve_google_place_id_for_location,
 )
 from pinit.api.services.vibe_tagging import generate_vibe_tags_for_location
-from pinit.config.secrets import GOOGLE_PLACE_API_KEY
-from pinit.integrations import r2_photos
 from pinit.integrations.supabase import get_supabase_service
 
 logger = logging.getLogger(__name__)
@@ -755,89 +753,16 @@ async def run_pipeline_inline(
 
 
 async def _run_photo_pipeline(location_id: int, photos_from_details: List[Dict[str, Any]]) -> None:
-    from pinit.api.services.proximal_service import download_photo
+    """Store a place's first photos through the single photo step. A row
+    without photo metadata gets a Details refresh there, rather than being
+    marked unavailable."""
+    from pinit.api.services.location_photos import (
+        PREFETCH_PHOTOS,
+        ensure_location_photos,
+    )
 
-    api_key = GOOGLE_PLACE_API_KEY
-    if not api_key:
-        logger.warning("photos: GOOGLE_PLACE_API_KEY missing; skipping photo pipeline for %s", location_id)
-        return
-
-    bg_supabase = get_supabase_service()
-
-    if not photos_from_details:
-        logger.warning(
-            "photos: no photos for location %s — marking image_unavailable",
-            location_id,
-        )
-        try:
-            await asyncio.to_thread(bg_supabase.mark_location_image_unavailable, location_id)
-        except Exception as exc:
-            logger.error("photos: mark_location_image_unavailable failed for %s: %s", location_id, exc)
-        return
-
-    primary = photos_from_details[0]
-    primary_name = primary.get("name") if isinstance(primary, dict) else None
-    if not primary_name:
-        logger.warning(
-            "photos: first photo for location %s has no resource name — marking image_unavailable",
-            location_id,
-        )
-        try:
-            await asyncio.to_thread(bg_supabase.mark_location_image_unavailable, location_id)
-        except Exception as exc:
-            logger.error("photos: mark_location_image_unavailable failed for %s: %s", location_id, exc)
-        return
-
-    ingest_px = r2_photos.ingest_max_px()
-    primary_dl = await asyncio.to_thread(download_photo, primary_name, api_key, ingest_px, ingest_px)
-    if primary_dl is None:
-        logger.error(
-            "photos: primary photo download failed for location %s (name=%s)",
-            location_id,
-            primary_name,
-        )
-        return
-
-    primary_bytes, primary_ct = primary_dl
-    try:
-        await asyncio.to_thread(bg_supabase.upload_location_photo, location_id, primary_bytes, primary_ct, None)
-    except Exception as exc:
-        logger.error("photos: primary photo upload failed for location %s: %s", location_id, exc)
-        return
-
-    try:
-        await asyncio.to_thread(
-            bg_supabase.mark_location_image_uploaded,
-            location_id,
-            photos_from_details,
-            primary_name,
-        )
-    except Exception as exc:
-        logger.error("photos: mark_location_image_uploaded failed for location %s: %s", location_id, exc)
-        return
-
-    extras_uploaded = 0
-    for idx, extra in enumerate(photos_from_details[1:10], start=1):
-        extra_name = extra.get("name") if isinstance(extra, dict) else None
-        if not extra_name:
-            continue
-
-        extra_dl = await asyncio.to_thread(download_photo, extra_name, api_key, ingest_px, ingest_px)
-        if extra_dl is None:
-            logger.warning("photos: extra photo %d download failed for location %s", idx, location_id)
-            continue
-
-        extra_bytes, extra_ct = extra_dl
-        try:
-            await asyncio.to_thread(bg_supabase.upload_location_photo, location_id, extra_bytes, extra_ct, idx)
-            extras_uploaded += 1
-        except Exception as exc:
-            logger.error("photos: extra photo %d upload failed for location %s: %s", idx, location_id, exc)
-
-    if extras_uploaded > 0:
-        try:
-            await asyncio.to_thread(bg_supabase.mark_location_extra_photos_stored, location_id, extras_uploaded)
-        except Exception as exc:
-            logger.error("photos: mark_location_extra_photos_stored failed for %s: %s", location_id, exc)
-
-    logger.info("photos: pipeline complete for location %s: primary + %d extras", location_id, extras_uploaded)
+    await ensure_location_photos(
+        location_id,
+        PREFETCH_PHOTOS,
+        photos=photos_from_details or None,
+    )

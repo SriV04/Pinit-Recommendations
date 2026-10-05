@@ -29,6 +29,8 @@ from pinit.api.schemas import (
     HiddenGemsResponse,
     IndividualScore,
     LocationCoordinatesResponse,
+    LocationPhotosRequest,
+    LocationPhotosResponse,
     MagicLocationRecommendation,
     LocationRecommendation,
     MagicSearchRequest,
@@ -41,7 +43,6 @@ from pinit.api.schemas import (
     TagMatch,
     UserVibeScore,
 )
-from pinit.config.secrets import GOOGLE_PLACE_API_KEY
 from pinit.api.services.proximal_service import (
     add_location_emoji,
     create_location_from_place_details,
@@ -1283,6 +1284,8 @@ async def get_proximal_recommendations(request: ProximalRequest) -> ProximalResp
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     )
 
+    await _queue_missing_photos(recommendations)
+
     return ProximalResponse(
         user_id=request.user_id,
         center_lat=request.latitude,
@@ -1386,140 +1389,14 @@ async def _run_photo_pipeline(
     location_id: int,
     photos_from_details: List[Dict[str, Any]],
 ) -> None:
-    from pinit.api.services.proximal_service import download_photo
-    from pinit.integrations import r2_photos
-
-    bg_supabase = get_supabase_service()
-
-    if not photos_from_details:
-        logger.warning(
-            "No photos returned by Places API for location %s — marking image_unavailable",
-            location_id,
-        )
-        try:
-            await asyncio.to_thread(bg_supabase.mark_location_image_unavailable, location_id)
-        except Exception as exc:
-            logger.error(
-                "mark_location_image_unavailable failed for %s: %s",
-                location_id,
-                exc,
-            )
-        return
-
-    primary = photos_from_details[0]
-    primary_name = primary.get("name") if isinstance(primary, dict) else None
-    if not primary_name:
-        logger.warning(
-            "First photo for location %s has no resource name — marking image_unavailable",
-            location_id,
-        )
-        try:
-            await asyncio.to_thread(bg_supabase.mark_location_image_unavailable, location_id)
-        except Exception as exc:
-            logger.error(
-                "mark_location_image_unavailable failed for %s: %s",
-                location_id,
-                exc,
-            )
-        return
-
-    ingest_px = r2_photos.ingest_max_px()
-    primary_dl = await asyncio.to_thread(
-        download_photo, primary_name, GOOGLE_PLACE_API_KEY, ingest_px, ingest_px
+    """Store a new place's first photos through the single photo step."""
+    from pinit.api.services.location_photos import (
+        PREFETCH_PHOTOS,
+        ensure_location_photos,
     )
-    if primary_dl is None:
-        logger.error(
-            "Primary photo download failed for location %s (name=%s)",
-            location_id,
-            primary_name,
-        )
-        return
 
-    primary_bytes, primary_ct = primary_dl
-    try:
-        await asyncio.to_thread(
-            bg_supabase.upload_location_photo,
-            location_id,
-            primary_bytes,
-            primary_ct,
-            None,
-        )
-    except Exception as exc:
-        logger.error(
-            "Primary photo upload failed for location %s: %s",
-            location_id,
-            exc,
-        )
-        return
-
-    try:
-        await asyncio.to_thread(
-            bg_supabase.mark_location_image_uploaded,
-            location_id,
-            photos_from_details,
-            primary_name,
-        )
-    except Exception as exc:
-        logger.error(
-            "mark_location_image_uploaded failed for location %s: %s",
-            location_id,
-            exc,
-        )
-        return
-
-    extras_uploaded = 0
-    for idx, extra in enumerate(photos_from_details[1:10], start=1):
-        extra_name = extra.get("name") if isinstance(extra, dict) else None
-        if not extra_name:
-            continue
-
-        extra_dl = await asyncio.to_thread(
-            download_photo, extra_name, GOOGLE_PLACE_API_KEY, ingest_px, ingest_px
-        )
-        if extra_dl is None:
-            logger.warning(
-                "Extra photo %d download failed for location %s",
-                idx,
-                location_id,
-            )
-            continue
-
-        extra_bytes, extra_ct = extra_dl
-        try:
-            await asyncio.to_thread(
-                bg_supabase.upload_location_photo,
-                location_id,
-                extra_bytes,
-                extra_ct,
-                idx,
-            )
-            extras_uploaded += 1
-        except Exception as exc:
-            logger.error(
-                "Extra photo %d upload failed for location %s: %s",
-                idx,
-                location_id,
-                exc,
-            )
-
-    if extras_uploaded > 0:
-        try:
-            await asyncio.to_thread(
-                bg_supabase.mark_location_extra_photos_stored,
-                location_id,
-                extras_uploaded,
-            )
-        except Exception as exc:
-            logger.error(
-                "mark_location_extra_photos_stored failed for %s: %s",
-                location_id,
-                exc,
-            )
-
-    logger.info(
-        "Photo pipeline complete for location %s: primary + %d extras",
-        location_id,
-        extras_uploaded,
+    await ensure_location_photos(
+        location_id, PREFETCH_PHOTOS, photos=photos_from_details or []
     )
 
 
@@ -1675,6 +1552,55 @@ async def _dispatch_location_processing(payload: ProcessLocationPayload) -> None
         payload.source,
     )
     await dispatcher.dispatch(payload)
+
+
+async def _queue_missing_photos(recommendations: List[LocationRecommendation]) -> None:
+    """Store first photos for returned places that have none, in the
+    background, so the app never has to ask for them."""
+    from pinit.api.services.location_photos import schedule_missing_photos
+
+    try:
+        queued = await schedule_missing_photos(
+            (
+                {
+                    "location_id": rec.location_id,
+                    "image_stored": rec.image_stored,
+                    "image_unavailable": rec.image_unavailable,
+                }
+                for rec in recommendations
+            ),
+            get_background_job_runner().enqueue,
+        )
+        if queued:
+            logger.info("photos: queued %d places with no stored photo", queued)
+    except Exception as exc:
+        logger.warning("photos: could not queue missing photos: %s", exc)
+
+
+@router.post(
+    "/locations/{location_id}/photos",
+    response_model=LocationPhotosResponse,
+)
+async def location_photos(
+    location_id: int,
+    request: Optional[LocationPhotosRequest] = None,
+) -> LocationPhotosResponse:
+    """Gallery for a place the user opened: stored photos (CDN), then Google
+    photo links for the rest, which are copied into R2 in the background."""
+    from pinit.api.services.location_photos import gallery_for_tap
+
+    photos = await gallery_for_tap(
+        location_id,
+        (request or LocationPhotosRequest()).max_photos,
+        supabase=get_supabase_service(),
+        enqueue=get_background_job_runner().enqueue,
+    )
+    if photos is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Location {location_id} was not found",
+        )
+    return LocationPhotosResponse(location_id=location_id, photos=photos)
 
 
 @router.post(

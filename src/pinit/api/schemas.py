@@ -243,6 +243,18 @@ class ProcessLocationResponse(BaseModel):
     request_id: str
 
 
+class LocationPhotosRequest(BaseModel):
+    max_photos: int = Field(10, ge=1, le=10, description="Gallery size cap")
+
+
+class LocationPhotosResponse(BaseModel):
+    location_id: int
+    photos: List[str] = Field(
+        default_factory=list,
+        description="Display order: stored CDN URLs, then short-lived Google photo URLs",
+    )
+
+
 class MagicSearchRequest(BaseModel):
     user_id: str = Field(..., description="User identifier")
     latitude: float = Field(..., description="Center point latitude", ge=-90, le=90)
