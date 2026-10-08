@@ -4,7 +4,7 @@ import asyncio
 import logging
 import math
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
 from pinit.api.schemas_location_tasks import (
     DetailsEnrichPayload,
@@ -590,7 +590,10 @@ async def emoji_task(payload: EmojiPayload) -> None:
 
 async def photos_task(payload: PhotosPayload) -> None:
     row = await _get_location(payload.location_id)
-    if _truthy(row.get("image_stored")) or _truthy(row.get("image_unavailable")):
+    # A stored row only gets more photos when a tap already paid for their
+    # links; otherwise this stays a primary-photo step.
+    already_stored = _truthy(row.get("image_stored")) and not payload.photo_uris
+    if already_stored or _truthy(row.get("image_unavailable")):
         logger.info(
             "photos: skip (image already stored/unavailable) (location_id=%s request_id=%s)",
             payload.location_id,
@@ -599,7 +602,12 @@ async def photos_task(payload: PhotosPayload) -> None:
         return
 
     photos_from_details: List[Dict[str, Any]] = row.get("photos") or []
-    await _run_photo_pipeline(payload.location_id, photos_from_details)
+    await _run_photo_pipeline(
+        payload.location_id,
+        photos_from_details,
+        want=payload.want,
+        photo_uris=payload.photo_uris,
+    )
 
 
 async def menu_vibe_task(payload: MenuVibePayload) -> None:
@@ -752,7 +760,13 @@ async def run_pipeline_inline(
         )
 
 
-async def _run_photo_pipeline(location_id: int, photos_from_details: List[Dict[str, Any]]) -> None:
+async def _run_photo_pipeline(
+    location_id: int,
+    photos_from_details: List[Dict[str, Any]],
+    *,
+    want: Optional[int] = None,
+    photo_uris: Optional[List[Tuple[str, str]]] = None,
+) -> None:
     """Store a place's first photos through the single photo step. A row
     without photo metadata gets a Details refresh there, rather than being
     marked unavailable."""
@@ -763,6 +777,7 @@ async def _run_photo_pipeline(location_id: int, photos_from_details: List[Dict[s
 
     await ensure_location_photos(
         location_id,
-        PREFETCH_PHOTOS,
+        want or PREFETCH_PHOTOS,
         photos=photos_from_details or None,
+        photo_uris=photo_uris or None,
     )

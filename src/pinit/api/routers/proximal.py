@@ -29,6 +29,8 @@ from pinit.api.schemas import (
     HiddenGemsResponse,
     IndividualScore,
     LocationCoordinatesResponse,
+    LocationPhotosEnsureRequest,
+    LocationPhotosEnsureResponse,
     LocationPhotosRequest,
     LocationPhotosResponse,
     MagicLocationRecommendation,
@@ -57,7 +59,7 @@ from pinit.api.services.magic_google_service import (
 from pinit.api.services.magic_ai_enrichment import build_magic_ai_enrichment_payload
 from pinit.api.services.magic_ai_signature import build_magic_ai_signature
 from pinit.api.services.magic_intent_parser import normalise_prompt, parse_magic_intent
-from pinit.api.schemas_location_tasks import ProcessLocationPayload
+from pinit.api.schemas_location_tasks import PhotosPayload, ProcessLocationPayload
 from pinit.api.services.location_processing_admission import (
     admit_location_processing,
 )
@@ -1554,6 +1556,17 @@ async def _dispatch_location_processing(payload: ProcessLocationPayload) -> None
     await dispatcher.dispatch(payload)
 
 
+async def _dispatch_photos(payload: PhotosPayload) -> None:
+    """Hand a photo job to the location-task worker. A failed publish is
+    logged, never surfaced: the next view or tap queues it again."""
+    try:
+        await _dispatch_location_processing(payload)
+    except Exception as exc:
+        logger.warning(
+            "photos: dispatch failed for location %s: %s", payload.location_id, exc
+        )
+
+
 async def _queue_missing_photos(recommendations: List[LocationRecommendation]) -> None:
     """Store first photos for returned places that have none, in the
     background, so the app never has to ask for them."""
@@ -1569,7 +1582,7 @@ async def _queue_missing_photos(recommendations: List[LocationRecommendation]) -
                 }
                 for rec in recommendations
             ),
-            get_background_job_runner().enqueue,
+            _dispatch_photos,
         )
         if queued:
             logger.info("photos: queued %d places with no stored photo", queued)
@@ -1593,7 +1606,7 @@ async def location_photos(
         location_id,
         (request or LocationPhotosRequest()).max_photos,
         supabase=get_supabase_service(),
-        enqueue=get_background_job_runner().enqueue,
+        dispatch=_dispatch_photos,
     )
     if photos is None:
         raise HTTPException(
@@ -1601,6 +1614,25 @@ async def location_photos(
             detail=f"Location {location_id} was not found",
         )
     return LocationPhotosResponse(location_id=location_id, photos=photos)
+
+
+@router.post(
+    "/locations/photos/ensure",
+    response_model=LocationPhotosEnsureResponse,
+)
+async def ensure_location_photos_for_list(
+    request: LocationPhotosEnsureRequest,
+) -> LocationPhotosEnsureResponse:
+    """Primary photo for each listed place without one in the CDN yet: the
+    stored URL, or a short-lived Google link while the worker stores it."""
+    from pinit.api.services.location_photos import ensure_primary_photos
+
+    photos = await ensure_primary_photos(
+        request.location_ids,
+        supabase=get_supabase_service(),
+        dispatch=_dispatch_photos,
+    )
+    return LocationPhotosEnsureResponse(photos=photos)
 
 
 @router.post(

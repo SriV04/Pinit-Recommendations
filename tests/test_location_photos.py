@@ -44,12 +44,18 @@ def _supabase(row):
     return supabase
 
 
-class _Enqueue:
-    def __init__(self):
-        self.jobs = []
+class _Dispatch:
+    """Records the ``photos`` tasks handed to the worker."""
 
-    async def __call__(self, name, handler):
-        self.jobs.append((name, handler))
+    def __init__(self):
+        self.payloads = []
+
+    async def __call__(self, payload):
+        self.payloads.append(payload)
+
+    @property
+    def ids(self):
+        return [p.location_id for p in self.payloads]
 
 
 def _download_ok(name):
@@ -123,7 +129,7 @@ class EnsureLocationPhotosTest(unittest.TestCase):
 
     def test_google_with_no_photos_marks_unavailable_without_a_details_call(self):
         supabase = _supabase(_row(photos=None))
-        with patch.object(lp, "_refresh_details") as refresh:
+        with patch.object(lp, "_refresh_photo_names") as refresh:
             stored = asyncio.run(lp.ensure_location_photos(7, 3, supabase=supabase, photos=[]))
         self.assertEqual(stored, 0)
         refresh.assert_not_called()
@@ -131,7 +137,7 @@ class EnsureLocationPhotosTest(unittest.TestCase):
 
     def test_row_without_metadata_refreshes_details_once(self):
         supabase = _supabase(_row(photos=None))
-        with patch.object(lp, "_refresh_details", return_value={"photos": _photos(2)}) as refresh, \
+        with patch.object(lp, "_refresh_photo_names", return_value={"photos": _photos(2)}) as refresh, \
                 patch.object(lp, "_from_name", side_effect=_download_ok):
             stored = asyncio.run(lp.ensure_location_photos(7, 3, supabase=supabase))
         refresh.assert_called_once()
@@ -172,13 +178,14 @@ class ScheduleMissingPhotosTest(unittest.TestCase):
     def test_queues_only_places_without_photos_capped_per_request(self):
         rows = [{"location_id": 1, "image_stored": True}, {"location_id": 2, "image_unavailable": True}]
         rows += [{"location_id": 100 + i, "image_stored": False} for i in range(15)]
-        enqueue = _Enqueue()
-        queued = asyncio.run(lp.schedule_missing_photos(rows, enqueue))
+        dispatch = _Dispatch()
+        queued = asyncio.run(lp.schedule_missing_photos(rows, dispatch))
         self.assertEqual(queued, lp.MAX_BACKGROUND_PER_REQUEST)
-        names = [name for name, _ in enqueue.jobs]
-        self.assertEqual(names[0], "location:100:photos")
-        self.assertNotIn("location:1:photos", names)
-        self.assertNotIn("location:2:photos", names)
+        self.assertEqual(dispatch.ids[0], 100)
+        self.assertNotIn(1, dispatch.ids)
+        self.assertNotIn(2, dispatch.ids)
+        self.assertTrue(all(p.task_type == "photos" for p in dispatch.payloads))
+        self.assertTrue(all(p.want == lp.LIST_PHOTOS == 1 for p in dispatch.payloads))
 
 
 class GalleryForTapTest(unittest.TestCase):
@@ -196,9 +203,9 @@ class GalleryForTapTest(unittest.TestCase):
 
     def test_stored_cdn_urls_then_google_links_and_queues_the_copy(self):
         supabase = _supabase(_row(image_stored=True, photos=_photos(4)))
-        enqueue = _Enqueue()
+        dispatch = _Dispatch()
         with patch.object(lp, "google_photo_uri", side_effect=lambda name: f"https://lh3/{name[-1]}"):
-            urls = asyncio.run(lp.gallery_for_tap(7, 10, supabase=supabase, enqueue=enqueue))
+            urls = asyncio.run(lp.gallery_for_tap(7, 10, supabase=supabase, dispatch=dispatch))
 
         self.assertEqual(urls, [
             "https://img.example.com/l/7/0_hero.webp",
@@ -206,53 +213,272 @@ class GalleryForTapTest(unittest.TestCase):
             "https://lh3/2",
             "https://lh3/3",
         ])
-        self.assertEqual([name for name, _ in enqueue.jobs], ["location:7:photos"])
+        self.assertEqual(dispatch.ids, [7])
+        job = dispatch.payloads[0]
+        self.assertEqual(job.want, 4)
+        self.assertEqual(
+            [tuple(p) for p in job.photo_uris],
+            [(f"places/p/photos/{i}", f"https://lh3/{i}") for i in (1, 2, 3)],
+        )
 
     def test_a_failed_link_truncates_so_order_matches_what_gets_stored(self):
         supabase = _supabase(_row(image_stored=True, photos=_photos(4)))
-        enqueue = _Enqueue()
+        dispatch = _Dispatch()
 
         def uri(name):
             return None if name.endswith("/2") else f"https://lh3/{name[-1]}"
 
         with patch.object(lp, "google_photo_uri", side_effect=uri):
-            urls = asyncio.run(lp.gallery_for_tap(7, 10, supabase=supabase, enqueue=enqueue))
+            urls = asyncio.run(lp.gallery_for_tap(7, 10, supabase=supabase, dispatch=dispatch))
         self.assertEqual(urls, ["https://img.example.com/l/7/0_hero.webp", "https://lh3/1"])
 
     def test_fully_stored_gallery_makes_no_google_calls(self):
         supabase = _supabase(_row(image_stored=True, extra_photos_stored=2, photos=_photos(3)))
-        enqueue = _Enqueue()
+        dispatch = _Dispatch()
         with patch.object(lp, "google_photo_uri") as google:
-            urls = asyncio.run(lp.gallery_for_tap(7, 10, supabase=supabase, enqueue=enqueue))
+            urls = asyncio.run(lp.gallery_for_tap(7, 10, supabase=supabase, dispatch=dispatch))
         self.assertEqual(len(urls), 3)
         google.assert_not_called()
-        self.assertEqual(enqueue.jobs, [])
+        self.assertEqual(dispatch.payloads, [])
 
-    def test_no_metadata_returns_quickly_and_prefetches_in_background(self):
+    def test_no_metadata_fetches_details_inline_and_returns_photos(self):
         supabase = _supabase(_row(photos=None))
-        enqueue = _Enqueue()
-        with patch.object(lp, "google_photo_uri") as google:
-            urls = asyncio.run(lp.gallery_for_tap(7, 10, supabase=supabase, enqueue=enqueue))
+        dispatch = _Dispatch()
+        with patch.object(lp, "_refresh_photo_names", return_value={"photos": _photos(2)}) as details, \
+                patch.object(lp, "google_photo_uri", side_effect=lambda name: f"https://lh3/{name[-1]}"):
+            urls = asyncio.run(lp.gallery_for_tap(7, 10, supabase=supabase, dispatch=dispatch))
+        details.assert_called_once()
+        self.assertEqual(urls, ["https://lh3/0", "https://lh3/1"])
+        self.assertEqual(dispatch.ids, [7])
+        self.assertEqual(dispatch.payloads[0].want, 2)
+
+    def test_no_metadata_and_details_fail_queues_the_full_step(self):
+        supabase = _supabase(_row(photos=None))
+        dispatch = _Dispatch()
+        with patch.object(lp, "_refresh_photo_names", return_value=None), \
+                patch.object(lp, "google_photo_uri") as google:
+            urls = asyncio.run(lp.gallery_for_tap(7, 10, supabase=supabase, dispatch=dispatch))
         self.assertEqual(urls, [])
         google.assert_not_called()
-        self.assertEqual(len(enqueue.jobs), 1)
+        self.assertEqual(dispatch.ids, [7])
+        self.assertEqual(dispatch.payloads[0].photo_uris, [])
+
+    def test_details_with_no_photos_marks_unavailable(self):
+        supabase = _supabase(_row(photos=None))
+        with patch.object(lp, "_refresh_photo_names", return_value={"photos": []}):
+            urls = asyncio.run(lp.gallery_for_tap(7, 10, supabase=supabase, dispatch=_Dispatch()))
+        self.assertEqual(urls, [])
+        supabase.mark_location_image_unavailable.assert_called_once_with(7)
 
     def test_unavailable_and_missing_places(self):
-        enqueue = _Enqueue()
+        dispatch = _Dispatch()
         self.assertEqual(
-            asyncio.run(lp.gallery_for_tap(7, 10, supabase=_supabase(_row(image_unavailable=True)), enqueue=enqueue)),
+            asyncio.run(lp.gallery_for_tap(7, 10, supabase=_supabase(_row(image_unavailable=True)), dispatch=dispatch)),
             [],
         )
-        self.assertIsNone(asyncio.run(lp.gallery_for_tap(7, 10, supabase=_supabase(None), enqueue=enqueue)))
+        self.assertIsNone(asyncio.run(lp.gallery_for_tap(7, 10, supabase=_supabase(None), dispatch=dispatch)))
 
     def test_without_r2_stored_photos_use_supabase_storage(self):
         supabase = _supabase(_row(image_stored=True, extra_photos_stored=1, photos=_photos(2)))
         with patch.object(lp.r2_photos, "is_configured", return_value=False):
-            urls = asyncio.run(lp.gallery_for_tap(7, 10, supabase=supabase, enqueue=_Enqueue()))
+            urls = asyncio.run(lp.gallery_for_tap(7, 10, supabase=supabase, dispatch=_Dispatch()))
         self.assertEqual(urls, [
             "https://proj.supabase.co/storage/v1/object/public/location_photos/7.jpg",
             "https://proj.supabase.co/storage/v1/object/public/location_photos/7_1.jpg",
         ])
+
+
+class EnsurePrimaryPhotosTest(unittest.TestCase):
+    def setUp(self):
+        patched = patch.multiple(secrets, PHOTO_CDN_BASE_URL="https://img.example.com")
+        patched.start()
+        self.addCleanup(patched.stop)
+        r2 = patch.object(lp.r2_photos, "is_configured", return_value=True)
+        r2.start()
+        self.addCleanup(r2.stop)
+
+    def test_stored_link_or_queue_per_place(self):
+        supabase = MagicMock()
+        supabase.get_locations_by_ids.return_value = [
+            _row(location_id=1, image_stored=True),
+            _row(location_id=2),
+            _row(location_id=3, photos=None),
+            _row(location_id=4, image_unavailable=True),
+        ]
+        dispatch = _Dispatch()
+        with patch.object(lp, "google_photo_uri", return_value="https://lh3/x") as google:
+            urls = asyncio.run(lp.ensure_primary_photos([1, 2, 3, 4, 2], supabase=supabase, dispatch=dispatch))
+
+        self.assertEqual(urls, {1: "https://img.example.com/l/1/0_hero.webp", 2: "https://lh3/x"})
+        google.assert_called_once_with("places/p/photos/0")
+        supabase.get_locations_by_ids.assert_called_once_with([1, 2, 3, 4])
+        self.assertEqual(sorted(dispatch.ids), [2, 3])
+        by_id = {p.location_id: p for p in dispatch.payloads}
+        self.assertEqual([tuple(p) for p in by_id[2].photo_uris], [("places/p/photos/0", "https://lh3/x")])
+        self.assertEqual(by_id[3].photo_uris, [])
+        self.assertEqual({p.want for p in dispatch.payloads}, {lp.LIST_PHOTOS})
+
+    def test_a_failed_link_still_queues_storage(self):
+        supabase = MagicMock()
+        supabase.get_locations_by_ids.return_value = [_row(location_id=2)]
+        dispatch = _Dispatch()
+        with patch.object(lp, "google_photo_uri", return_value=None):
+            urls = asyncio.run(lp.ensure_primary_photos([2], supabase=supabase, dispatch=dispatch))
+        self.assertEqual(urls, {})
+        self.assertEqual(dispatch.ids, [2])
+
+    def test_caps_ids_per_call(self):
+        supabase = MagicMock()
+        supabase.get_locations_by_ids.return_value = []
+        asyncio.run(lp.ensure_primary_photos(list(range(100)), supabase=supabase, dispatch=_Dispatch()))
+        self.assertEqual(len(supabase.get_locations_by_ids.call_args.args[0]), lp.MAX_ENSURE_IDS)
+
+
+class EnsureWithLinksTest(unittest.TestCase):
+    def test_links_matched_by_name_and_expired_link_falls_back_to_name(self):
+        supabase = _supabase(_row(image_stored=True, photos=_photos(4)))
+        fetched = []
+
+        def fetch_uri(uri):
+            fetched.append(uri)
+            return None if uri.endswith("/2") else (b"x", "image/jpeg")
+
+        def by_name(name):
+            def fetch():
+                fetched.append(name)
+                return (b"y", "image/jpeg")
+            return fetch
+
+        pairs = [("places/p/photos/2", "https://lh3/2"), ("places/p/photos/1", "https://lh3/1")]
+        with patch.object(lp, "_acquire", return_value=lambda: None), \
+                patch.object(lp, "_fetch_uri", side_effect=fetch_uri), \
+                patch.object(lp, "_from_name", side_effect=by_name):
+            stored = asyncio.run(lp.ensure_location_photos(7, 3, supabase=supabase, photo_uris=pairs))
+
+        self.assertEqual(stored, 3)
+        self.assertEqual(sorted(fetched), ["https://lh3/1", "https://lh3/2", "places/p/photos/2"])
+        indices = [c.args[3] for c in supabase.upload_location_photo.call_args_list]
+        self.assertEqual(indices, [1, 2])
+
+    def test_links_without_names_are_stored_without_a_details_call(self):
+        supabase = _supabase(_row(photos=None))
+        with patch.object(lp, "_acquire", return_value=lambda: None), \
+                patch.object(lp, "_refresh_photo_names") as details, \
+                patch.object(lp, "_fetch_uri", return_value=(b"x", "image/jpeg")):
+            stored = asyncio.run(
+                lp.ensure_location_photos(7, 1, supabase=supabase, photo_uris=[("places/p/photos/0", "https://lh3/0")])
+            )
+        self.assertEqual(stored, 1)
+        details.assert_not_called()
+
+
+def _fresh(n):
+    return [{"name": f"places/p/photos/fresh{i}"} for i in range(n)]
+
+
+class StalePhotoNamesTest(unittest.TestCase):
+    def test_google_400_invalid_argument_means_stale(self):
+        response = MagicMock(status_code=400, text='{"error": {"status": "INVALID_ARGUMENT"}}')
+        with patch.object(lp.requests, "get", return_value=response):
+            with self.assertRaises(lp.StalePhotoName):
+                lp.google_photo_uri("places/p/photos/0")
+
+    def test_expired_names_refresh_details_once_and_store_fresh_ones(self):
+        supabase = _supabase(_row(photos=_photos(3)))
+
+        def by_name(name):
+            def fetch():
+                if "fresh" not in name:
+                    raise lp.StalePhotoName(name)
+                return (name.encode(), "image/jpeg")
+            return fetch
+
+        with patch.object(lp, "_acquire", return_value=lambda: None), \
+                patch.object(lp, "_from_name", side_effect=by_name), \
+                patch.object(lp, "_refresh_photo_names", return_value={"photos": _fresh(3)}) as details:
+            stored = asyncio.run(lp.ensure_location_photos(7, 3, supabase=supabase))
+
+        self.assertEqual(stored, 3)
+        details.assert_called_once()
+        uploaded = [c.args[1] for c in supabase.upload_location_photo.call_args_list]
+        self.assertEqual(uploaded, [f"places/p/photos/fresh{i}".encode() for i in range(3)])
+        self.assertEqual(supabase.mark_location_image_uploaded.call_args.args[2], "places/p/photos/fresh0")
+
+    def test_still_stale_after_refresh_gives_up_without_looping(self):
+        supabase = _supabase(_row(photos=_photos(3)))
+
+        def stale(name):
+            def fetch():
+                raise lp.StalePhotoName(name)
+            return fetch
+
+        with patch.object(lp, "_acquire", return_value=lambda: None), \
+                patch.object(lp, "_from_name", side_effect=stale), \
+                patch.object(lp, "_refresh_photo_names", return_value={"photos": _fresh(3)}) as details:
+            stored = asyncio.run(lp.ensure_location_photos(7, 3, supabase=supabase))
+        self.assertEqual(stored, 0)
+        details.assert_called_once()
+        supabase.upload_location_photo.assert_not_called()
+
+    def test_refresh_with_no_photos_marks_unavailable(self):
+        supabase = _supabase(_row(photos=_photos(2)))
+
+        def stale(name):
+            def fetch():
+                raise lp.StalePhotoName(name)
+            return fetch
+
+        with patch.object(lp, "_acquire", return_value=lambda: None), \
+                patch.object(lp, "_from_name", side_effect=stale), \
+                patch.object(lp, "_refresh_photo_names", return_value={"photos": []}):
+            self.assertEqual(asyncio.run(lp.ensure_location_photos(7, 3, supabase=supabase)), 0)
+        supabase.mark_location_image_unavailable.assert_called_once_with(7)
+
+    def test_tap_with_expired_names_refreshes_inline(self):
+        supabase = _supabase(_row(photos=_photos(2)))
+        dispatch = _Dispatch()
+
+        def uri(name):
+            if "fresh" not in name:
+                raise lp.StalePhotoName(name)
+            return f"https://lh3/{name[-1]}"
+
+        with patch.object(lp, "google_photo_uri", side_effect=uri), \
+                patch.object(lp, "_refresh_photo_names", return_value={"photos": _fresh(2)}) as details:
+            urls = asyncio.run(lp.gallery_for_tap(7, 10, supabase=supabase, dispatch=dispatch))
+        details.assert_called_once()
+        self.assertEqual(urls, ["https://lh3/0", "https://lh3/1"])
+        self.assertEqual([p[0] for p in dispatch.payloads[0].photo_uris],
+                         ["places/p/photos/fresh0", "places/p/photos/fresh1"])
+
+    def test_list_ensure_with_expired_name_queues_the_step(self):
+        supabase = MagicMock()
+        supabase.get_locations_by_ids.return_value = [_row(location_id=2)]
+        dispatch = _Dispatch()
+        with patch.object(lp, "google_photo_uri", side_effect=lp.StalePhotoName("x")):
+            urls = asyncio.run(lp.ensure_primary_photos([2], supabase=supabase, dispatch=dispatch))
+        self.assertEqual(urls, {})
+        self.assertEqual(dispatch.ids, [2])
+        self.assertEqual(dispatch.payloads[0].photo_uris, [])
+
+
+class RefreshPhotoNamesTest(unittest.TestCase):
+    def test_requests_only_the_free_id_and_photos_fields_and_saves_them(self):
+        response = MagicMock(status_code=200)
+        response.json.return_value = {"id": "gp-7", "photos": _fresh(2)}
+        supabase = MagicMock()
+        with patch.object(lp.requests, "get", return_value=response) as get:
+            result = lp._refresh_photo_names(7, _row(), supabase)
+
+        self.assertEqual(result, {"photos": _fresh(2)})
+        self.assertEqual(get.call_args.kwargs["headers"]["X-Goog-FieldMask"], "id,photos")
+        self.assertTrue(get.call_args.args[0].endswith("/places/gp-7"))
+        supabase.update_location.assert_called_once_with(7, photos=_fresh(2))
+
+    def test_no_place_id_or_failure_returns_none(self):
+        self.assertIsNone(lp._refresh_photo_names(7, _row(google_place_id=None), MagicMock()))
+        with patch.object(lp.requests, "get", side_effect=RuntimeError("down")):
+            self.assertIsNone(lp._refresh_photo_names(7, _row(), MagicMock()))
 
 
 if __name__ == "__main__":

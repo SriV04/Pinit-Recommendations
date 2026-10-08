@@ -255,6 +255,17 @@ class LocationPhotosResponse(BaseModel):
     )
 
 
+class LocationPhotosEnsureRequest(BaseModel):
+    location_ids: List[int] = Field(..., min_length=1, max_length=30)
+
+
+class LocationPhotosEnsureResponse(BaseModel):
+    photos: Dict[int, str] = Field(
+        default_factory=dict,
+        description="Primary photo per location: stored CDN URL or a short-lived Google photo URL",
+    )
+
+
 class MagicSearchRequest(BaseModel):
     user_id: str = Field(..., description="User identifier")
     latitude: float = Field(..., description="Center point latitude", ge=-90, le=90)

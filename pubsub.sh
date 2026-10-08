@@ -41,6 +41,12 @@ if [ -z "${SUPABASE_URL:-}" ]; then
   exit 1
 fi
 
+# The local .env is a dev config; these must match the shared live API (see deploy.sh).
+# Workers need Redis for the per-location photo lock, and must keep writing photos to
+# Supabase Storage while installed app versions still read them from there.
+CACHING_ENABLED="${DEPLOY_CACHING_ENABLED:-true}"
+PHOTO_DUAL_WRITE_SUPABASE="${DEPLOY_PHOTO_DUAL_WRITE:-true}"
+
 case "${MAX_DELIVERY_ATTEMPTS}" in
   ''|*[!0-9]*)
     echo "❌ PUBSUB_MAX_DELIVERY_ATTEMPTS must be an integer between 5 and 100."

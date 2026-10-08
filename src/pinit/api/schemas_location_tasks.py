@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Annotated, Literal, Union
+from typing import Annotated, List, Literal, Tuple, Union
 
 from pydantic import BaseModel, Field
 
@@ -47,6 +47,11 @@ class EmojiPayload(LocationTaskPayloadBase):
 
 class PhotosPayload(LocationTaskPayloadBase):
     task_type: Literal["photos"]
+    # How many photos to have stored afterwards (primary + extras).
+    want: int = Field(3, ge=1, le=10)
+    # (name, photoUri) pairs the API already paid for; downloaded instead of
+    # making new billed requests.
+    photo_uris: List[Tuple[str, str]] = Field(default_factory=list)
 
 
 class MenuVibePayload(LocationTaskPayloadBase):
